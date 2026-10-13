@@ -1,6 +1,6 @@
 # xemu on Xbox Series X|S Dev Mode (UWP) - experimental port
 
-**UWP port by [Skitzellez](https://github.com/skitzellez).**
+**UWP port by [Skitzelles](https://github.com/skitzellez).**
 
 This branch (`uwp`) makes [xemu](https://github.com/xemu-project/xemu), the original Xbox emulator, run as a UWP
 app on an Xbox Series X in Dev Mode. It is based on upstream master `478b4f4`. Every change is inside
@@ -133,6 +133,6 @@ companion repository does that. On the console set the app type to **Game** (abo
 
 ## Licence
 
-Same as xemu / QEMU: GPL version 2. See `COPYING`. The UWP port changes are Copyright (c) 2026 Skitzellez.
+Same as xemu / QEMU: GPL version 2. See `COPYING`. The UWP port changes are Copyright (c) 2026 Skitzelles.
 Under the GPL you must keep the copyright notices, mark your own changes as changes, and pass on the source
-with any copy you distribute. Please keep the credit to Skitzellez and to the xemu project.
+with any copy you distribute. Please keep the credit to Skitzelles and to the xemu project.

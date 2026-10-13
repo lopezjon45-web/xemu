@@ -1,6 +1,6 @@
 # xemu for Xbox Series X|S Dev Mode (experimental fork)
 
-**UWP port by [Skitzellez](https://github.com/skitzellez).**
+**UWP port by [Skitzelles](https://github.com/skitzellez).**
 
 This fork's `uwp` branch runs xemu, the original Xbox emulator, as a UWP app on an Xbox Series X in Dev Mode.
 **Read [README-UWP.md](README-UWP.md)** for what it does, how to set it up, what works and how to help.
