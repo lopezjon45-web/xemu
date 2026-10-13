@@ -12,6 +12,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xemu-uwp.h"
 #include "qemu/thread.h"
 #include "qemu/notify.h"
 #include "qemu-thread-common.h"
@@ -237,6 +238,9 @@ struct QemuThreadData {
     void             *arg;
     short             mode;
     NotifierList      exit;
+#ifdef XEMU_UWP
+    char              name[32];
+#endif
 
     /* Only used for joinable threads. */
     bool              exited;
@@ -279,6 +283,9 @@ static unsigned __stdcall win32_start_routine(void *arg)
     void *thread_arg = data->arg;
 
     qemu_thread_data = data;
+#ifdef XEMU_UWP
+    uwp_prof_register_thread(data->name);
+#endif
     qemu_thread_exit(start_routine(thread_arg));
     abort();
 }
@@ -359,6 +366,9 @@ void qemu_thread_create(QemuThread *thread, const char *name,
     data->arg = arg;
     data->mode = mode;
     data->exited = false;
+#ifdef XEMU_UWP
+    g_strlcpy(data->name, name ? name : "thread", sizeof(data->name));
+#endif
     notifier_list_init(&data->exit);
 
     if (data->mode != QEMU_THREAD_DETACHED) {

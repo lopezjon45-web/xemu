@@ -26,6 +26,7 @@
 #include "hw/xbox/nv2a/pgraph/texture.h"
 #include "debug.h"
 #include "renderer.h"
+#include "qemu/xemu-uwp.h"
 
 static TextureBinding* generate_texture(const TextureShape s, const uint8_t *texture_data, const uint8_t *palette_data);
 static void texture_binding_destroy(gpointer data);
@@ -202,6 +203,40 @@ static void apply_texture_parameters(PGRAPHGLState *r,
     }
 }
 
+#ifdef XEMU_UWP
+/*
+ * A cube map whose six faces are all render targets (a game drawing its own
+ * reflections every frame): find the surface behind each face, so the faces
+ * can be copied on the GPU instead of being read back and uploaded again.
+ * Returns false when any face is not a matching surface.
+ */
+static bool find_cube_face_surfaces(NV2AState *d, const TextureShape *shape,
+                                    hwaddr addr, size_t length,
+                                    SurfaceBinding **faces, int *newest)
+{
+    PGRAPHState *pg = &d->pgraph;
+    const ColorFormatInfo *f = &kelvin_color_format_gl_map[shape->color_format];
+    TextureShape face_shape = *shape;
+    face_shape.cubemap = false;
+
+    if (pg->surface_scale_factor != 1 || shape->border) {
+        return false;
+    }
+    *newest = 0;
+    for (int face = 0; face < 6; face++) {
+        SurfaceBinding *s = pgraph_gl_surface_get(d, addr + face * (length / 6));
+        if (s == NULL ||
+            s->fmt.gl_internal_format != f->gl_internal_format ||
+            !pgraph_gl_check_surface_to_texture_compatibility(s, &face_shape)) {
+            return false;
+        }
+        faces[face] = s;
+        *newest = MAX(*newest, s->draw_time);
+    }
+    return true;
+}
+#endif
+
 void pgraph_gl_bind_textures(NV2AState *d)
 {
     int i;
@@ -254,9 +289,17 @@ void pgraph_gl_bind_textures(NV2AState *d)
 
         SurfaceBinding *surface = pgraph_gl_surface_get(d, texture_vram_offset);
         TextureBinding *tbind = r->texture_binding[i];
+        int surface_time = surface ? surface->draw_time : 0;
+#ifdef XEMU_UWP
+        SurfaceBinding *cube_faces[6];
+        bool cube_s2t = surface && state.cubemap &&
+                        find_cube_face_surfaces(d, &state, texture_vram_offset,
+                                                length, cube_faces,
+                                                &surface_time);
+#endif
         if (!pg->texture_dirty[i] && tbind) {
             bool reusable = false;
-            if (surface && tbind->draw_time == surface->draw_time) {
+            if (surface && tbind->draw_time == surface_time) {
                 reusable = true;
             } else if (!surface) {
                 possibly_dirty = check_texture_possibly_dirty(
@@ -296,6 +339,17 @@ void pgraph_gl_bind_textures(NV2AState *d)
             if (surf_to_tex && surface->upload_pending) {
                 pgraph_gl_upload_surface_data(d, surface, false);
             }
+#ifdef XEMU_UWP
+            if (cube_s2t) {
+                surf_to_tex = true;
+                for (int face = 0; face < 6; face++) {
+                    if (cube_faces[face]->upload_pending) {
+                        pgraph_gl_upload_surface_data(d, cube_faces[face],
+                                                      false);
+                    }
+                }
+            }
+#endif
         }
 
         if (!surf_to_tex) {
@@ -308,6 +362,25 @@ void pgraph_gl_bind_textures(NV2AState *d)
                 bool overlapping = !(surface->vram_addr >= tex_vram_end
                                      || texture_vram_offset >= surf_vram_end);
                 if (overlapping) {
+#ifdef XEMU_UWP
+                    if (surface->draw_dirty) {
+                        UWP_TRACE("  tex miss unit %d: surface %s %ux%u pitch %u "
+                                  "swz %d addr %x cfmt %d | tex %ux%u pitch %u "
+                                  "fmt 0x%x levels %u cube %d addr %x len %u "
+                                  "filter %x",
+                                  i, surface->color ? "color" : "zeta",
+                                  surface->width, surface->height,
+                                  surface->pitch, surface->swizzle,
+                                  (unsigned)surface->vram_addr,
+                                  surface->shape.color_format, state.width,
+                                  state.height, state.pitch,
+                                  state.color_format, state.levels,
+                                  state.cubemap,
+                                  (unsigned)texture_vram_offset,
+                                  (unsigned)length, filter);
+                    }
+                    UWP_DL_SITE(TEX_OVERLAP);
+#endif
                     pgraph_gl_surface_download_if_dirty(d, surface);
                 }
             }
@@ -363,6 +436,10 @@ void pgraph_gl_bind_textures(NV2AState *d)
         if (key_out->binding == NULL) {
             // Must create the texture
             key_out->binding = generate_texture(state, texture_data, palette_data);
+            UWP_TRACE("  tex upload unit %d: %ux%u fmt 0x%x levels %u addr %x "
+                      "surf2tex %d", i, state.width, state.height,
+                      state.color_format, state.levels,
+                      (unsigned)texture_vram_offset, surf_to_tex);
             key_out->binding->data_hash = tex_data_hash;
             key_out->binding->scale = 1;
         } else {
@@ -375,11 +452,37 @@ void pgraph_gl_bind_textures(NV2AState *d)
         TextureBinding *binding = key_out->binding;
         binding->refcnt++;
 
+#ifdef XEMU_UWP
+        if (cube_s2t) {
+            if (binding->draw_time < surface_time) {
+                UWP_PROF_BEGIN(t_s2t);
+                if (binding->s2t_width != state.width) {
+                    /* the faces only provide the base level */
+                    glTexParameteri(binding->gl_target, GL_TEXTURE_BASE_LEVEL, 0);
+                    glTexParameteri(binding->gl_target, GL_TEXTURE_MAX_LEVEL, 0);
+                    binding->s2t_width = state.width;
+                    binding->s2t_height = state.height;
+                }
+                for (int face = 0; face < 6; face++) {
+                    glCopyImageSubData(cube_faces[face]->gl_buffer,
+                                       GL_TEXTURE_2D, 0, 0, 0, 0,
+                                       binding->gl_texture, GL_TEXTURE_CUBE_MAP,
+                                       0, 0, 0, face, state.width,
+                                       state.height, 1);
+                }
+                binding->draw_time = surface_time;
+                binding->scale = 1;
+                UWP_PROF_END(PF_S2T, t_s2t);
+            }
+        } else
+#endif
         if (surf_to_tex && binding->draw_time < surface->draw_time) {
 
             trace_nv2a_pgraph_surface_render_to_texture(
                 surface->vram_addr, surface->width, surface->height);
+            UWP_PROF_BEGIN(t_s2t);
             pgraph_gl_render_surface_to_texture(d, surface, binding, &state, i);
+            UWP_PROF_END(PF_S2T, t_s2t);
             binding->draw_time = surface->draw_time;
             binding->scale = pg->surface_scale_factor;
         }
@@ -724,7 +827,9 @@ static TextureBinding* generate_texture(const TextureShape s,
         upload_gl_texture(GL_TEXTURE_CUBE_MAP_NEGATIVE_Z,
                           s, texture_data + 5 * length, palette_data);
     } else {
+        UWP_PROF_BEGIN(t0);
         upload_gl_texture(gl_target, s, texture_data, palette_data);
+        UWP_PROF_END(PF_TEX_UP, t0);
     }
 
     /* Linear textures don't support mipmapping */
@@ -754,6 +859,10 @@ static TextureBinding* generate_texture(const TextureShape s,
     ret->addrv = 0xFFFFFFFF;
     ret->addrp = 0xFFFFFFFF;
     ret->border_color_set = false;
+#ifdef XEMU_UWP
+    ret->s2t_width = 0;
+    ret->s2t_height = 0;
+#endif
     return ret;
 }
 

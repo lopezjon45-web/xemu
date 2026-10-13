@@ -19,7 +19,7 @@
 
 #include "win32-dxgi-present.h"
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(XEMU_UWP) /* Xbox: Mesa already presents through D3D12 */
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

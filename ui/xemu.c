@@ -53,6 +53,11 @@
 
 #include "hw/xbox/smbus.h" // For eject, drive tray
 #include "hw/xbox/nv2a/nv2a.h"
+#include "hw/xbox/nv2a/debug.h"
+#ifdef XEMU_UWP
+#include "xemu-uwp-audio.h"
+#endif
+#include "qemu/xemu-uwp.h"
 #include "ui/xemu-notifications.h"
 
 #include <stb_image.h>
@@ -63,6 +68,7 @@
 #ifdef _WIN32
 #include "xui/win32-dxgi-present.h"
 #endif
+
 
 #ifndef DEBUG_XEMU_C
 #define DEBUG_XEMU_C 0
@@ -848,7 +854,9 @@ static void gl_render_frame(struct xemu_console *scon)
      * the guest code isn't using HW accelerated rendering, but just blitting
      * to the framebuffer, fall back to the VGA path.
      */
+    UWP_PROF_BEGIN(t_getfb);
     GLuint tex = nv2a_get_framebuffer_surface();
+    UWP_PROF_END(UI_GETFB, t_getfb);
 
     assert(glGetError() == GL_NO_ERROR);
 
@@ -882,8 +890,12 @@ static void gl_render_frame(struct xemu_console *scon)
     xemu_hud_update();
     xemu_main_loop_unlock();
 
+    UWP_PROF_BEGIN(t_hud);
     xemu_hud_render();
+    UWP_PROF_END(UI_HUD, t_hud);
+    UWP_PROF_BEGIN(t_finish);
     glFinish();
+    UWP_PROF_END(UI_FINISH, t_finish);
 
     if (release_surface_texture) {
         xemu_main_loop_lock();
@@ -904,7 +916,9 @@ static void gl_render_frame(struct xemu_console *scon)
                     "SDL_GL_SwapWindow\n");
             warned = true;
         }
+        UWP_PROF_BEGIN(t_swap);
         SDL_GL_SwapWindow(scon->real_window);
+        UWP_PROF_END(UI_SWAP, t_swap);
     }
 #else
     SDL_GL_SwapWindow(scon->real_window);
@@ -1267,9 +1281,458 @@ type_init(register_xemu_display);
 int gArgc;
 char **gArgv;
 
+#ifdef XEMU_UWP
+/* Progress log for the Xbox port, in its own file (uwp_debug.log in LocalState\xemu\xemu). */
+SDL_AudioStream *xemu_uwp_audio_stream; /* opened on the UI thread, used by the APU */
+void uwp_log(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+void uwp_log(const char *fmt, ...)
+{
+    static FILE *f;
+    if (!f) {
+        char *base = SDL_GetPrefPath("xemu", "xemu");
+        char *path = g_strdup_printf("%suwp_debug.log", base ? base : "");
+        f = fopen(path, "w");
+        g_free(path);
+        SDL_free(base);
+        if (!f) {
+            return;
+        }
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(f, "[%8.3f] ", SDL_GetTicks() / 1000.0);
+    vfprintf(f, fmt, ap);
+    fputc('\n', f);
+    fflush(f);
+    va_end(ap);
+}
+
+/* Profiler state, see include/qemu/xemu-uwp.h. */
+int64_t uwp_prof_ticks[UWP_PROF__COUNT];
+int uwp_prof_calls[UWP_PROF__COUNT];
+int uwp_dl_site;
+int uwp_dl_counts[UWP_DL__COUNT];
+int uwp_trace_budget;
+int uwp_gpu_blits;
+extern int64_t uwp_prof_nv2a_totals[NV2A_PROF__COUNT];
+extern int64_t uwp_prof_nv2a_frames;
+
+#define UWP_PROF_MAX_THREADS 48
+static struct {
+    char name[32];
+    DWORD tid;
+    HANDLE handle;
+    uint64_t last_cpu;
+} uwp_prof_threads[UWP_PROF_MAX_THREADS];
+static int uwp_prof_num_threads;
+
+void uwp_prof_register_thread(const char *name)
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    HANDLE h = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                         GetCurrentProcess(), &h, 0, FALSE,
+                         DUPLICATE_SAME_ACCESS)) {
+        return;
+    }
+    AcquireSRWLockExclusive(&lock);
+    /* a thread that registers twice (QEMU's name, then ours) is renamed */
+    int slot = 0;
+    while (slot < uwp_prof_num_threads &&
+           uwp_prof_threads[slot].tid != GetCurrentThreadId()) {
+        slot++;
+    }
+    if (slot < UWP_PROF_MAX_THREADS) {
+        char *out = uwp_prof_threads[slot].name;
+        for (int i = 0; name[i] && i < 31; i++) {
+            *out++ = g_ascii_isalnum(name[i]) ? name[i] : '_';
+        }
+        *out = '\0';
+    }
+    if (slot == uwp_prof_num_threads && slot < UWP_PROF_MAX_THREADS) {
+        uwp_prof_threads[slot].tid = GetCurrentThreadId();
+        uwp_prof_threads[slot].handle = h;
+        uwp_prof_num_threads++;
+    } else {
+        CloseHandle(h);
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+/* One log line: CPU use per thread, time per probe, nv2a counters per frame. */
+static void uwp_prof_report(double seconds)
+{
+    static int64_t last_ticks[UWP_PROF__COUNT];
+    static int last_calls[UWP_PROF__COUNT];
+    static int64_t last_nv2a[NV2A_PROF__COUNT], last_frames;
+    static const char *const names[UWP_PROF__COUNT] = {
+#define _X(x) #x,
+        UWP_PROF_TIMERS_XMAC
+#undef _X
+    };
+    char line[2048];
+    int n = 0;
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+
+    n += snprintf(line + n, sizeof(line) - n, "prof cpu%%:");
+    for (int i = 0; i < uwp_prof_num_threads; i++) {
+        FILETIME c, e, k, u;
+        if (!GetThreadTimes(uwp_prof_threads[i].handle, &c, &e, &k, &u)) {
+            continue;
+        }
+        uint64_t cpu = (((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) +
+                       (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime);
+        double pct = (cpu - uwp_prof_threads[i].last_cpu) / 1e5 / seconds;
+        if (pct >= 1.0 || i < 3) {
+            n += snprintf(line + n, sizeof(line) - n, " %s %.0f",
+                          uwp_prof_threads[i].name, pct);
+        }
+        uwp_prof_threads[i].last_cpu = cpu;
+    }
+    {
+        /* the whole process, which also covers threads that are not ours
+         * (graphics driver, audio) */
+        static uint64_t last_total;
+        FILETIME c, e, k, u;
+        if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) {
+            uint64_t total =
+                (((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) +
+                (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime);
+            n += snprintf(line + n, sizeof(line) - n, " ALL %.0f",
+                          (total - last_total) / 1e5 / seconds);
+            last_total = total;
+        }
+    }
+    n += snprintf(line + n, sizeof(line) - n, " | wall%% (calls):");
+    for (int i = 0; i < UWP_PROF__COUNT; i++) {
+        int64_t t = uwp_prof_ticks[i];
+        int c = uwp_prof_calls[i];
+        if (c != last_calls[i]) {
+            n += snprintf(line + n, sizeof(line) - n, " %s %.1f (%d)", names[i],
+                          (t - last_ticks[i]) * 100.0 / freq.QuadPart / seconds,
+                          c - last_calls[i]);
+        }
+        last_ticks[i] = t;
+        last_calls[i] = c;
+    }
+    int64_t frames = uwp_prof_nv2a_frames - last_frames;
+    n += snprintf(line + n, sizeof(line) - n, " | per frame (%d frames):",
+                  (int)frames);
+    for (int i = 0; i < NV2A_PROF__COUNT; i++) {
+        int64_t v = uwp_prof_nv2a_totals[i];
+        if (v != last_nv2a[i] && frames > 0 && n < (int)sizeof(line) - 64) {
+            n += snprintf(line + n, sizeof(line) - n, " %s %.1f",
+                          nv2a_profile_get_counter_name(i),
+                          (double)(v - last_nv2a[i]) / frames);
+        }
+        last_nv2a[i] = v;
+    }
+    last_frames = uwp_prof_nv2a_frames;
+    static int last_dl[UWP_DL__COUNT];
+    n += snprintf(line + n, sizeof(line) - n, " | readbacks by site:");
+    for (int i = 0; i < UWP_DL__COUNT; i++) {
+        n += snprintf(line + n, sizeof(line) - n, " %d",
+                      uwp_dl_counts[i] - last_dl[i]);
+        last_dl[i] = uwp_dl_counts[i];
+    }
+    static int last_gpu_blits;
+    n += snprintf(line + n, sizeof(line) - n, " | gpu blits %d",
+                  uwp_gpu_blits - last_gpu_blits);
+    last_gpu_blits = uwp_gpu_blits;
+    uwp_log("%s", line);
+
+    static int reports;
+    if (++reports % 7 == 0) {
+        uwp_trace_budget = 70; /* a frame or two of events, every ~20 s */
+    }
+}
+
+/*
+ * Sampling profiler for one thread (the emulated CPU, the renderer): about
+ * 500 times a second it is stopped for a moment and the address it was
+ * executing is noted. Every
+ * 30 s the busiest places go to the log, as offsets into xemu.exe (to be
+ * looked up in the build's symbols on the PC), as other modules by name, or
+ * as "generated code" (the guest's own code, translated).
+ */
+#define UWP_SAMPLES 16384
+static DWORD WINAPI uwp_sampler_thread(void *arg)
+{
+    const char *target = arg; /* which thread to watch: "vcpu" or "pfifo" */
+    uint64_t *samples = g_malloc(UWP_SAMPLES * sizeof(uint64_t));
+    struct {
+        uint64_t key;
+        int count;
+    } *top = g_malloc(4096 * sizeof(*top));
+    HMODULE exe = GetModuleHandleW(NULL);
+    uint64_t exe_base = (uint64_t)(uintptr_t)exe;
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)
+        ((const uint8_t *)exe + ((const IMAGE_DOS_HEADER *)exe)->e_lfanew);
+    uint64_t exe_size = nt->OptionalHeader.SizeOfImage;
+    int num = 0;
+    HANDLE vcpu = NULL;
+    DWORD next_dump = GetTickCount() + 30000;
+
+    rcu_register_thread(); /* for uwp_read_guest */
+
+    for (;;) {
+        Sleep(10); /* 500 a second cost the watched thread about a fifth */
+        if (!vcpu) {
+            for (int i = 0; i < uwp_prof_num_threads; i++) {
+                if (!strcmp(uwp_prof_threads[i].name, target)) {
+                    vcpu = uwp_prof_threads[i].handle;
+                }
+            }
+            continue;
+        }
+        if (num < UWP_SAMPLES && SuspendThread(vcpu) != (DWORD)-1) {
+            CONTEXT ctx;
+            ctx.ContextFlags = CONTEXT_CONTROL;
+            if (GetThreadContext(vcpu, &ctx)) {
+                samples[num++] = ctx.Rip;
+            }
+            ResumeThread(vcpu);
+        }
+        if ((int)(GetTickCount() - next_dump) < 0) {
+            continue;
+        }
+        next_dump = GetTickCount() + 30000;
+
+        /* group: xemu.exe in 64-byte pieces, anything else per module */
+        int groups = 0, jit = 0;
+        for (int i = 0; i < num; i++) {
+            uint64_t key;
+            if (samples[i] - exe_base < exe_size) {
+                key = (samples[i] - exe_base) >> 6;
+            } else {
+                HMODULE mod = NULL;
+                if (!GetModuleHandleExW(
+                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        (LPCWSTR)(uintptr_t)samples[i], &mod) || !mod) {
+                    jit++;
+                    continue;
+                }
+                key = (uint64_t)(uintptr_t)mod | (1ull << 63);
+            }
+            int g = 0;
+            while (g < groups && top[g].key != key) {
+                g++;
+            }
+            if (g == groups) {
+                if (groups == 4096) {
+                    continue;
+                }
+                top[groups].key = key;
+                top[groups++].count = 0;
+            }
+            top[g].count++;
+        }
+        char line[1800];
+        int n = snprintf(line, sizeof(line),
+                         "%s samples %d: generated code %d", target, num, jit);
+        for (int rank = 0; rank < 40 && n < (int)sizeof(line) - 80; rank++) {
+            int best = -1;
+            for (int g = 0; g < groups; g++) {
+                if (top[g].count > 0 &&
+                    (best < 0 || top[g].count > top[best].count)) {
+                    best = g;
+                }
+            }
+            if (best < 0) {
+                break;
+            }
+            if (top[best].key >> 63) {
+                wchar_t path[260];
+                DWORD len = GetModuleFileNameW(
+                    (HMODULE)(uintptr_t)(top[best].key & ~(1ull << 63)), path,
+                    ARRAY_SIZE(path));
+                const wchar_t *base = path + len;
+                while (base > path && base[-1] != L'\\') {
+                    base--;
+                }
+                n += snprintf(line + n, sizeof(line) - n, ", %ls %d", base,
+                              top[best].count);
+            } else {
+                n += snprintf(line + n, sizeof(line) - n, ", +%llx %d",
+                              (unsigned long long)(top[best].key << 6),
+                              top[best].count);
+            }
+            top[best].count = 0;
+        }
+        uwp_log("%s", line);
+
+        /* the same samples by guest address (start of the translated block) */
+        if (jit) {
+            extern uint32_t uwp_guest_pc_of(uintptr_t host_pc);
+            extern int uwp_read_guest(uint32_t addr, uint8_t *buf, int len);
+            int found = 0;
+            groups = 0;
+            for (int i = 0; i < num; i++) {
+                uint32_t pc;
+                if (samples[i] - exe_base < exe_size ||
+                    !(pc = uwp_guest_pc_of((uintptr_t)samples[i]))) {
+                    continue;
+                }
+                found++;
+                int g = 0;
+                while (g < groups && top[g].key != pc) {
+                    g++;
+                }
+                if (g == groups) {
+                    if (groups == 4096) {
+                        continue;
+                    }
+                    top[groups].key = pc;
+                    top[groups++].count = 0;
+                }
+                top[g].count++;
+            }
+            n = snprintf(line, sizeof(line), "%s guest blocks %d of %d (%d distinct)",
+                         target, found, jit, groups);
+            for (int rank = 0; rank < 48 && n < (int)sizeof(line) - 40; rank++) {
+                int best = -1;
+                for (int g = 0; g < groups; g++) {
+                    if (top[g].count > 0 &&
+                        (best < 0 || top[g].count > top[best].count)) {
+                        best = g;
+                    }
+                }
+                if (best < 0) {
+                    break;
+                }
+                n += snprintf(line + n, sizeof(line) - n, ", %08x %d",
+                              (unsigned)top[best].key, top[best].count);
+                if (rank < 12) {
+                    uint8_t code[64];
+                    char hex[2 * sizeof(code) + 1];
+                    if (uwp_read_guest((uint32_t)top[best].key, code,
+                                       sizeof(code)) == 0) {
+                        for (int k = 0; k < (int)sizeof(code); k++) {
+                            snprintf(hex + 2 * k, 3, "%02x", code[k]);
+                        }
+                        uwp_log("%s guest code %08x x%d: %s", target,
+                                (unsigned)top[best].key, top[best].count, hex);
+                    }
+                }
+                top[best].count = 0;
+            }
+            uwp_log("%s", line);
+        }
+        num = 0;
+    }
+    return 0;
+}
+
+/*
+ * Starting a game from a launcher (Game Vault): the app is opened through the
+ * link xemu:?disc=<path of the disc image>. SDL (local patch) publishes each
+ * activation as the hint SDL_WINRT_ACTIVATION_URI; this takes the disc path
+ * out of it, or returns NULL when there is none. Free with g_free().
+ */
+#define UWP_ACTIVATION_HINT "SDL_WINRT_ACTIVATION_URI"
+static char *uwp_take_activation_disc(void)
+{
+    const char *hint = SDL_GetHint(UWP_ACTIVATION_HINT);
+    if (!hint || !hint[0]) {
+        return NULL;
+    }
+    char *uri = g_strdup(hint);
+    SDL_SetHint(UWP_ACTIVATION_HINT, "");
+
+    char *disc = NULL;
+    char *query = strchr(uri, '?');
+    for (char *p = query ? query + 1 : NULL; p && *p;) {
+        char *end = strchr(p, '&');
+        if (end) {
+            *end = '\0';
+        }
+        if (!strncmp(p, "disc=", 5)) {
+            /* undo the %XX escaping; xemu.toml uses forward slashes */
+            disc = g_malloc(strlen(p) + 1);
+            char *out = disc;
+            for (const char *in = p + 5; *in; in++) {
+                if (in[0] == '%' && g_ascii_isxdigit(in[1]) &&
+                    g_ascii_isxdigit(in[2])) {
+                    *out = (char)(g_ascii_xdigit_value(in[1]) * 16 +
+                                  g_ascii_xdigit_value(in[2]));
+                    in += 2;
+                } else {
+                    *out = *in;
+                }
+                if (*out == '\\') {
+                    *out = '/';
+                }
+                out++;
+            }
+            *out = '\0';
+        }
+        p = end ? end + 1 : NULL;
+    }
+    g_free(uri);
+    if (disc && !disc[0]) {
+        g_free(disc);
+        disc = NULL;
+    }
+    return disc;
+}
+
+/* Before the machine is created: boot with the disc the launcher asked for. */
+static void uwp_startup_disc(void)
+{
+    /* the activation arrives through the window's event queue */
+    for (int i = 0; i < 200 && !SDL_GetHint(UWP_ACTIVATION_HINT); i++) {
+        SDL_PumpEvents();
+        SDL_Delay(10);
+    }
+    char *disc = uwp_take_activation_disc();
+    if (disc) {
+        uwp_log("disc from launcher: %s", disc);
+        xemu_settings_set_string(&g_config.sys.files.dvd_path, disc);
+        g_free(disc);
+    }
+}
+
+/*
+ * While running (the app was left open and the launcher starts a game): the
+ * same disc just continues; another disc is swapped in and the console reset.
+ */
+static void uwp_poll_activation(void)
+{
+    char *disc = uwp_take_activation_disc();
+    if (!disc) {
+        return;
+    }
+    const char *current = g_config.sys.files.dvd_path;
+    if (current && !g_ascii_strcasecmp(current, disc)) {
+        uwp_log("launcher asked for the disc that is already running");
+    } else {
+        Error *err = NULL;
+        xemu_main_loop_lock();
+        xemu_load_disc(disc, &err);
+        if (err) {
+            uwp_log("could not load %s: %s", disc, error_get_pretty(err));
+            error_free(err);
+        } else {
+            uwp_log("disc changed by launcher: %s", disc);
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        }
+        xemu_main_loop_unlock();
+    }
+    g_free(disc);
+}
+#endif
+
 static void *qemu_main(void *opaque)
 {
+#ifdef XEMU_UWP
+    uwp_log("qemu_init start");
+#endif
     qemu_init(gArgc, gArgv);
+#ifdef XEMU_UWP
+    uwp_log("qemu_init done, entering main loop");
+#endif
     exit_status = qemu_main_loop();
     qatomic_set(&qemu_exiting, true);
     bql_unlock();
@@ -1340,13 +1803,52 @@ static void init_sdl_app_metadata(void)
                                "https://xemu.app");
 }
 
+#ifdef XEMU_UWP
+/*
+ * Xbox (UWP) build: SDL's WinRT backend owns the app's CoreWindow, so the
+ * program starts in WinMain and SDL_RunApp calls xemu's main on the UI thread.
+ */
+#define SDL_MAIN_HANDLED
+#include <SDL3/SDL_main.h>
+
+static int xemu_uwp_main(int argc, char **argv);
+
+int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
+{
+    static char *uwp_argv[] = { (char *)"xemu.exe", NULL };
+
+    /* Windows.Gaming.Input is the only controller API that works in Xbox apps */
+    SDL_SetHint(SDL_HINT_JOYSTICK_WGI, "1");
+    return SDL_RunApp(1, uwp_argv, xemu_uwp_main, NULL);
+}
+
+static int xemu_uwp_main(int argc, char **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
     QemuThread thread;
 
     setlocale(LC_NUMERIC, "C");
 
-#ifdef _WIN32
+#ifdef XEMU_UWP
+    {
+        /* The install folder is read-only: log next to xemu.toml in LocalState */
+        init_sdl_app_metadata();
+        char *base = SDL_GetPrefPath("xemu", "xemu");
+        if (base) {
+            char *log_path = g_strdup_printf("%sxemu.log", base);
+            /* append mode for both streams so they can't overwrite each other */
+            remove(log_path);
+            freopen(log_path, "a", stdout);
+            freopen(log_path, "a", stderr);
+            setvbuf(stdout, NULL, _IONBF, 0);
+            setvbuf(stderr, NULL, _IONBF, 0);
+            g_free(log_path);
+            SDL_free(base);
+        }
+    }
+#elif defined(_WIN32)
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         // Launched with a console. If stdout and stderr are not associated with
         // an output stream, redirect to parent console.
@@ -1408,12 +1910,86 @@ int main(int argc, char **argv)
 #endif
 
     display_very_early_init(NULL);
+#ifdef XEMU_UWP
+    uwp_log("display_very_early_init done");
+    uwp_startup_disc();
+#endif
 
+#ifdef XEMU_UWP
+    /* List disc images on the drives (USB sticks show up as E:, F:, ...) */
+    {
+        DWORD mask = GetLogicalDrives();
+        for (char d = 'D'; d <= 'Z'; d++) {
+            if (!(mask & (1u << (d - 'A')))) {
+                continue;
+            }
+            const char *patterns[] = { "%c:\\*.iso", "%c:\\*\\*.iso" };
+            for (int p = 0; p < 2; p++) {
+                char pat[32];
+                snprintf(pat, sizeof(pat), patterns[p], d);
+                if (p == 1) {
+                    /* one folder level down */
+                    char root[8];
+                    snprintf(root, sizeof(root), "%c:\\*", d);
+                    WIN32_FIND_DATAA dir;
+                    HANDLE hd = FindFirstFileA(root, &dir);
+                    if (hd == INVALID_HANDLE_VALUE) {
+                        continue;
+                    }
+                    do {
+                        if (!(dir.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+                            dir.cFileName[0] == '.') {
+                            continue;
+                        }
+                        char sub[MAX_PATH];
+                        snprintf(sub, sizeof(sub), "%c:\\%s\\*.iso", d, dir.cFileName);
+                        WIN32_FIND_DATAA f;
+                        HANDLE hf = FindFirstFileA(sub, &f);
+                        if (hf != INVALID_HANDLE_VALUE) {
+                            do {
+                                uwp_log("iso: %c:\\%s\\%s (%llu MB)", d, dir.cFileName, f.cFileName,
+                                        (((unsigned long long)f.nFileSizeHigh << 32) | f.nFileSizeLow) >> 20);
+                            } while (FindNextFileA(hf, &f));
+                            FindClose(hf);
+                        }
+                    } while (FindNextFileA(hd, &dir));
+                    FindClose(hd);
+                    continue;
+                }
+                WIN32_FIND_DATAA f;
+                HANDLE hf = FindFirstFileA(pat, &f);
+                if (hf != INVALID_HANDLE_VALUE) {
+                    do {
+                        uwp_log("iso: %c:\\%s (%llu MB)", d, f.cFileName,
+                                (((unsigned long long)f.nFileSizeHigh << 32) | f.nFileSizeLow) >> 20);
+                    } while (FindNextFileA(hf, &f));
+                    FindClose(hf);
+                }
+            }
+        }
+    }
+
+    /*
+     * Audio: SDL3-uwp's WASAPI device open never completes on the Xbox, so
+     * the APU's stream is played through XAudio2 instead (xemu-uwp-audio.c).
+     * The QEMU thread picks the stream up in mcpx_apu_monitor_init().
+     */
+    xemu_uwp_audio_stream = xemu_uwp_audio_start();
+#endif
     qemu_sem_init(&display_init_sem, 0);
     qemu_sem_init(&display_shutdown_sem, 0);
     qemu_thread_create(&thread, "qemu_main", qemu_main,
                        NULL, QEMU_THREAD_JOINABLE);
+#ifdef XEMU_UWP
+    while (qemu_sem_timedwait(&display_init_sem, 10) != 0) {
+        SDL_PumpEvents();
+    }
+#else
     qemu_sem_wait(&display_init_sem);
+#endif
+#ifdef XEMU_UWP
+    uwp_log("display_init done, UI thread continuing");
+#endif
 
     gui_grab = 0;
     if (gui_fullscreen) {
@@ -1433,9 +2009,36 @@ int main(int argc, char **argv)
     xemu_main_loop_unlock();
 
     struct xemu_console *scon = &scon_list[0];
+#ifdef XEMU_UWP
+    uwp_log("UI loop starting");
+    UWP_PROF_THREAD("ui");
+    CloseHandle(CreateThread(NULL, 0, uwp_sampler_thread, (void *)"vcpu", 0,
+                             NULL));
+    CloseHandle(CreateThread(NULL, 0, uwp_sampler_thread, (void *)"pfifo", 0,
+                             NULL));
+    uint64_t uwp_frames = 0, uwp_next_report = SDL_GetTicks() + 3000;
+#endif
     while (!qatomic_read(&qemu_exiting)) {
         poll_events(scon);
         gl_render_frame(scon);
+#ifdef XEMU_UWP
+        uwp_frames++;
+        uwp_poll_activation();
+        if (SDL_GetTicks() >= uwp_next_report) {
+            int w = 0, h = 0;
+            SDL_GetWindowSizeInPixels(scon->real_window, &w, &h);
+            int pads = 0;
+            SDL_free(SDL_GetGamepads(&pads));
+            ControllerState *p1 = xemu_input_get_bound(0);
+            uwp_log("%llu UI frames, window %dx%d, runstate %s, game fps %d, "
+                    "gamepads %d, port1 %s",
+                    (unsigned long long)uwp_frames, w, h,
+                    RunState_str(runstate_get()), g_nv2a_stats.increment_fps,
+                    pads, p1 ? p1->name : "(none)");
+            uwp_prof_report((SDL_GetTicks() - (uwp_next_report - 3000)) / 1000.0);
+            uwp_next_report = SDL_GetTicks() + 3000;
+        }
+#endif
     }
     qemu_sem_post(&display_shutdown_sem);
     qemu_thread_join(&thread);
@@ -1459,6 +2062,59 @@ void xemu_eject_disc(Error **errp)
     xbox_smc_update_tray_state();
 }
 
+#ifdef XEMU_UWP
+/*
+ * A full dump of an Xbox disc (7.3 GB) has the game partition 0x18300000
+ * bytes in, after the DVD-Video part; the console's kernel wants the drive to
+ * start at the game partition, which is what an XISO file is. Instead of
+ * making the user convert dumps on a PC, look where the partition starts and
+ * let the block layer skip to it. Returns the file name to open: the path
+ * itself, or a json: description of the same file read from that offset.
+ * Free with g_free().
+ */
+char *xemu_uwp_disc_filename(const char *path);
+char *xemu_uwp_disc_filename(const char *path)
+{
+    static const char magic[] = "MICROSOFT*XBOX*MEDIA";
+    static const uint64_t bases[] = { 0, 0x18300000ull, 0x0FD90000ull,
+                                      0x02080000ull };
+    uint64_t found = 0;
+
+    if (!path || !path[0] || !strncmp(path, "json:", 5)) {
+        return g_strdup(path ? path : "");
+    }
+    int fd = qemu_open_old(path, O_RDONLY | O_BINARY);
+    if (fd >= 0) {
+        for (int i = 0; i < ARRAY_SIZE(bases); i++) {
+            char head[20];
+            if (lseek(fd, bases[i] + 0x10000, SEEK_SET) >= 0 &&
+                read(fd, head, sizeof(head)) == sizeof(head) &&
+                !memcmp(head, magic, sizeof(head))) {
+                found = bases[i];
+                break;
+            }
+        }
+        close(fd);
+    }
+    if (!found) {
+        return g_strdup(path);
+    }
+    uwp_log("full disc dump: game partition at 0x%llx", (unsigned long long)found);
+    GString *name = g_string_new(NULL);
+    g_string_printf(name, "json:{\"driver\":\"raw\",\"offset\":%llu,\"file\":"
+                    "{\"driver\":\"file\",\"filename\":\"",
+                    (unsigned long long)found);
+    for (const char *c = path; *c; c++) {
+        if (*c == '"' || *c == '\\') {
+            g_string_append_c(name, '\\');
+        }
+        g_string_append_c(name, *c);
+    }
+    g_string_append(name, "\"}}");
+    return g_string_free(name, FALSE);
+}
+#endif
+
 void xemu_load_disc(const char *path, Error **errp)
 {
     Error *error = NULL;
@@ -1467,8 +2123,15 @@ void xemu_load_disc(const char *path, Error **errp)
     xbox_smc_eject_button();
     xemu_settings_set_string(&g_config.sys.files.dvd_path, "");
 
+#ifdef XEMU_UWP
+    char *filename = xemu_uwp_disc_filename(path);
+    qmp_blockdev_change_medium("ide0-cd1", NULL, filename, "raw", false, false,
+                               false, 0, &error);
+    g_free(filename);
+#else
     qmp_blockdev_change_medium("ide0-cd1", NULL, path, "raw", false, false,
                                false, 0, &error);
+#endif
     if (error) {
         error_propagate(errp, error);
     } else {

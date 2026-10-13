@@ -18,6 +18,9 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xemu-uwp.h"
+#include "qemu/rcu.h"
+#include "system/memory.h"
 #include "qemu/qemu-print.h"
 #include "qapi/error.h"
 #include "qapi/type-helpers.h"
@@ -1109,3 +1112,28 @@ void tcg_exec_unrealizefn(CPUState *cpu)
     tlb_destroy(cpu);
     g_free_rcu(cpu->tb_jmp_cache, rcu);
 }
+
+#ifdef XEMU_UWP
+/*
+ * For the Xbox port's sampling profiler (ui/xemu.c): the address of the
+ * translated block a host address lies in (0 when it is not generated
+ * code), and a peek at guest memory there, so that the hot guest code can
+ * be disassembled. Blocks are position independent (CF_PCREL), so what a
+ * block keeps is its place in guest RAM (a ram_addr_t), not a guest EIP.
+ */
+uint32_t uwp_guest_pc_of(uintptr_t host_pc);
+uint32_t uwp_guest_pc_of(uintptr_t host_pc)
+{
+    TranslationBlock *tb = tcg_tb_lookup(host_pc);
+    return tb ? (uint32_t)tb_page_addr0(tb) : 0;
+}
+
+int uwp_read_guest(uint32_t addr, uint8_t *buf, int len);
+int uwp_read_guest(uint32_t addr, uint8_t *buf, int len)
+{
+    /* the calling thread must be registered with RCU */
+    RCU_READ_LOCK_GUARD();
+    memcpy(buf, qemu_map_ram_ptr(NULL, addr), len);
+    return 0;
+}
+#endif

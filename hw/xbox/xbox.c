@@ -61,6 +61,13 @@
 #define MAX_IDE_BUS 2
 
 /* FIXME: Clean this up and propagate errors to UI */
+#ifdef XEMU_UWP
+void uwp_log(const char *fmt, ...);
+#define UWP_MARK(s) uwp_log("xbox_init: %s", s)
+#else
+#define UWP_MARK(s)
+#endif
+
 static void xbox_flash_init(MachineState *ms, MemoryRegion *rom_memory)
 {
     const uint32_t rom_start = 0xFF000000;
@@ -240,6 +247,7 @@ void xbox_init_common(MachineState *machine,
     I2CBus *smbus;
     PCIBus *agp_bus;
 
+    UWP_MARK("before cpus init");
     x86_cpus_init(x86ms, pcmc->default_cpu_version);
 
     if (kvm_enabled()) {
@@ -253,10 +261,12 @@ void xbox_init_common(MachineState *machine,
     // pc_guest_info_init(pcms);
 
     /* allocate ram and load rom/bios */
+    UWP_MARK("before memory init");
     xbox_memory_init(pcms, system_memory, rom_memory, &ram_memory);
 
     gsi_state = pc_gsi_create(&x86ms->gsi, pcmc->pci_enabled);
 
+    UWP_MARK("before pci init");
     xbox_pci_init(x86ms->gsi,
                   get_system_memory(), get_system_io(),
                   pci_memory, ram_memory, rom_memory,
@@ -276,6 +286,7 @@ void xbox_init_common(MachineState *machine,
     }
 
     /* init basic PC hardware */
+    UWP_MARK("before rtc");
     rtc_state = mc146818_rtc_init(isa_bus, 2000, NULL);
     x86ms->rtc = ISA_DEVICE(rtc_state);
 
@@ -289,14 +300,17 @@ void xbox_init_common(MachineState *machine,
 
     object_property_set_link(OBJECT(pcms->pcspk), "pit",
                              OBJECT(pit), &error_fatal);
+    UWP_MARK("before pcspk");
     isa_realize_and_unref(pcms->pcspk, isa_bus, &error_fatal);
 
     PCIDevice *dev = pci_create_simple(pci_bus, PCI_DEVFN(9, 0), "piix3-ide");
+    UWP_MARK("before ide");
     pci_ide_create_devs(dev);
     // idebus[0] = qdev_get_child_bus(&dev->qdev, "ide.0");
     // idebus[1] = qdev_get_child_bus(&dev->qdev, "ide.1");
 
     /* smbus devices */
+    UWP_MARK("before smc");
     smbus_xbox_smc_init(smbus, 0x10);
 
     const char *video_encoder =
@@ -316,10 +330,12 @@ void xbox_init_common(MachineState *machine,
     /* USB */
     PCIDevice *usb1 = pci_new(PCI_DEVFN(3, 0), "pci-ohci");
     qdev_prop_set_uint32(&usb1->qdev, "num-ports", 4);
+    UWP_MARK("before usb1");
     pci_realize_and_unref(usb1, pci_bus, &error_fatal);
 
     PCIDevice *usb0 = pci_new(PCI_DEVFN(2, 0), "pci-ohci");
     qdev_prop_set_uint32(&usb0->qdev, "num-ports", 4);
+    UWP_MARK("before usb0");
     pci_realize_and_unref(usb0, pci_bus, &error_fatal);
 
     /* Ethernet! */
@@ -328,12 +344,15 @@ void xbox_init_common(MachineState *machine,
     pci_realize_and_unref(nvnet, pci_bus, &error_fatal);
 
     /* APU! */
+    UWP_MARK("before apu");
     mcpx_apu_init(pci_bus, PCI_DEVFN(5, 0), ram_memory);
 
     /* ACI! */
+    UWP_MARK("before aci");
     pci_create_simple(pci_bus, PCI_DEVFN(6, 0), "mcpx-aci");
 
     /* GPU! */
+    UWP_MARK("before nv2a");
     nv2a_init(agp_bus, PCI_DEVFN(0, 0), ram_memory);
 
     /* FIXME: Stub the memory controller */

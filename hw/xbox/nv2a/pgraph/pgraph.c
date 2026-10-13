@@ -27,6 +27,7 @@
 #include "util.h"
 #include "swizzle.h"
 #include "nv2a_vsh_emulator.h"
+#include "qemu/xemu-uwp.h"
 
 #define PG_GET_MASK(reg, mask) GET_MASK(pgraph_reg_r(pg, reg), mask)
 #define PG_SET_MASK(reg, mask, value)        \
@@ -44,7 +45,10 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
     NV2AState *d = (NV2AState *)opaque;
     PGRAPHState *pg = &d->pgraph;
 
+    UWP_PROF_BEGIN(t_lock);
     qemu_mutex_lock(&pg->lock);
+    UWP_PROF_END(VC_GRAPH_LOCK, t_lock);
+    UWP_TRACE("  pgraph read %x", (unsigned)addr);
 
     uint64_t r = 0;
     switch (addr) {
@@ -87,8 +91,11 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     nv2a_reg_log_write(NV_PGRAPH, addr, size, val);
 
+    UWP_PROF_BEGIN(t_lock);
     qemu_mutex_lock(&d->pfifo.lock); // FIXME: Factor out fifo lock here
     qemu_mutex_lock(&pg->lock);
+    UWP_PROF_END(VC_GRAPH_LOCK, t_lock);
+    UWP_TRACE("  pgraph write %x = %x", (unsigned)addr, (unsigned)val);
 
     switch (addr) {
     case NV_PGRAPH_INTR:
@@ -762,7 +769,9 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
             image_blit->height = parameter >> 16;
 
             if (image_blit->width && image_blit->height) {
+                UWP_PROF_BEGIN(t_blit);
                 d->pgraph.renderer->ops.image_blit(d);
+                UWP_PROF_END(PF_BLIT, t_blit);
             }
             break;
         default:
@@ -901,6 +910,7 @@ DEF_METHOD(NV097, FLIP_INCREMENT_WRITE)
 DEF_METHOD(NV097, FLIP_STALL)
 {
     trace_nv2a_pgraph_flip_stall();
+    UWP_TRACE("frame end");
     d->pgraph.renderer->ops.surface_update(d, false, true, true);
     d->pgraph.renderer->ops.flip_stall(d);
     nv2a_profile_flip_stall();
@@ -2505,7 +2515,9 @@ DEF_METHOD(NV097, SET_BEGIN_END)
             return;
         }
         nv2a_profile_inc_counter(NV2A_PROF_BEGIN_ENDS);
+        UWP_PROF_BEGIN(t0);
         d->pgraph.renderer->ops.draw_end(d);
+        UWP_PROF_END(PF_DRAW, t0);
         pgraph_reset_inline_buffers(pg);
         pg->primitive_mode = PRIM_TYPE_INVALID;
     } else {
@@ -2903,7 +2915,9 @@ DEF_METHOD(NV097, SET_COLOR_CLEAR_VALUE)
 
 DEF_METHOD(NV097, CLEAR_SURFACE)
 {
+    UWP_PROF_BEGIN(t_clear);
     d->pgraph.renderer->ops.clear_surface(d, parameter);
+    UWP_PROF_END(PF_CLEAR, t_clear);
 }
 
 DEF_METHOD(NV097, SET_CLEAR_RECT_HORIZONTAL)

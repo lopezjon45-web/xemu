@@ -81,6 +81,10 @@ typedef struct TextureBinding {
     bool border_color_set;
     GLenum gl_target;
     GLuint gl_texture;
+#ifdef XEMU_UWP
+    /* Size of the storage set up for surface-to-texture copies (0: none). */
+    unsigned int s2t_width, s2t_height;
+#endif
 } TextureBinding;
 
 typedef struct ShaderModuleCacheKey {
@@ -214,6 +218,8 @@ typedef struct PGRAPHGLState {
     struct s2t_rndr {
         GLuint fbo, vao, vbo, prog;
         GLuint tex_loc, surface_size_loc;
+        GLuint zeta_prog; /* XEMU_UWP: depth surface -> the color image of its bits */
+        GLint zeta_tex_loc;
     } s2t_rndr;
 
     struct disp_rndr {
@@ -281,6 +287,9 @@ void pgraph_gl_render_surface_to_texture(NV2AState *d, SurfaceBinding *surface, 
 void pgraph_gl_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta);
 void pgraph_gl_surface_download_if_dirty(NV2AState *d, SurfaceBinding *surface);
 SurfaceBinding *pgraph_gl_surface_get(NV2AState *d, hwaddr addr);
+#ifdef XEMU_UWP
+bool pgraph_gl_surface_copy_to(NV2AState *d, SurfaceBinding *src, hwaddr dest_addr);
+#endif
 SurfaceBinding *pgraph_gl_surface_get_within(NV2AState *d, hwaddr addr);
 void pgraph_gl_surface_invalidate(NV2AState *d, SurfaceBinding *e);
 void pgraph_gl_unbind_surface(NV2AState *d, bool color);

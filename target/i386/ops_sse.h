@@ -22,6 +22,68 @@
 #include "crypto/aes-round.h"
 #include "crypto/clmul.h"
 
+#if defined(XEMU_UWP) && defined(__x86_64__) && !defined(UWP_NATIVE_SSE)
+/*
+ * The guest and the host are both x86, so the busiest MMX/SSE helpers (video
+ * decoders live in them) can run the host's own instruction instead of
+ * softfloat or byte loops. The exception flags the host raises belong in the
+ * guest's MXCSR, but reading or writing the host's MXCSR costs 15-20 cycles
+ * on Zen 2 (measured: ~60 cycles per helper call, millions of calls a second
+ * in a video). So with the usual settings (round to nearest, no DAZ/FZ) the
+ * flags are left to pile up in the host's MXCSR; update_mxcsr_from_sse_status
+ * fetches them when the guest reads MXCSR and update_mxcsr_status clears them
+ * when the guest loads it. Only other rounding modes or DAZ/FZ switch the
+ * host's MXCSR around each helper.
+ */
+#define UWP_NATIVE_SSE 1
+#include <emmintrin.h>
+#define UWP_MXCSR_CTL (SSE_RC_MASK | SSE_FZ | SSE_DAZ)
+
+static inline void uwp_sse_begin(CPUX86State *env)
+{
+    if (unlikely(env->mxcsr & UWP_MXCSR_CTL)) {
+        _mm_setcsr((env->mxcsr & UWP_MXCSR_CTL) | 0x1f80);
+    }
+}
+
+static inline void uwp_sse_end(CPUX86State *env)
+{
+    if (unlikely(env->mxcsr & UWP_MXCSR_CTL)) {
+        env->mxcsr |= _mm_getcsr() & 0x3f;
+        _mm_setcsr(0x1f80);
+    }
+}
+
+/*
+ * Registers are read as two 8-byte halves. Generated code writes them that
+ * way, and a 16-byte load right after two 8-byte stores cannot be forwarded
+ * from the store buffer: measured on the console, 12 ns a call instead of 3.
+ * (The empty asm keeps the compiler from merging the halves into one load.)
+ */
+static inline __m128d uwp_ld_pd(const void *p)
+{
+    const double *hi = (const double *)p + 1;
+    __asm__("" : "+r"(hi));
+    return _mm_loadh_pd(_mm_load_sd((const double *)p), hi);
+}
+
+static inline __m128 uwp_ld_ps(const void *p)
+{
+    return _mm_castpd_ps(uwp_ld_pd(p));
+}
+
+static inline __m128i uwp_ld_si(const void *p)
+{
+    return _mm_castpd_si128(uwp_ld_pd(p));
+}
+
+/* the low two floats of a register, the upper two zero */
+static inline __m128 uwp_load_2ps(const void *p)
+{
+    return _mm_castpd_ps(_mm_load_sd((const double *)p));
+}
+#endif
+
 #if SHIFT == 0
 #define Reg MMXReg
 #define XMM_ONLY(...)
@@ -335,6 +397,12 @@ void glue(helper_pmaddwd, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
 {
     int i;
 
+#if SHIFT == 0 && defined(UWP_NATIVE_SSE)
+    _mm_storel_epi64((__m128i *)d,
+                     _mm_madd_epi16(_mm_loadl_epi64((const __m128i *)v),
+                                    _mm_loadl_epi64((const __m128i *)s)));
+    return;
+#endif
     for (i = 0; i < (2 << SHIFT); i++) {
         d->L(i) = (int16_t)s->W(2 * i) * (int16_t)v->W(2 * i) +
             (int16_t)s->W(2 * i + 1) * (int16_t)v->W(2 * i + 1);
@@ -399,6 +467,16 @@ void glue(helper_pshufw, SUFFIX)(Reg *d, Reg *s, int order)
 {
     uint16_t r0, r1, r2, r3;
 
+#ifdef UWP_NATIVE_SSE
+    /* one 8-byte store: the next 8-byte load of d can be forwarded */
+    r0 = s->W(order & 3);
+    r1 = s->W((order >> 2) & 3);
+    r2 = s->W((order >> 4) & 3);
+    r3 = s->W((order >> 6) & 3);
+    d->Q(0) = r0 | ((uint64_t)r1 << 16) | ((uint64_t)r2 << 32) |
+              ((uint64_t)r3 << 48);
+    return;
+#endif
     SHUFFLE4(W, s, s, 0);
 }
 #else
@@ -407,6 +485,15 @@ void glue(helper_shufps, SUFFIX)(Reg *d, Reg *v, Reg *s, int order)
     uint32_t r0, r1, r2, r3;
     int i;
 
+#if SHIFT == 1 && defined(UWP_NATIVE_SSE)
+    /* one 16-byte store, see uwp_ld_pd */
+    r0 = v->L(order & 3);
+    r1 = v->L((order >> 2) & 3);
+    r2 = s->L((order >> 4) & 3);
+    r3 = s->L((order >> 6) & 3);
+    _mm_storeu_si128((__m128i *)d, _mm_set_epi32(r3, r2, r1, r0));
+    return;
+#endif
     for (i = 0; i < 2 << SHIFT; i += 4) {
         SHUFFLE4(L, v, s, i);
     }
@@ -431,6 +518,14 @@ void glue(helper_pshufd, SUFFIX)(Reg *d, Reg *s, int order)
     uint32_t r0, r1, r2, r3;
     int i;
 
+#if SHIFT == 1 && defined(UWP_NATIVE_SSE)
+    r0 = s->L(order & 3);
+    r1 = s->L((order >> 2) & 3);
+    r2 = s->L((order >> 4) & 3);
+    r3 = s->L((order >> 6) & 3);
+    _mm_storeu_si128((__m128i *)d, _mm_set_epi32(r3, r2, r1, r0));
+    return;
+#endif
     for (i = 0; i < 2 << SHIFT; i += 4) {
         SHUFFLE4(L, s, s, i);
     }
@@ -525,12 +620,62 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
 #define FPU_MAX(size, a, b)                                     \
     (float ## size ## _lt(b, a, &env->sse_status) ? (a) : (b))
 
+#if SHIFT == 1 && defined(UWP_NATIVE_SSE)
+/* the host has the very same instructions: use them, under the guest's MXCSR */
+#define UWP_SSE_ARITH(name)                                             \
+    void helper_ ## name ## ps_xmm(CPUX86State *env,                    \
+                                   Reg *d, Reg *v, Reg *s)              \
+    {                                                                   \
+        uwp_sse_begin(env);                                             \
+        _mm_storeu_ps((float *)d, _mm_ ## name ## _ps(                  \
+            uwp_ld_ps(v),                                               \
+            uwp_ld_ps(s)));                                             \
+        uwp_sse_end(env);                                               \
+    }                                                                   \
+                                                                        \
+    void helper_ ## name ## pd_xmm(CPUX86State *env,                    \
+                                   Reg *d, Reg *v, Reg *s)              \
+    {                                                                   \
+        uwp_sse_begin(env);                                             \
+        _mm_storeu_pd((double *)d, _mm_ ## name ## _pd(                 \
+            uwp_ld_pd(v),                                               \
+            uwp_ld_pd(s)));                                             \
+        uwp_sse_end(env);                                               \
+    }                                                                   \
+                                                                        \
+    void helper_ ## name ## ss(CPUX86State *env, Reg *d, Reg *v, Reg *s)\
+    {                                                                   \
+        uwp_sse_begin(env);                                             \
+        _mm_storeu_ps((float *)d, _mm_ ## name ## _ss(                  \
+            uwp_ld_ps(v),                                               \
+            _mm_load_ss((const float *)s)));                            \
+        uwp_sse_end(env);                                               \
+    }                                                                   \
+                                                                        \
+    void helper_ ## name ## sd(CPUX86State *env, Reg *d, Reg *v, Reg *s)\
+    {                                                                   \
+        uwp_sse_begin(env);                                             \
+        _mm_storeu_pd((double *)d, _mm_ ## name ## _sd(                 \
+            uwp_ld_pd(v),                                               \
+            _mm_load_sd((const double *)s)));                           \
+        uwp_sse_end(env);                                               \
+    }
+
+UWP_SSE_ARITH(add)
+UWP_SSE_ARITH(sub)
+UWP_SSE_ARITH(mul)
+UWP_SSE_ARITH(div)
+UWP_SSE_ARITH(min)
+UWP_SSE_ARITH(max)
+#undef UWP_SSE_ARITH
+#else
 SSE_HELPER_S(add, FPU_ADD)
 SSE_HELPER_S(sub, FPU_SUB)
 SSE_HELPER_S(mul, FPU_MUL)
 SSE_HELPER_S(div, FPU_DIV)
 SSE_HELPER_S(min, FPU_MIN)
 SSE_HELPER_S(max, FPU_MAX)
+#endif
 
 void glue(helper_sqrtps, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 {
@@ -641,6 +786,13 @@ void helper_cvtsd2ss(CPUX86State *env, Reg *d, Reg *v, Reg *s)
 void glue(helper_cvtdq2ps, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 {
     int i;
+#if SHIFT == 1 && defined(UWP_NATIVE_SSE)
+    uwp_sse_begin(env);
+    _mm_storeu_ps((float *)d,
+                  _mm_cvtepi32_ps(uwp_ld_si(s)));
+    uwp_sse_end(env);
+    return;
+#endif
     for (i = 0; i < 2 << SHIFT; i++) {
         d->ZMM_S(i) = int32_to_float32(s->ZMM_L(i), &env->sse_status);
     }
@@ -658,6 +810,13 @@ void glue(helper_cvtdq2pd, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 #if SHIFT == 1
 void helper_cvtpi2ps(CPUX86State *env, ZMMReg *d, MMXReg *s)
 {
+#ifdef UWP_NATIVE_SSE
+    uwp_sse_begin(env);
+    _mm_store_sd((double *)d, _mm_castps_pd(_mm_cvtepi32_ps(
+                     _mm_loadl_epi64((const __m128i *)s))));
+    uwp_sse_end(env);
+    return;
+#endif
     d->ZMM_S(0) = int32_to_float32(s->MMX_L(0), &env->sse_status);
     d->ZMM_S(1) = int32_to_float32(s->MMX_L(1), &env->sse_status);
 }
@@ -730,6 +889,13 @@ WRAP_FLOATCONV(int64_t, float64_to_int64_round_to_zero, float64, INT64_MIN)
 void glue(helper_cvtps2dq, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 {
     int i;
+#if SHIFT == 1 && defined(UWP_NATIVE_SSE)
+    uwp_sse_begin(env);
+    _mm_storeu_si128((__m128i *)d,
+                     _mm_cvtps_epi32(uwp_ld_ps(s)));
+    uwp_sse_end(env);
+    return;
+#endif
     for (i = 0; i < 2 << SHIFT; i++) {
         d->ZMM_L(i) = x86_float32_to_int32(s->ZMM_S(i), &env->sse_status);
     }
@@ -749,6 +915,12 @@ void glue(helper_cvtpd2dq, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 #if SHIFT == 1
 void helper_cvtps2pi(CPUX86State *env, MMXReg *d, ZMMReg *s)
 {
+#ifdef UWP_NATIVE_SSE
+    uwp_sse_begin(env);
+    _mm_storel_epi64((__m128i *)d, _mm_cvtps_epi32(uwp_load_2ps(s)));
+    uwp_sse_end(env);
+    return;
+#endif
     d->MMX_L(0) = x86_float32_to_int32(s->ZMM_S(0), &env->sse_status);
     d->MMX_L(1) = x86_float32_to_int32(s->ZMM_S(1), &env->sse_status);
 }
@@ -786,6 +958,13 @@ int64_t helper_cvtsd2sq(CPUX86State *env, ZMMReg *s)
 void glue(helper_cvttps2dq, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 {
     int i;
+#if SHIFT == 1 && defined(UWP_NATIVE_SSE)
+    uwp_sse_begin(env);
+    _mm_storeu_si128((__m128i *)d,
+                     _mm_cvttps_epi32(uwp_ld_ps(s)));
+    uwp_sse_end(env);
+    return;
+#endif
     for (i = 0; i < 2 << SHIFT; i++) {
         d->ZMM_L(i) = x86_float32_to_int32_round_to_zero(s->ZMM_S(i),
                                                          &env->sse_status);
@@ -807,6 +986,12 @@ void glue(helper_cvttpd2dq, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 #if SHIFT == 1
 void helper_cvttps2pi(CPUX86State *env, MMXReg *d, ZMMReg *s)
 {
+#ifdef UWP_NATIVE_SSE
+    uwp_sse_begin(env);
+    _mm_storel_epi64((__m128i *)d, _mm_cvttps_epi32(uwp_load_2ps(s)));
+    uwp_sse_end(env);
+    return;
+#endif
     d->MMX_L(0) = x86_float32_to_int32_round_to_zero(s->ZMM_S(0), &env->sse_status);
     d->MMX_L(1) = x86_float32_to_int32_round_to_zero(s->ZMM_S(1), &env->sse_status);
 }
@@ -1196,9 +1381,28 @@ void glue(helper_pack ## name, SUFFIX)(CPUX86State *env,      \
     }                                                         \
 }
 
+#if SHIFT == 0 && defined(UWP_NATIVE_SSE)
+/* MMX pack: both operands side by side in one host register, packed at once */
+#define UWP_MMX_PACK(name, op)                                          \
+    void helper_pack ## name ## _mmx(CPUX86State *env,                  \
+                                     Reg *d, Reg *v, Reg *s)            \
+    {                                                                   \
+        __m128i vs = _mm_unpacklo_epi64(                                \
+            _mm_loadl_epi64((const __m128i *)v),                        \
+            _mm_loadl_epi64((const __m128i *)s));                       \
+        _mm_storel_epi64((__m128i *)d, op(vs, vs));                     \
+    }
+
+UWP_MMX_PACK(sswb, _mm_packs_epi16)
+UWP_MMX_PACK(uswb, _mm_packus_epi16)
+UWP_MMX_PACK(ssdw, _mm_packs_epi32)
+#undef UWP_MMX_PACK
+#else
 PACK_HELPER_B(sswb, satsb)
 PACK_HELPER_B(uswb, satub)
+#endif
 
+#if !(SHIFT == 0 && defined(UWP_NATIVE_SSE))
 void glue(helper_packssdw, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
 {
     uint16_t r[PACK_WIDTH];
@@ -1216,8 +1420,9 @@ void glue(helper_packssdw, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
         }
     }
 }
+#endif
 
-#define UNPCK_OP(base_name, base)                                       \
+#define UNPCK_OP(base_name, base)                                      \
                                                                         \
     void glue(helper_punpck ## base_name ## bw, SUFFIX)(CPUX86State *env,\
                                                 Reg *d, Reg *v, Reg *s) \
@@ -1289,8 +1494,33 @@ void glue(helper_packssdw, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
              }                                                          \
                                                                         )
 
+#if SHIFT == 0 && defined(UWP_NATIVE_SSE)
+/* MMX unpack: the host does the interleave on 128 bits, one half is kept */
+#define UWP_MMX_UNPCK(name, op)                                         \
+    void helper_punpckl ## name ## _mmx(CPUX86State *env,               \
+                                        Reg *d, Reg *v, Reg *s)         \
+    {                                                                   \
+        _mm_storel_epi64((__m128i *)d,                                  \
+                         op(_mm_loadl_epi64((const __m128i *)v),        \
+                            _mm_loadl_epi64((const __m128i *)s)));      \
+    }                                                                   \
+                                                                        \
+    void helper_punpckh ## name ## _mmx(CPUX86State *env,               \
+                                        Reg *d, Reg *v, Reg *s)         \
+    {                                                                   \
+        _mm_storel_epi64((__m128i *)d, _mm_srli_si128(                  \
+                         op(_mm_loadl_epi64((const __m128i *)v),        \
+                            _mm_loadl_epi64((const __m128i *)s)), 8));  \
+    }
+
+UWP_MMX_UNPCK(bw, _mm_unpacklo_epi8)
+UWP_MMX_UNPCK(wd, _mm_unpacklo_epi16)
+UWP_MMX_UNPCK(dq, _mm_unpacklo_epi32)
+#undef UWP_MMX_UNPCK
+#else
 UNPCK_OP(l, 0)
 UNPCK_OP(h, 1)
+#endif
 
 #undef PACK_WIDTH
 #undef PACK_HELPER_B

@@ -19,6 +19,13 @@
 
 #include "apu_int.h"
 
+#ifdef XEMU_UWP
+void uwp_log(const char *fmt, ...);
+#define UWP_MARK(s) uwp_log("apu monitor: %s", s)
+#else
+#define UWP_MARK(s)
+#endif
+
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 {
     SDL_AudioSpec spec = {
@@ -29,6 +36,19 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 
     d->monitor.stream = NULL;
 
+#ifdef XEMU_UWP
+    /*
+     * On WinRT, starting SDL audio or opening a device from this (QEMU)
+     * thread never returns, so the UI thread opens the stream before QEMU
+     * starts (ui/xemu.c) with this same spec; use that one.
+     */
+    extern SDL_AudioStream *xemu_uwp_audio_stream;
+    d->monitor.stream = xemu_uwp_audio_stream;
+    UWP_MARK(d->monitor.stream ? "using UI-thread audio stream" : "no audio stream");
+    if (d->monitor.stream == NULL) {
+        return; /* run silently; every other use checks monitor.stream */
+    }
+#else
     if (!SDL_Init(SDL_INIT_AUDIO)) {
         error_setg(errp, "SDL_Init failed: %s", SDL_GetError());
         return;
@@ -36,6 +56,7 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 
     d->monitor.stream = SDL_OpenAudioDeviceStream(
         SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+#endif
     if (d->monitor.stream == NULL) {
         error_setg(errp, "SDL_OpenAudioDeviceStream failed: %s",
                    SDL_GetError());
@@ -56,6 +77,14 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     int drain = MAX(dev_drain_bytes, frame_bytes);
     d->monitor.queued_bytes_low = drain;
     d->monitor.queued_bytes_high = 3 * drain;
+#ifdef XEMU_UWP
+    /*
+     * The stream has no SDL device behind it; the XAudio2 feeder takes
+     * 4 KiB (~21 ms) chunks, so keep two to four chunks queued.
+     */
+    d->monitor.queued_bytes_low = 8192;
+    d->monitor.queued_bytes_high = 16384;
+#endif
 
     SDL_ResumeAudioDevice(dev);
 }

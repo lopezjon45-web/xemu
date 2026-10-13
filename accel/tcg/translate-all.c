@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xemu-uwp.h"
 
 #include "trace.h"
 #include "disas/disas.h"
@@ -274,6 +275,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     void *host_pc;
     bool recycled = false;
 
+    UWP_PROF_SCOPE(TB_GEN);
     assert_memory_lock();
     qemu_thread_jit_write();
 

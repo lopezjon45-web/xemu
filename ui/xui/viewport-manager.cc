@@ -68,8 +68,15 @@ void ViewportManager::Update()
     m_pixel_density = fmaxf(SDL_GetWindowPixelDensity(window), 1.0f);
 
     if (g_config.display.ui.auto_scale) {
+#ifdef XEMU_UWP
+        // The console reports no display scale: size the menus for the TV picture, 1x at 1080p and 2x at 4K.
+        int pw = 0, ph = 0;
+        SDL_GetWindowSizeInPixels(window, &pw, &ph);
+        m_scale = ph / 1080.0f;
+#else
         float window_display_scale = fmaxf(SDL_GetWindowDisplayScale(window), 1.0f);
         m_scale = window_display_scale / m_pixel_density;
+#endif
     } else {
         m_scale = g_config.display.ui.scale;
     }

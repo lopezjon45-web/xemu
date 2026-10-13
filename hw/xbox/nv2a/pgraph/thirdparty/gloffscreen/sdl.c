@@ -56,11 +56,22 @@ GloContext *glo_context_create(void)
         SDL_GL_CONTEXT_PROFILE_MASK,
         SDL_GL_CONTEXT_PROFILE_CORE);
 
+#ifdef XEMU_UWP
+    // An Xbox (UWP) app has exactly one window and SDL's WinRT backend
+    // refuses a second one. Offscreen work renders into FBOs, so the contexts
+    // can all use the main window, which is current when the first is made.
+    static SDL_Window *uwp_window;
+    if (uwp_window == NULL) {
+        uwp_window = SDL_GL_GetCurrentWindow();
+    }
+    context->window = uwp_window;
+#else
     // Create main window
     context->window = SDL_CreateWindow(
         "SDL Offscreen Window",
         640, 480,
         SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+#endif
     if (context->window == NULL) {
         fprintf(stderr, "%s: Failed to create window\n", __func__);
         SDL_Quit();

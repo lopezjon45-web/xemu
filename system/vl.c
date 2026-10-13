@@ -2948,6 +2948,13 @@ static const char *get_eeprom_path(void)
     return path;
 }
 
+#ifdef XEMU_UWP
+void uwp_log(const char *fmt, ...);
+#define UWP_MARK(s) uwp_log("qemu_init: %s", s)
+#else
+#define UWP_MARK(s)
+#endif
+
 void qemu_init(int argc, char **argv)
 {
     QemuOpts *opts;
@@ -3089,7 +3096,15 @@ void qemu_init(int argc, char **argv)
     // Always populate DVD drive. If disc path is the empty string, drive is
     // connected but no media present.
     fake_argv[fake_argc++] = strdup("-drive");
+#ifdef XEMU_UWP
+    /* a full disc dump is opened at its game partition, see ui/xemu.c */
+    extern char *xemu_uwp_disc_filename(const char *path);
+    char *dvd_filename = xemu_uwp_disc_filename(dvd_path);
+    char *escaped_dvd_path = strdup_double_commas(dvd_filename);
+    g_free(dvd_filename);
+#else
     char *escaped_dvd_path = strdup_double_commas(dvd_path);
+#endif
     fake_argv[fake_argc++] = g_strdup_printf("index=1,media=cdrom,file=%s",
         escaped_dvd_path);
     free(escaped_dvd_path);
@@ -3164,6 +3179,7 @@ void qemu_init(int argc, char **argv)
 #endif
 
     qemu_init_subsystems();
+    UWP_MARK("after qemu_init_subsystems");
 
     /* first pass of option parsing */
     optind = 1;
@@ -4035,6 +4051,7 @@ void qemu_init(int argc, char **argv)
     parse_memory_options();
 
     qemu_create_machine(machine_opts_dict);
+    UWP_MARK("after qemu_create_machine");
 
     /*
      * Load incoming CPR state before any devices are created, because it
@@ -4048,6 +4065,7 @@ void qemu_init(int argc, char **argv)
     qemu_setup_display();
     qemu_create_default_devices();
     qemu_create_early_backends();
+    UWP_MARK("after qemu_create_early_backends");
 
     qemu_apply_legacy_machine_options(machine_opts_dict);
     qemu_apply_machine_options(machine_opts_dict);
@@ -4059,6 +4077,7 @@ void qemu_init(int argc, char **argv)
      * after qemu_apply_machine_options.
      */
     configure_accelerators(argv[0]);
+    UWP_MARK("after configure_accelerators");
     phase_advance(PHASE_ACCEL_CREATED);
 
     /*
@@ -4089,6 +4108,7 @@ void qemu_init(int argc, char **argv)
      * over memory-backend-file objects).
      */
     qemu_create_late_backends();
+    UWP_MARK("after qemu_create_late_backends");
     phase_advance(PHASE_LATE_BACKENDS_CREATED);
 
     /*
@@ -4106,6 +4126,7 @@ void qemu_init(int argc, char **argv)
 
     qemu_resolve_machine_memdev();
     parse_numa_opts(current_machine);
+    UWP_MARK("after parse_numa_opts");
 
     if (vmstate_dump_file) {
         /* dump and exit */
@@ -4118,7 +4139,9 @@ void qemu_init(int argc, char **argv)
         qmp_x_exit_preconfig(&error_fatal);
     }
     qemu_init_displays();
+    UWP_MARK("after qemu_init_displays");
     accel_setup_post(current_machine);
+    UWP_MARK("after accel_setup_post");
     if (migrate_mode() != MIG_MODE_CPR_EXEC) {
         os_setup_post();
     }

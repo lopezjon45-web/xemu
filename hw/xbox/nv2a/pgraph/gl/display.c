@@ -24,6 +24,7 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "hw/xbox/nv2a/pgraph/util.h"
 #include "renderer.h"
+#include "qemu/xemu-uwp.h"
 
 #include <math.h>
 
@@ -386,6 +387,7 @@ void pgraph_gl_sync(NV2AState *d)
     /* FIXME: Sanity check surface dimensions */
 
     /* Wait for queued commands to complete */
+    UWP_PROF_BEGIN(t0);
     pgraph_gl_upload_surface_data(d, surface, !tcg_enabled());
     gl_fence();
     assert(glGetError() == GL_NO_ERROR);
@@ -398,6 +400,7 @@ void pgraph_gl_sync(NV2AState *d)
 
     /* Switch back to original context */
     glo_set_current(g_nv2a_context_render);
+    UWP_PROF_END(PF_SYNC, t0);
 
     qatomic_set(&d->pgraph.sync_pending, false);
     qemu_event_set(&d->pgraph.sync_complete);

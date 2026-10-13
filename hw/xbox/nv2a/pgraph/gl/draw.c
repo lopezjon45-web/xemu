@@ -23,6 +23,7 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "debug.h"
 #include "renderer.h"
+#include "qemu/xemu-uwp.h"
 
 void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
 {
@@ -157,7 +158,9 @@ void pgraph_gl_draw_begin(NV2AState *d)
 
     assert(r->color_binding || r->zeta_binding);
 
+    UWP_PROF_BEGIN(t_tex);
     pgraph_gl_bind_textures(d);
+    UWP_PROF_END(PF_BIND_TEX, t_tex);
     pgraph_gl_bind_shaders(pg);
 
     glColorMask(mask_red, mask_green, mask_blue, mask_alpha);

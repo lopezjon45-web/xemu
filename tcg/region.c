@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xemu-uwp.h"
 #include "qemu/units.h"
 #include "qemu/madvise.h"
 #include "qemu/mprotect.h"
@@ -538,8 +539,28 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
         return -1;
     }
 
+#ifdef XEMU_UWP
+    /*
+     * Xbox (UWP) apps cannot VirtualAlloc executable memory directly; with the
+     * codeGeneration capability they may allocate it read-write and then make
+     * it read-write-execute.
+     */
+    buf = xemu_uwp_virtual_alloc(NULL, size, MEM_RESERVE | MEM_COMMIT,
+                              PAGE_READWRITE);
+    if (buf != NULL) {
+        ULONG old_protect;
+        if (!xemu_uwp_virtual_protect(buf, size, PAGE_EXECUTE_READWRITE,
+                                   &old_protect)) {
+            DWORD err = GetLastError();
+            VirtualFree(buf, 0, MEM_RELEASE);
+            buf = NULL;
+            SetLastError(err);
+        }
+    }
+#else
     buf = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT,
                              PAGE_EXECUTE_READWRITE);
+#endif
     if (buf == NULL) {
         error_setg_win32(errp, GetLastError(),
                          "allocate %zu bytes for jit buffer", size);

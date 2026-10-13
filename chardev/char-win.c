@@ -108,7 +108,10 @@ int win_chr_serial_init(Chardev *chr, const char *filename, Error **errp)
 
     ZeroMemory(&comcfg, sizeof(COMMCONFIG));
     size = sizeof(COMMCONFIG);
+#ifndef XEMU_UWP
+    /* Not exported on the Xbox; the zeroed config plus the baud rate below is enough */
     GetDefaultCommConfig(filename, &comcfg, &size);
+#endif
     comcfg.dcb.DCBlength = sizeof(DCB);
     comcfg.dcb.BaudRate = CBR_115200;
 

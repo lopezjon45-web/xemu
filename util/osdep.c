@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  */
 #include "qemu/osdep.h"
+#include "qemu/xemu-uwp.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/sockets.h"
@@ -75,9 +76,16 @@ static int qemu_mprotect__osdep(void *addr, size_t size, int prot)
     g_assert(!(size & ~qemu_real_host_page_mask()));
 
 #ifdef _WIN32
+#ifdef XEMU_UWP
+    /* Xbox (UWP) apps may only make memory executable through the FromApp variant. */
+    ULONG old_protect;
+
+    if (!xemu_uwp_virtual_protect(addr, size, prot, &old_protect)) {
+#else
     DWORD old_protect;
 
     if (!VirtualProtect(addr, size, prot, &old_protect)) {
+#endif
         g_autofree gchar *emsg = g_win32_error_message(GetLastError());
         error_report("%s: VirtualProtect failed: %s", __func__, emsg);
         return -1;

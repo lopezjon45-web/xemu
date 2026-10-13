@@ -24,6 +24,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xemu-uwp.h"
 #include "qemu/cutils.h"
 #include "hw/scsi/scsi.h"
 #include "system/block-backend.h"
@@ -153,6 +154,7 @@ static void cd_read_sector_cb(void *opaque, int ret)
 static int cd_read_sector(IDEState *s)
 {
     void *buf;
+    UWP_PROF_COUNT(DVD_READ);
 
     if (s->cd_sector_size != 2048 && s->cd_sector_size != 2352) {
         block_acct_invalid(blk_get_stats(s->blk), BLOCK_ACCT_READ);

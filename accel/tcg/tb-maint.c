@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xemu-uwp.h"
 #include "qemu/interval-tree.h"
 #include "qemu/qtree.h"
 #include "exec/cputlb.h"
@@ -802,6 +803,7 @@ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
 {
     /* If it is already been done on request of another CPU, just retry. */
     if (tb_ctx.tb_flush_count == tb_flush_count.host_int) {
+        UWP_PROF_COUNT(TB_FLUSH);
         tb_flush__exclusive_or_serial();
     }
 }
@@ -1130,6 +1132,7 @@ tb_invalidate_phys_page_range__locked(CPUState *cpu,
     TranslationBlock *tb;
     PageForEachNext n;
     bool current_tb_modified = false;
+    UWP_PROF_COUNT(TB_INVAL);
     TranslationBlock *current_tb = NULL;
 
     /* Range may not cross a page. */

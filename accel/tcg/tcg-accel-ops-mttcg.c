@@ -34,6 +34,7 @@
 #include "tcg/startup.h"
 #include "tcg-accel-ops.h"
 #include "tcg-accel-ops-mttcg.h"
+#include "qemu/xemu-uwp.h"
 
 typedef struct MttcgForceRcuNotifier {
     Notifier notifier;
@@ -74,6 +75,7 @@ static void *mttcg_cpu_thread_fn(void *arg)
     force_rcu.cpu = cpu;
     rcu_add_force_rcu_notifier(&force_rcu.notifier);
     tcg_register_thread();
+    UWP_PROF_THREAD("vcpu");
 
     bql_lock();
     qemu_thread_get_self(cpu->thread);
@@ -85,13 +87,21 @@ static void *mttcg_cpu_thread_fn(void *arg)
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
 
     do {
-        qemu_process_cpu_events(cpu);
+        {
+            UWP_PROF_BEGIN(t_halt);
+            qemu_process_cpu_events(cpu);
+            UWP_PROF_END(CPU_HALT, t_halt);
+        }
 
         if (cpu_can_run(cpu)) {
             int r;
             bql_unlock();
+            UWP_PROF_BEGIN(t_exec);
             r = tcg_cpu_exec(cpu);
+            UWP_PROF_END(CPU_EXEC, t_exec);
+            UWP_PROF_BEGIN(t_bql);
             bql_lock();
+            UWP_PROF_END(CPU_BQL, t_bql);
             switch (r) {
             case EXCP_DEBUG:
                 cpu_handle_guest_debug(cpu);

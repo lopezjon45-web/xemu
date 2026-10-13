@@ -3467,11 +3467,20 @@ void update_mxcsr_status(CPUX86State *env)
 
     /* set flush to zero */
     set_flush_to_zero((mxcsr & SSE_FZ) ? 1 : 0, &env->sse_status);
+
+#if defined(XEMU_UWP) && defined(__x86_64__)
+    /* the native SSE helpers (ops_sse.h) collect flags in the host's MXCSR */
+    __builtin_ia32_ldmxcsr(0x1f80);
+#endif
 }
 
 void update_mxcsr_from_sse_status(CPUX86State *env)
 {
     int flags = get_float_exception_flags(&env->sse_status);
+#if defined(XEMU_UWP) && defined(__x86_64__)
+    /* flags raised by the native SSE helpers (ops_sse.h) */
+    env->mxcsr |= __builtin_ia32_stmxcsr() & 0x3f;
+#endif
     env->mxcsr |= ((flags & float_flag_invalid ? FPUS_IE : 0) |
                    (flags & float_flag_input_denormal_used ? FPUS_DE : 0) |
                    (flags & float_flag_divbyzero ? FPUS_ZE : 0) |

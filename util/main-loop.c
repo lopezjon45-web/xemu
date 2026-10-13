@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xemu-uwp.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/timer.h"
@@ -560,6 +561,9 @@ static int os_host_main_loop_wait(int64_t timeout)
         if (select_ret != 0) {
             timeout = 0;
         }
+        if (select_ret < 0) {
+            UWP_PROF_COUNT(ML_SELECT_ERR);
+        }
         if (select_ret > 0) {
             pollfds_poll(gpollfds, nfds, &rfds, &wfds, &xfds);
         }
@@ -590,7 +594,9 @@ static int os_host_main_loop_wait(int64_t timeout)
 #ifdef XBOX
     qemu_mutex_unlock_main_loop();
 #endif
+    UWP_PROF_BEGIN(t_poll);
     g_poll_ret = qemu_poll_ns(poll_fds, n_poll_fds + w->num, poll_timeout_ns);
+    UWP_PROF_END(ML_POLL, t_poll);
 #ifdef XBOX
     qemu_mutex_lock_main_loop();
 #endif
@@ -598,6 +604,8 @@ static int os_host_main_loop_wait(int64_t timeout)
     replay_mutex_lock();
 
     bql_lock();
+    /* from here to the end of the function the main loop holds the big lock */
+    UWP_PROF_SCOPE(ML_WORK);
     if (g_poll_ret > 0) {
         for (i = 0; i < w->num; i++) {
             w->revents[i] = poll_fds[n_poll_fds + i].revents;

@@ -25,6 +25,7 @@
 #include "hw/xbox/nv2a/pgraph/swizzle.h"
 #include "debug.h"
 #include "renderer.h"
+#include "qemu/xemu-uwp.h"
 
 static void surface_download(NV2AState *d, SurfaceBinding *surface, bool force);
 static void surface_download_to_buffer(NV2AState *d, SurfaceBinding *surface,
@@ -142,6 +143,28 @@ static void init_render_to_texture(PGRAPHState *pg)
         "}\n";
 
     r->s2t_rndr.prog = pgraph_gl_compile_shader(vs, fs);
+#ifdef XEMU_UWP
+    /*
+     * A Z24S8 depth surface read as an A8R8G8B8 / X8R8G8B8 texture (games do
+     * this for depth-of-field and glare effects): the texel is the 32-bit
+     * word (depth << 8 | stencil), so A, R, G are the depth's high, middle
+     * and low byte. The stencil byte (B) is given as 0.
+     */
+    const char *zeta_fs =
+        "#version 330\n"
+        "uniform sampler2D tex;\n"
+        "layout(location = 0) out vec4 out_Color;\n"
+        "void main()\n"
+        "{\n"
+        "    float d = texelFetch(tex, ivec2(gl_FragCoord.xy), 0).r;\n"
+        "    uint v = min(uint(d * 16777215.0 + 0.5), 16777215u);\n"
+        "    out_Color = vec4(float((v >> 8) & 255u), float(v & 255u), 0.0,\n"
+        "                     float(v >> 16)) / 255.0;\n"
+        "}\n";
+    r->s2t_rndr.zeta_prog = pgraph_gl_compile_shader(vs, zeta_fs);
+    r->s2t_rndr.zeta_tex_loc =
+        glGetUniformLocation(r->s2t_rndr.zeta_prog, "tex");
+#endif
     r->s2t_rndr.tex_loc = glGetUniformLocation(r->s2t_rndr.prog, "tex");
     r->s2t_rndr.surface_size_loc = glGetUniformLocation(r->s2t_rndr.prog,
                                                     "surface_size");
@@ -160,6 +183,10 @@ static void finalize_render_to_texture(PGRAPHState *pg)
 
     glDeleteProgram(r->s2t_rndr.prog);
     r->s2t_rndr.prog = 0;
+#ifdef XEMU_UWP
+    glDeleteProgram(r->s2t_rndr.zeta_prog);
+    r->s2t_rndr.zeta_prog = 0;
+#endif
 
     glDeleteVertexArrays(1, &r->s2t_rndr.vao);
     r->s2t_rndr.vao = 0;
@@ -171,6 +198,40 @@ static void finalize_render_to_texture(PGRAPHState *pg)
     r->s2t_rndr.fbo = 0;
 }
 
+#ifdef XEMU_UWP
+/*
+ * A 16-bit depth surface sampled as a 16-bit depth texture (shadow maps): both
+ * are GL_DEPTH_COMPONENT16 here, so pgraph_gl_render_surface_to_texture can
+ * copy the image on the GPU instead of reading the surface back every frame.
+ */
+static bool uwp_zeta_to_texture_ok(const SurfaceBinding *surface,
+                                   const TextureShape *shape)
+{
+    if (surface->color || surface->swizzle) {
+        return false;
+    }
+    /* the texture gets the surface's own GL format, see the copy below */
+    return (surface->fmt.gl_internal_format == GL_DEPTH_COMPONENT16 &&
+            shape->color_format ==
+                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FIXED) ||
+           (surface->fmt.gl_internal_format == GL_DEPTH24_STENCIL8 &&
+            shape->color_format ==
+                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_X8_Y24_FIXED);
+}
+
+/* A 24-bit depth surface read as a color texture: drawn with zeta_prog. */
+static bool uwp_zeta_as_color_ok(const SurfaceBinding *surface,
+                                 const TextureShape *shape)
+{
+    return !surface->color && !surface->swizzle &&
+           surface->fmt.gl_internal_format == GL_DEPTH24_STENCIL8 &&
+           (shape->color_format ==
+                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8 ||
+            shape->color_format ==
+                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8);
+}
+#endif
+
 static bool surface_to_texture_can_fastpath(SurfaceBinding *surface,
                                             TextureShape *shape)
 {
@@ -180,6 +241,10 @@ static bool surface_to_texture_can_fastpath(SurfaceBinding *surface,
     int texture_fmt = shape->color_format;
 
     if (!surface->color) {
+#ifdef XEMU_UWP
+        return uwp_zeta_to_texture_ok(surface, shape) ||
+               uwp_zeta_as_color_ok(surface, shape);
+#endif
         // FIXME: Support zeta to color
         return false;
     }
@@ -244,11 +309,21 @@ static void render_surface_to(NV2AState *d, SurfaceBinding *surface,
 
     glBindVertexArray(r->s2t_rndr.vao);
     glBindBuffer(GL_ARRAY_BUFFER, r->s2t_rndr.vbo);
+#ifdef XEMU_UWP
+    if (!surface->color) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+        glUseProgram(r->s2t_rndr.zeta_prog);
+        glProgramUniform1i(r->s2t_rndr.zeta_prog, r->s2t_rndr.zeta_tex_loc,
+                           texture_unit);
+    } else
+#endif
+    {
     glUseProgram(r->s2t_rndr.prog);
     glProgramUniform1i(r->s2t_rndr.prog, r->s2t_rndr.tex_loc,
                        texture_unit);
     glProgramUniform2f(r->s2t_rndr.prog,
                        r->s2t_rndr.surface_size_loc, width, height);
+    }
 
     glViewport(0, 0, width, height);
     glColorMask(true, true, true, true);
@@ -294,6 +369,9 @@ static void render_surface_to_texture_slow(NV2AState *d,
     size_t bufsize = width * height * surface->fmt.bytes_per_pixel;
 
     uint8_t *buf = g_malloc(bufsize);
+#ifdef XEMU_UWP
+    uwp_dl_counts[UWP_DL_S2T_SLOW]++;
+#endif
     surface_download_to_buffer(d, surface, false, false, false, buf);
 
     width = texture_shape->width;
@@ -333,6 +411,46 @@ void pgraph_gl_render_surface_to_texture(NV2AState *d, SurfaceBinding *surface,
     unsigned int width = texture_shape->width, height = texture_shape->height;
     pgraph_apply_scaling_factor(pg, &width, &height);
 
+#ifdef XEMU_UWP
+    /*
+     * Same pixel format on both sides: copy the image directly instead of
+     * drawing it. On GL-on-D3D12 the draw (framebuffer switch, new texture
+     * storage every time) costs about half a millisecond, and games do this
+     * several times a frame.
+     */
+    bool zeta_tex = uwp_zeta_to_texture_ok(surface, texture_shape);
+    if ((zeta_tex ||
+         (surface->color &&
+          surface->fmt.gl_internal_format == f->gl_internal_format)) &&
+        (texture->gl_target == GL_TEXTURE_2D ||
+         texture->gl_target == GL_TEXTURE_RECTANGLE)) {
+        glActiveTexture(GL_TEXTURE0 + texture_unit);
+        glBindTexture(texture->gl_target, texture->gl_texture);
+        if (texture->s2t_width != width || texture->s2t_height != height) {
+            glTexParameteri(texture->gl_target, GL_TEXTURE_BASE_LEVEL, 0);
+            glTexParameteri(texture->gl_target, GL_TEXTURE_MAX_LEVEL, 0);
+            glTexParameteri(texture->gl_target, GL_TEXTURE_MIN_FILTER,
+                            GL_LINEAR);
+            if (zeta_tex) {
+                /* a depth texture: the surface's exact format, so that the
+                 * image can be copied (sampling it still gives the depth) */
+                glTexImage2D(texture->gl_target, 0,
+                             surface->fmt.gl_internal_format, width, height,
+                             0, surface->fmt.gl_format, surface->fmt.gl_type,
+                             NULL);
+            } else
+            glTexImage2D(texture->gl_target, 0, f->gl_internal_format, width,
+                         height, 0, f->gl_format, f->gl_type, NULL);
+            texture->s2t_width = width;
+            texture->s2t_height = height;
+        }
+        glCopyImageSubData(surface->gl_buffer, GL_TEXTURE_2D, 0, 0, 0, 0,
+                           texture->gl_texture, texture->gl_target, 0, 0, 0, 0,
+                           width, height, 1);
+        return;
+    }
+#endif
+
     glActiveTexture(GL_TEXTURE0 + texture_unit);
     glBindTexture(texture->gl_target, texture->gl_texture);
     glTexParameteri(texture->gl_target, GL_TEXTURE_BASE_LEVEL, 0);
@@ -364,6 +482,11 @@ bool pgraph_gl_check_surface_to_texture_compatibility(
     int texture_fmt = shape->color_format;
 
     if (!surface->color) {
+#ifdef XEMU_UWP
+        return !shape->cubemap && shape->levels == 1 &&
+               (uwp_zeta_to_texture_ok(surface, shape) ||
+                uwp_zeta_as_color_ok(surface, shape));
+#endif
         // FIXME: Support zeta to color
         return false;
     }
@@ -373,10 +496,19 @@ bool pgraph_gl_check_surface_to_texture_compatibility(
         return false;
     }
 
+#ifndef XEMU_UWP
     if (shape->levels > 1) {
         // FIXME: Support rendering surface to mip levels
         return false;
     }
+#else
+    /*
+     * On the Xbox port a surface read-back stalls on the GPU (GL on D3D12),
+     * and games that render into mipmapped textures do it several times a
+     * frame. Take the surface as the base level instead: the surface-to-texture
+     * copy limits sampling to level 0, the only level the surface holds.
+     */
+#endif
 
     switch (surface_fmt) {
     case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5: switch (texture_fmt) {
@@ -425,6 +557,7 @@ static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
                                     hwaddr len, bool write)
 {
     NV2AState *d = (NV2AState *)opaque;
+    UWP_PROF_SCOPE(SURF_CPU_ACCESS);
     qemu_mutex_lock(&d->pgraph.lock);
 
     PGRAPHGLState *r = d->pgraph.gl_renderer_state;
@@ -505,6 +638,7 @@ static void invalidate_overlapping_surfaces(NV2AState *d, SurfaceBinding *surfac
             trace_nv2a_pgraph_surface_evict_overlapping(
                 other_surface->vram_addr, other_surface->width, other_surface->height,
                 other_surface->pitch);
+            UWP_DL_SITE(EVICT_OVERLAP);
             pgraph_gl_surface_download_if_dirty(d, other_surface);
             pgraph_gl_surface_invalidate(d, other_surface);
         }
@@ -587,6 +721,81 @@ void pgraph_gl_surface_invalidate(NV2AState *d, SurfaceBinding *surface)
     g_free(surface);
 }
 
+#ifdef XEMU_UWP
+/*
+ * Copy a whole color surface to another VRAM address without leaving the GPU:
+ * the destination becomes a surface of its own, so a texture bound there is
+ * filled from it directly. Guest memory is brought up to date only if the CPU
+ * touches it (the usual surface access callback). Returns false when the
+ * caller has to do the copy in guest memory instead.
+ */
+bool pgraph_gl_surface_copy_to(NV2AState *d, SurfaceBinding *src,
+                               hwaddr dest_addr)
+{
+    PGRAPHState *pg = &d->pgraph;
+    PGRAPHGLState *r = pg->gl_renderer_state;
+
+    if (check_surface_overlaps_range(src, dest_addr, src->size)) {
+        return false;
+    }
+
+    SurfaceBinding *dest = NULL, *other;
+    QTAILQ_FOREACH(other, &r->surfaces, entry) {
+        if (!check_surface_overlaps_range(other, dest_addr, src->size)) {
+            continue;
+        }
+        if (dest != NULL || other->vram_addr != dest_addr ||
+            other == r->color_binding || other == r->zeta_binding ||
+            !other->color || other->swizzle != src->swizzle ||
+            other->width != src->width || other->height != src->height ||
+            other->pitch != src->pitch ||
+            other->fmt.gl_internal_format != src->fmt.gl_internal_format) {
+            return false;
+        }
+        dest = other;
+    }
+
+    if (src->upload_pending) {
+        pgraph_gl_upload_surface_data(d, src, false);
+    }
+
+    unsigned int width = src->width ? src->width : 1;
+    unsigned int height = src->height ? src->height : 1;
+    pgraph_apply_scaling_factor(pg, &width, &height);
+
+    if (dest == NULL) {
+        GLint last_texture_binding;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_texture_binding);
+
+        SurfaceBinding entry = *src;
+        entry.vram_addr = dest_addr;
+        entry.access_cb = NULL;
+        glGenTextures(1, &entry.gl_buffer);
+        glBindTexture(GL_TEXTURE_2D, entry.gl_buffer);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexImage2D(GL_TEXTURE_2D, 0, entry.fmt.gl_internal_format, width,
+                     height, 0, entry.fmt.gl_format, entry.fmt.gl_type, NULL);
+        glBindTexture(GL_TEXTURE_2D, last_texture_binding);
+        dest = surface_put(d, dest_addr, &entry);
+    }
+
+    glCopyImageSubData(src->gl_buffer, GL_TEXTURE_2D, 0, 0, 0, 0,
+                       dest->gl_buffer, GL_TEXTURE_2D, 0, 0, 0, 0,
+                       width, height, 1);
+
+    pg->draw_time++;
+    dest->draw_time = pg->draw_time;
+    dest->frame_time = pg->frame_time;
+    dest->draw_dirty = true;
+    dest->download_pending = false;
+    dest->upload_pending = false;
+    dest->cleared = false;
+    return true;
+}
+#endif
+
 static void surface_evict_old(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -599,6 +808,7 @@ static void surface_evict_old(NV2AState *d)
         int last_used = d->pgraph.frame_time - s->frame_time;
         if (last_used >= surface_age_limit) {
             trace_nv2a_pgraph_surface_evict_reason("old", s->vram_addr);
+            UWP_DL_SITE(EVICT_OLD);
             pgraph_gl_surface_download_if_dirty(d, s);
             pgraph_gl_surface_invalidate(d, s);
         }
@@ -772,9 +982,22 @@ static void surface_download(NV2AState *d, SurfaceBinding *surface, bool force)
     /* FIXME: Respect write enable at last TOU? */
 
     nv2a_profile_inc_counter(NV2A_PROF_SURF_DOWNLOAD);
+#ifdef XEMU_UWP
+    {
+        uwp_dl_counts[uwp_dl_site]++;
+        UWP_TRACE("  readback site %d: %s %ux%u pitch %u swz %d addr %x "
+                  "cfmt %d zfmt %d",
+                  uwp_dl_site, surface->color ? "color" : "zeta",
+                  surface->width, surface->height, surface->pitch,
+                  surface->swizzle, (unsigned)surface->vram_addr,
+                  surface->shape.color_format, surface->shape.zeta_format);
+    }
+#endif
 
+    UWP_PROF_BEGIN(t0);
     surface_download_to_buffer(d, surface, true, false, true,
                                d->vram_ptr + surface->vram_addr);
+    UWP_PROF_END(PF_SURF_DOWN, t0);
 
     memory_region_set_client_dirty(d->vram, surface->vram_addr,
                                    surface->pitch * surface->height,
@@ -794,6 +1017,7 @@ void pgraph_gl_process_pending_downloads(NV2AState *d)
 
     SurfaceBinding *surface;
     QTAILQ_FOREACH(surface, &r->surfaces, entry) {
+        UWP_DL_SITE(CPU_ACCESS);
         surface_download(d, surface, false);
     }
 
@@ -808,6 +1032,7 @@ void pgraph_gl_download_dirty_surfaces(NV2AState *d)
 
     SurfaceBinding *surface;
     QTAILQ_FOREACH(surface, &r->surfaces, entry) {
+        UWP_DL_SITE(ALL_DIRTY);
         pgraph_gl_surface_download_if_dirty(d, surface);
     }
 
@@ -955,10 +1180,12 @@ void pgraph_gl_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     }
 
+    UWP_PROF_BEGIN(t0);
     glBindTexture(GL_TEXTURE_2D, surface->gl_buffer);
     glTexImage2D(GL_TEXTURE_2D, 0, surface->fmt.gl_internal_format, width,
                  height, 0, surface->fmt.gl_format, surface->fmt.gl_type,
                  gl_read_buf);
+    UWP_PROF_END(PF_SURF_UP, t0);
     glPixelStorei(GL_UNPACK_ALIGNMENT, prev_unpack_alignment);
     if (optimal_buf != buf) {
         g_free(optimal_buf);
@@ -1123,6 +1350,22 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
              */
             SurfaceBinding *other = (color ? r->zeta_binding
                                            : r->color_binding);
+#ifdef XEMU_UWP
+            if (!color && found->color &&
+                (found == other || pg->frame_time - found->frame_time <= 1)) {
+                /*
+                 * The depth buffer set to memory that is a color image: the
+                 * color target itself, or one drawn this frame or the last
+                 * (seen: two 160x120 blur targets, each named as the depth
+                 * buffer while the other is drawn). Such passes cannot be
+                 * using depth. Making a depth surface there would throw the
+                 * color surface away, with two read-backs, every frame:
+                 * draw without a depth buffer instead.
+                 */
+                surface->buffer_dirty = false;
+                return;
+            }
+#endif
             if (found == other) {
                 NV2A_UNIMPLEMENTED("Same color & zeta surface offset");
                 pgraph_gl_unbind_surface(d, !color);
@@ -1184,12 +1427,36 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                                  zeta_entry.vram_addr >= color_end;
             }
 
+#ifdef XEMU_UWP
+            /*
+             * Games render to a smaller color target with the main depth
+             * buffer still set (seen: 512x384 color, 640x480 depth, twice a
+             * frame). The pitch matched above, so the larger depth image is
+             * that same memory with the color target's pixels in its top
+             * left corner: keep it bound, as the console does, instead of
+             * reading it back and building a smaller one. The drawing area
+             * stays the color target's.
+             */
+            bool zeta_larger = false;
+            if (is_compatible && !color && r->color_binding) {
+                is_compatible &= (found->width >= r->color_binding->width) &&
+                                 (found->height >= r->color_binding->height);
+                zeta_larger = is_compatible &&
+                              (found->width != r->color_binding->width ||
+                               found->height != r->color_binding->height);
+            }
+#else
             if (is_compatible && !color && r->color_binding) {
                 is_compatible &= (found->width == r->color_binding->width) &&
                                  (found->height == r->color_binding->height);
             }
+#endif
 
             if (is_compatible) {
+#ifdef XEMU_UWP
+                if (!zeta_larger)
+#endif
+                {
                 /* FIXME: Refactor */
                 pg->surface_binding_dim.width = found->width;
                 pg->surface_binding_dim.clip_x = found->shape.clip_x;
@@ -1197,6 +1464,7 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                 pg->surface_binding_dim.height = found->height;
                 pg->surface_binding_dim.clip_y = found->shape.clip_y;
                 pg->surface_binding_dim.clip_height = found->shape.clip_height;
+                }
                 found->upload_pending |= mem_dirty;
                 pg->surface_zeta.buffer_dirty |= color;
                 should_create = false;
@@ -1204,6 +1472,23 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                 trace_nv2a_pgraph_surface_evict_reason(
                     "incompatible", found->vram_addr);
                 compare_surfaces(found, &entry);
+#ifdef XEMU_UWP
+                if (found->draw_dirty) {
+                    UWP_TRACE("  evict %s addr %x: had %ux%u pitch %u swz %d "
+                              "ifmt %x | wanted %ux%u pitch %u swz %d ifmt %x "
+                              "| color binding %ux%u, clearing %d",
+                              color ? "color" : "zeta",
+                              (unsigned)found->vram_addr, found->width,
+                              found->height, found->pitch, found->swizzle,
+                              found->fmt.gl_internal_format, entry.width,
+                              entry.height, entry.pitch, entry.swizzle,
+                              entry.fmt.gl_internal_format,
+                              r->color_binding ? r->color_binding->width : 0,
+                              r->color_binding ? r->color_binding->height : 0,
+                              pg->clearing);
+                }
+#endif
+                UWP_DL_SITE(EVICT_INCOMPATIBLE);
                 pgraph_gl_surface_download_if_dirty(d, found);
                 pgraph_gl_surface_invalidate(d, found);
             }
@@ -1388,8 +1673,14 @@ void pgraph_gl_surface_update(NV2AState *d, bool upload, bool color_write,
 
     // Sanity check color and zeta dimensions match
     if (r->color_binding && r->zeta_binding) {
+#ifdef XEMU_UWP
+        /* the depth buffer may be the larger one, see update_surface_part */
+        assert((r->color_binding->width <= r->zeta_binding->width)
+               && (r->color_binding->height <= r->zeta_binding->height));
+#else
         assert((r->color_binding->width == r->zeta_binding->width)
                && (r->color_binding->height == r->zeta_binding->height));
+#endif
     }
 
     surface_evict_old(d);

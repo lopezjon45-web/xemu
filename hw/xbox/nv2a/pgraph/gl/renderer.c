@@ -23,6 +23,7 @@
 #include "hw/xbox/nv2a/pgraph/pgraph.h"
 #include "debug.h"
 #include "renderer.h"
+#include "qemu/xemu-uwp.h"
 
 GloContext *g_nv2a_context_render;
 GloContext *g_nv2a_context_display;
@@ -102,7 +103,16 @@ static void pgraph_gl_finalize(NV2AState *d)
 static void pgraph_gl_flip_stall(NV2AState *d)
 {
     NV2A_GL_DFRAME_TERMINATOR();
+    UWP_PROF_BEGIN(t0);
+#ifdef XEMU_UWP
+    /* On GL-on-D3D12, glFinish blocks until the GPU is idle, which stalls the
+     * renderer thread every frame. The display path waits on a fence before
+     * it reads the frame, so submitting the work is enough here. */
+    glFlush();
+#else
     glFinish();
+#endif
+    UWP_PROF_END(PF_FLIP_FINISH, t0);
 }
 
 static void pgraph_gl_flush(NV2AState *d)

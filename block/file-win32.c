@@ -250,10 +250,16 @@ static void raw_probe_alignment(BlockDriverState *bs, Error **errp)
         /* try GetDiskFreeSpace too */
     }
 
-    if (s->drive_path[0]) {
+    /*
+     * Only trust the answer if the call succeeded: in an Xbox (UWP) app the
+     * drive root is not accessible, GetDiskFreeSpace fails and the sector
+     * size would be left uninitialized.
+     */
+    if (s->drive_path[0] &&
         GetDiskFreeSpace(s->drive_path, &sectorsPerCluster,
                          &dg.Geometry.BytesPerSector,
-                         &freeClusters, &totalClusters);
+                         &freeClusters, &totalClusters) &&
+        is_power_of_2(dg.Geometry.BytesPerSector)) {
         bs->bl.request_alignment = dg.Geometry.BytesPerSector;
         return;
     }

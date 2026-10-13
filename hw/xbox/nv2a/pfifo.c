@@ -20,6 +20,7 @@
  */
 
 #include "nv2a_int.h"
+#include "qemu/xemu-uwp.h"
 
 typedef struct RAMHTEntry {
     uint32_t handle;
@@ -38,7 +39,9 @@ uint64_t pfifo_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
 
+    UWP_PROF_BEGIN(t_lock);
     qemu_mutex_lock(&d->pfifo.lock);
+    UWP_PROF_END(VC_FIFO_LOCK, t_lock);
 
     uint64_t r = 0;
     switch (addr) {
@@ -68,7 +71,9 @@ void pfifo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     nv2a_reg_log_write(NV_PFIFO, addr, size, val);
 
+    UWP_PROF_BEGIN(t_lock);
     qemu_mutex_lock(&d->pfifo.lock);
+    UWP_PROF_END(VC_FIFO_LOCK, t_lock);
 
     switch (addr) {
     case NV_PFIFO_INTR_0:
@@ -454,6 +459,7 @@ void *pfifo_thread(void *arg)
     NV2AState *d = (NV2AState *)arg;
 
     pgraph_init_thread(d);
+    UWP_PROF_THREAD("pfifo");
 
     rcu_register_thread();
 
@@ -464,7 +470,9 @@ void *pfifo_thread(void *arg)
         pgraph_process_pending(d);
 
         if (!d->pfifo.halt) {
+            UWP_PROF_BEGIN(t_push);
             pfifo_run_pusher(d);
+            UWP_PROF_END(PF_PUSHER, t_push);
         }
 
         pgraph_process_pending_reports(d);
@@ -473,7 +481,9 @@ void *pfifo_thread(void *arg)
             qemu_cond_broadcast(&d->pfifo.fifo_idle_cond);
 
             // Both the pusher and puller are waiting for some action
+            UWP_PROF_BEGIN(t0);
             qemu_cond_wait(&d->pfifo.fifo_cond, &d->pfifo.lock);
+            UWP_PROF_END(PF_IDLE, t0);
         }
 
         if (d->exiting) {

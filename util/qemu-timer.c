@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xemu-uwp.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
 #include "qemu/lockable.h"
@@ -351,9 +352,11 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
     if ((0 < timeout) && (timeout < XBOX_BUSYWAIT_THRESHOLD_NS)) {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         int64_t end = now + timeout;
+        UWP_PROF_BEGIN(t_spin);
         while (now < end) {
             now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         }
+        UWP_PROF_END(ML_SPIN, t_spin);
         timeout = 0;
     }
 #endif

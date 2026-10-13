@@ -18,8 +18,14 @@
  */
 
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include "qemu/xemu-uwp.h"
 
 NV2AStats g_nv2a_stats;
+#ifdef XEMU_UWP
+/* Running totals of the per-frame counters, for the heartbeat log. */
+int64_t uwp_prof_nv2a_totals[NV2A_PROF__COUNT];
+int64_t uwp_prof_nv2a_frames;
+#endif
 
 void nv2a_profile_increment(void)
 {
@@ -50,6 +56,12 @@ void nv2a_profile_flip_stall(void)
     g_nv2a_stats.frame_ptr =
         (g_nv2a_stats.frame_ptr + 1) % NV2A_PROF_NUM_FRAMES;
     g_nv2a_stats.frame_count++;
+#ifdef XEMU_UWP
+    for (int i = 0; i < NV2A_PROF__COUNT; i++) {
+        uwp_prof_nv2a_totals[i] += g_nv2a_stats.frame_working.counters[i];
+    }
+    uwp_prof_nv2a_frames++;
+#endif
     memset(&g_nv2a_stats.frame_working, 0, sizeof(g_nv2a_stats.frame_working));
 }
 

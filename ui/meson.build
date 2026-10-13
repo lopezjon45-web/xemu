@@ -28,6 +28,7 @@ xemu_ss.add(files(
   'xemu-controllers.cc',
 
   'xemu.c',
+  'xemu-uwp-audio.c',
   'xemu-data.c',
   'xemu-snapshots.c',
   'xemu-thumbnail.cc',

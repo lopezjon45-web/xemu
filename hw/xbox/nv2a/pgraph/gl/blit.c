@@ -21,6 +21,7 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "renderer.h"
+#include "qemu/xemu-uwp.h"
 
 static void perform_blit(int operation, uint8_t *source, uint8_t *dest,
                          size_t width, size_t height, size_t width_bytes,
@@ -116,7 +117,36 @@ void pgraph_gl_image_blit(NV2AState *d)
     hwaddr dest_addr = dest - d->vram_ptr;
 
     SurfaceBinding *surf_src = pgraph_gl_surface_get(d, source_addr);
+    UWP_TRACE("  blit op %x fmt %x: src %x (surface %d dirty %d %ux%u) pitch %u "
+              "-> dst %x pitch %u, in %u,%u out %u,%u size %ux%u",
+              image_blit->operation, context_surfaces->color_format,
+              (unsigned)source_addr, surf_src != NULL,
+              surf_src ? surf_src->draw_dirty : 0,
+              surf_src ? surf_src->width : 0, surf_src ? surf_src->height : 0,
+              context_surfaces->source_pitch, (unsigned)dest_addr,
+              context_surfaces->dest_pitch, image_blit->in_x,
+              image_blit->in_y, image_blit->out_x, image_blit->out_y,
+              image_blit->width, image_blit->height);
+#ifdef XEMU_UWP
+    if (surf_src && surf_src->draw_dirty && surf_src->color &&
+        !surf_src->swizzle && surf_src->fmt.bytes_per_pixel == 4 &&
+        image_blit->operation == NV09F_SET_OPERATION_SRCCOPY &&
+        context_surfaces->color_format == NV062_SET_COLOR_FORMAT_LE_A8R8G8B8 &&
+        image_blit->in_x == 0 && image_blit->in_y == 0 &&
+        image_blit->out_x == 0 && image_blit->out_y == 0 &&
+        image_blit->width == surf_src->width &&
+        image_blit->height == surf_src->height &&
+        context_surfaces->source_pitch == surf_src->pitch &&
+        context_surfaces->dest_pitch == surf_src->pitch &&
+        nv_clip_gpu_tile_blit(d, dest_addr, surf_src->size) == surf_src->size &&
+        pgraph_gl_surface_copy_to(d, surf_src, dest_addr)) {
+        /* A full-surface copy (e.g. grabbing the frame for a screen effect). */
+        uwp_gpu_blits++;
+        return;
+    }
+#endif
     if (surf_src) {
+        UWP_DL_SITE(BLIT);
         pgraph_gl_surface_download_if_dirty(d, surf_src);
     }
 
@@ -154,6 +184,7 @@ void pgraph_gl_image_blit(NV2AState *d)
     if (surf_dest) {
         if (adjusted_height < surf_dest->height ||
             row_pixels < surf_dest->width) {
+            UWP_DL_SITE(BLIT);
             pgraph_gl_surface_download_if_dirty(d, surf_dest);
         } else {
             // The blit will completely replace the surface so any pending
