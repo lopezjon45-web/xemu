@@ -183,6 +183,9 @@ typedef struct PGRAPHGLState {
     Lru element_cache;
     VertexLruNode *element_cache_entries;
     GLuint gl_inline_array_buffer;
+#ifdef XEMU_UWP
+#define PGRAPH_GL_UWP_STREAM 1
+#endif
     GLuint gl_memory_buffer;
     GLuint gl_vertex_array;
     GLuint gl_inline_buffer[NV2A_VERTEXSHADER_ATTRIBUTES];
@@ -268,6 +271,9 @@ void pgraph_gl_process_pending_reports(NV2AState *d);
 void pgraph_gl_surface_flush(NV2AState *d);
 void pgraph_gl_surface_update(NV2AState *d, bool upload, bool color_write, bool zeta_write);
 void pgraph_gl_sync(NV2AState *d);
+#ifdef XEMU_UWP
+GLintptr pgraph_gl_uwp_stream_put(const void *data, size_t size);
+#endif
 void pgraph_gl_update_entire_memory_buffer(NV2AState *d);
 void pgraph_gl_init_display(NV2AState *d);
 void pgraph_gl_finalize_display(PGRAPHState *pg);

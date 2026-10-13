@@ -45,6 +45,28 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
     NV2AState *d = (NV2AState *)opaque;
     PGRAPHState *pg = &d->pgraph;
 
+    /*
+     * Lock-free fast path for the GPU fence register the guest busy-polls.
+     * The Xbox D3D runtime polls NV_PGRAPH_PATT_COLOR0 for its fence value;
+     * taking pg->lock for each poll convoys with the FIFO puller, which
+     * needs the same lock to advance the fence being polled for. A
+     * momentarily stale read is what real hardware gives a CPU polling an
+     * asynchronously updated register. The write side is serialized: the
+     * fence method runs under pg->lock, and guest MMIO writes to this
+     * register are issued by the same single vCPU that polls it.
+     */
+    if (addr == NV_PGRAPH_PATT_COLOR0 && size == 4) {
+        uint64_t fr = qatomic_read(&pg->regs_[NV_PGRAPH_PATT_COLOR0]);
+        /*
+         * Pairs with the smp_wmb at the fence write site in pgraph_method,
+         * so that the pgraph effects preceding the fence are visible once
+         * the new fence value is.
+         */
+        smp_rmb();
+        nv2a_reg_log_read(NV_PGRAPH, addr, size, fr);
+        return fr;
+    }
+
     UWP_PROF_BEGIN(t_lock);
     qemu_mutex_lock(&pg->lock);
     UWP_PROF_END(VC_GRAPH_LOCK, t_lock);
@@ -184,6 +206,23 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     qemu_mutex_unlock(&d->pfifo.lock);
 }
 
+static void pgraph_update_irq_bh(void *opaque)
+{
+    NV2AState *d = opaque;
+    nv2a_update_irq(d);
+}
+
+/* Raising a PGRAPH interrupt needs the BQL, but taking the BQL from the
+ * pfifo thread can deadlock: a BQL holder may itself be blocked waiting on
+ * this very thread. For example, IDE DMA loading game data into RAM that
+ * overlaps a GPU-watched range holds the BQL and waits for the
+ * memory-access-callback flush that only the pfifo thread performs. Defer
+ * the IRQ raise to a main-loop bottom half, which runs with the BQL held. */
+static void pgraph_schedule_irq_update(NV2AState *d)
+{
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), pgraph_update_irq_bh, d);
+}
+
 void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -205,12 +244,8 @@ void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
                             NV_PGRAPH_DEBUG_3_HW_CONTEXT_SWITCH));
 
         pg->waiting_for_context_switch = true;
-        qemu_mutex_unlock(&pg->lock);
-        bql_lock();
         pg->pending_interrupts |= NV_PGRAPH_INTR_CONTEXT_SWITCH;
-        nv2a_update_irq(d);
-        bql_unlock();
-        qemu_mutex_lock(&pg->lock);
+        pgraph_schedule_irq_update(d);
     }
 }
 
@@ -709,7 +744,14 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
     case NV_CONTEXT_PATTERN: {
         switch (method) {
         case NV044_SET_MONOCHROME_COLOR0:
-            pgraph_reg_w(pg, NV_PGRAPH_PATT_COLOR0, parameter);
+            /*
+             * Xbox D3D GPU fence value, busy-polled by the guest CPU; see
+             * the lock-free read path in pgraph_read. The barrier orders
+             * the pgraph effects of preceding methods before the fence
+             * store becomes visible to the polling vCPU.
+             */
+            smp_wmb();
+            pgraph_reg_w_atomic(pg, NV_PGRAPH_PATT_COLOR0, parameter);
             break;
         default:
             goto unhandled;
@@ -858,11 +900,7 @@ DEF_METHOD(NV097, NO_OPERATION)
     pg->pending_interrupts |= NV_PGRAPH_INTR_ERROR;
     pg->waiting_for_nop = true;
 
-    qemu_mutex_unlock(&pg->lock);
-    bql_lock();
-    nv2a_update_irq(d);
-    bql_unlock();
-    qemu_mutex_lock(&pg->lock);
+    pgraph_schedule_irq_update(d);
 }
 
 DEF_METHOD(NV097, WAIT_FOR_IDLE)
@@ -2765,11 +2803,28 @@ DEF_METHOD(NV097, DRAW_ARRAYS)
     pg->draw_arrays_prevent_connect = false;
 }
 
-DEF_METHOD_NON_INC(NV097, INLINE_ARRAY)
+/* Defined without the NON_INC wrapper on purpose: bulk vertex data would
+ * otherwise pay a dispatch-loop iteration per word. Consume the whole run
+ * at once instead. */
+DEF_METHOD(NV097, INLINE_ARRAY)
 {
     pgraph_check_within_begin_end_block(pg);
     assert(pg->inline_array_length < NV2A_MAX_BATCH_LENGTH);
-    pg->inline_array[pg->inline_array_length++] = parameter;
+
+    if (inc) {
+        pg->inline_array[pg->inline_array_length++] = parameter;
+        return;
+    }
+
+    size_t count = MIN(num_words_available,
+                       (size_t)NV2A_MAX_BATCH_LENGTH -
+                           (size_t)pg->inline_array_length);
+    for (size_t i = 0; i < count; i++) {
+        pg->inline_array[pg->inline_array_length + i] =
+            ldl_le_p(parameters + i);
+    }
+    pg->inline_array_length += count;
+    *num_words_consumed = count;
 }
 
 DEF_METHOD_INC(NV097, SET_EYE_VECTOR)

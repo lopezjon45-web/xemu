@@ -79,6 +79,9 @@ typedef struct UwpStreamRange {
 } UwpStreamRange;
 
 static UwpStreamRange uwp_stream_ranges[UWP_STREAM_RANGES];
+/* VRAM ranges whose dirty state has already been asked for during the current draw */
+static hwaddr uwp_draw_checked[16][2];
+static int uwp_draw_checked_count;
 static unsigned int uwp_stream_next, uwp_stream_gen = 1;
 static GLintptr uwp_stream_pos;
 static GLuint uwp_stream_buffer;
@@ -92,12 +95,25 @@ static GLintptr uwp_stream_vertices(NV2AState *d, hwaddr addr, hwaddr end,
                                     hwaddr min_off)
 {
     hwaddr size = end - addr;
+    bool checked = false;
 
+    for (int i = 0; i < uwp_draw_checked_count; i++) {
+        if (uwp_draw_checked[i][0] <= addr && end <= uwp_draw_checked[i][1]) {
+            checked = true;
+            break;
+        }
+    }
     if (size == 0) {
         /* a draw of no vertices that starts on a page boundary: nothing to copy */
         return MAX(uwp_stream_pos, (GLintptr)TARGET_PAGE_ALIGN(min_off)) % UWP_STREAM_SIZE;
     }
-    if (memory_region_test_and_clear_dirty(d->vram, addr, size,
+    if (!checked && uwp_draw_checked_count < ARRAY_SIZE(uwp_draw_checked)) {
+        uwp_draw_checked[uwp_draw_checked_count][0] = addr;
+        uwp_draw_checked[uwp_draw_checked_count][1] = end;
+        uwp_draw_checked_count++;
+    }
+    if (!checked &&
+        memory_region_test_and_clear_dirty(d->vram, addr, size,
                                            DIRTY_MEMORY_NV2A)) {
         /* the guest wrote here: every copy that overlaps is out of date */
         for (int i = 0; i < UWP_STREAM_RANGES; i++) {
@@ -116,7 +132,8 @@ static GLintptr uwp_stream_vertices(NV2AState *d, hwaddr addr, hwaddr end,
         }
     }
 
-    GLintptr pos = MAX(uwp_stream_pos, (GLintptr)TARGET_PAGE_ALIGN(min_off));
+    GLintptr pos = MAX((GLintptr)TARGET_PAGE_ALIGN(uwp_stream_pos),
+                       (GLintptr)TARGET_PAGE_ALIGN(min_off));
     if (pos + (GLintptr)size > UWP_STREAM_SIZE) {
         glBufferData(GL_ARRAY_BUFFER, UWP_STREAM_SIZE, NULL, GL_STREAM_DRAW);
         uwp_stream_gen++;
@@ -154,6 +171,44 @@ static GLintptr uwp_stream_vertices(NV2AState *d, hwaddr addr, hwaddr end,
 }
 #endif
 
+#ifdef XEMU_UWP
+/*
+ * The other per-draw vertex data (inline arrays, inline buffers) goes through
+ * the same stream. Upstream gives each its own GL buffer and respecifies it
+ * with glBufferData for every draw; on D3D12 that is a fresh allocation in
+ * the kernel each time (several hundred a frame in Halo 2). Leaves the stream
+ * buffer bound to GL_ARRAY_BUFFER and returns the offset of the copy.
+ */
+static GLintptr uwp_inline_array_base;
+
+GLintptr pgraph_gl_uwp_stream_put(const void *data, size_t size)
+{
+    glBindBuffer(GL_ARRAY_BUFFER, uwp_stream_buffer);
+    GLintptr pos = ROUND_UP(uwp_stream_pos, 64);
+    if (size == 0) {
+        return pos % UWP_STREAM_SIZE;
+    }
+    if (pos + (GLintptr)size > UWP_STREAM_SIZE) {
+        glBufferData(GL_ARRAY_BUFFER, UWP_STREAM_SIZE, NULL, GL_STREAM_DRAW);
+        uwp_stream_gen++;
+        pos = 0;
+    }
+    void *map = glMapBufferRange(GL_ARRAY_BUFFER, pos, size,
+                                 GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT |
+                                 GL_MAP_UNSYNCHRONIZED_BIT);
+    if (map) {
+        memcpy(map, data, size);
+        glUnmapBuffer(GL_ARRAY_BUFFER);
+    } else {
+        while (glGetError() != GL_NO_ERROR) {
+        }
+        glBufferSubData(GL_ARRAY_BUFFER, pos, size, data);
+    }
+    uwp_stream_pos = pos + size;
+    return pos;
+}
+#endif
+
 void pgraph_gl_update_entire_memory_buffer(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -177,6 +232,9 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
     PGRAPHGLState *r = pg->gl_renderer_state;
 
     bool updated_memory_buffer = false;
+#ifdef XEMU_UWP
+    uwp_draw_checked_count = 0;
+#endif
     unsigned int num_elements = max_element - min_element + 1;
 
     if (inline_data) {
@@ -254,7 +312,13 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
         bool uwp_streamed = false;
 #endif
         if (inline_data) {
+#ifdef XEMU_UWP
+            glBindBuffer(GL_ARRAY_BUFFER, uwp_stream_buffer);
+            attrib_pointer = uwp_inline_array_base + attr->inline_array_offset;
+            uwp_streamed = true;
+#else
             glBindBuffer(GL_ARRAY_BUFFER, r->gl_inline_array_buffer);
+#endif
             attrib_data_addr = attr->inline_array_offset;
             stride = inline_stride;
         } else {
@@ -363,10 +427,14 @@ unsigned int pgraph_gl_bind_inline_array(NV2AState *d)
     NV2A_DPRINTF("draw inline array %d, %d\n", vertex_size, index_count);
 
     nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_2);
-    glBindBuffer(GL_ARRAY_BUFFER, r->gl_inline_array_buffer);
     GLsizeiptr buffer_size = index_count * vertex_size;
+#ifdef XEMU_UWP
+    uwp_inline_array_base = pgraph_gl_uwp_stream_put(pg->inline_array, buffer_size);
+#else
+    glBindBuffer(GL_ARRAY_BUFFER, r->gl_inline_array_buffer);
     glBufferData(GL_ARRAY_BUFFER, buffer_size, NULL, GL_STREAM_DRAW);
     glBufferSubData(GL_ARRAY_BUFFER, 0, buffer_size, pg->inline_array);
+#endif
     pgraph_gl_bind_vertex_attributes(d, 0, index_count-1, true, vertex_size,
                                   index_count-1);
 

@@ -23,6 +23,10 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "debug.h"
 #include "renderer.h"
+#ifdef XEMU_UWP
+bool xemu_uwp_skip_draws;
+unsigned int xemu_uwp_prim_hist[16];
+#endif
 #include "qemu/xemu-uwp.h"
 
 void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
@@ -149,8 +153,14 @@ void pgraph_gl_draw_begin(NV2AState *d)
     bool stencil_test =
         pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1) & NV_PGRAPH_CONTROL_1_STENCIL_TEST_ENABLE;
     bool is_nop_draw = !(color_write || depth_test || stencil_test);
+#ifdef XEMU_UWP
+    /* measuring aid (link parameter skipdraws=1): how fast is the game with a renderer that costs nothing? */
+    is_nop_draw |= xemu_uwp_skip_draws;
+#endif
 
+    UWP_PROF_BEGIN(t_surf);
     pgraph_gl_surface_update(d, true, true, depth_test || stencil_test);
+    UWP_PROF_END(PF_SURF_UPD, t_surf);
 
     if (is_nop_draw) {
         return;
@@ -161,7 +171,9 @@ void pgraph_gl_draw_begin(NV2AState *d)
     UWP_PROF_BEGIN(t_tex);
     pgraph_gl_bind_textures(d);
     UWP_PROF_END(PF_BIND_TEX, t_tex);
+    UWP_PROF_BEGIN(t_sh);
     pgraph_gl_bind_shaders(pg);
+    UWP_PROF_END(PF_BIND_SHADER, t_sh);
 
     glColorMask(mask_red, mask_green, mask_blue, mask_alpha);
     glDepthMask(!!(control_0 & NV_PGRAPH_CONTROL_0_ZWRITEENABLE));
@@ -348,6 +360,10 @@ void pgraph_gl_draw_end(NV2AState *d)
     bool stencil_test =
         pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1) & NV_PGRAPH_CONTROL_1_STENCIL_TEST_ENABLE;
     bool is_nop_draw = !(color_write || depth_test || stencil_test);
+#ifdef XEMU_UWP
+    /* measuring aid (link parameter skipdraws=1): how fast is the game with a renderer that costs nothing? */
+    is_nop_draw |= xemu_uwp_skip_draws;
+#endif
 
     if (is_nop_draw) {
         // FIXME: Check PGRAPH register 0x880.
@@ -381,10 +397,25 @@ void pgraph_gl_draw_end(NV2AState *d)
     NV2A_GL_DGROUP_END();
 }
 
+static void pgraph_gl_flush_draw_inner(NV2AState *d);
 void pgraph_gl_flush_draw(NV2AState *d)
+{
+    UWP_PROF_BEGIN(t_fl);
+    pgraph_gl_flush_draw_inner(d);
+    UWP_PROF_END(PF_FLUSH_DRAW, t_fl);
+}
+
+static void pgraph_gl_flush_draw_inner(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
+#ifdef XEMU_UWP
+    /* measuring: which primitive types the game draws, and how many draws need a geometry shader */
+    if (r->shader_binding) {
+        unsigned m = r->shader_binding->gl_primitive_mode;
+        xemu_uwp_prim_hist[m < 15 ? m : 15]++;
+    }
+#endif
 
     if (!(r->color_binding || r->zeta_binding)) {
         return;
@@ -402,10 +433,12 @@ void pgraph_gl_flush_draw(NV2AState *d)
                                       pg->draw_arrays_max_count - 1,
                                       false, 0,
                                       pg->draw_arrays_max_count - 1);
+        { UWP_PROF_BEGIN(t_gld);
         glMultiDrawArrays(r->shader_binding->gl_primitive_mode,
                           pg->draw_arrays_start,
                           pg->draw_arrays_count,
                           pg->draw_arrays_length);
+        UWP_PROF_END(PF_GLDRAW, t_gld); }
     } else if (pg->inline_elements_length) {
         NV2A_GL_DPRINTF(false, "Inline Elements");
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ELEMENTS);
@@ -444,9 +477,11 @@ void pgraph_gl_flush_draw(NV2AState *d)
         } else {
             nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_4_NOTDIRTY);
         }
+        { UWP_PROF_BEGIN(t_gld);
         glDrawElements(r->shader_binding->gl_primitive_mode,
                        pg->inline_elements_length, GL_UNSIGNED_INT,
                        (void *)0);
+        UWP_PROF_END(PF_GLDRAW, t_gld); }
     } else if (pg->inline_buffer_length) {
         NV2A_GL_DPRINTF(false, "Inline Buffer");
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_BUFFERS);
@@ -461,11 +496,19 @@ void pgraph_gl_flush_draw(NV2AState *d)
             VertexAttribute *attr = &pg->vertex_attributes[i];
             if (attr->inline_buffer_populated) {
                 nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_3);
+#ifdef XEMU_UWP
+                GLintptr uwp_off = pgraph_gl_uwp_stream_put(
+                    attr->inline_buffer,
+                    pg->inline_buffer_length * sizeof(float) * 4);
+                glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, 0,
+                                      (void *)(uintptr_t)uwp_off);
+#else
                 glBindBuffer(GL_ARRAY_BUFFER, r->gl_inline_buffer[i]);
                 glBufferData(GL_ARRAY_BUFFER,
                              pg->inline_buffer_length * sizeof(float) * 4,
                              attr->inline_buffer, GL_STREAM_DRAW);
                 glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, 0, 0);
+#endif
                 glEnableVertexAttribArray(i);
                 attr->inline_buffer_populated = false;
                 memcpy(attr->inline_value,
@@ -477,15 +520,19 @@ void pgraph_gl_flush_draw(NV2AState *d)
             }
         }
 
+        { UWP_PROF_BEGIN(t_gld);
         glDrawArrays(r->shader_binding->gl_primitive_mode,
                      0, pg->inline_buffer_length);
+        UWP_PROF_END(PF_GLDRAW, t_gld); }
     } else if (pg->inline_array_length) {
         NV2A_GL_DPRINTF(false, "Inline Array");
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ARRAYS);
 
         unsigned int index_count = pgraph_gl_bind_inline_array(d);
+        { UWP_PROF_BEGIN(t_gld);
         glDrawArrays(r->shader_binding->gl_primitive_mode,
                      0, index_count);
+        UWP_PROF_END(PF_GLDRAW, t_gld); }
     } else {
         NV2A_GL_DPRINTF(true, "EMPTY NV097_SET_BEGIN_END");
         NV2A_UNCONFIRMED("EMPTY NV097_SET_BEGIN_END");

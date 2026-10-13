@@ -1885,6 +1885,11 @@ static char *uwp_take_activation_disc(void)
         if (!strcmp(p, "state=1")) {
             uwp_load_state_wanted = true;
         }
+        if (!strcmp(p, "skipdraws=1")) {
+            extern bool xemu_uwp_skip_draws;
+            xemu_uwp_skip_draws = true;
+            uwp_log("measuring: draws are skipped");
+        }
         if (!strcmp(p, "state=save")) {
             uwp_save_state_wanted = true;
         }
@@ -2375,6 +2380,7 @@ int main(int argc, char **argv)
     CloseHandle(CreateThread(NULL, 0, uwp_sampler_thread, (void *)"pfifo", 0,
                              NULL));
     uint64_t uwp_frames = 0, uwp_next_report = SDL_GetTicks() + 3000;
+    uint64_t uwp_started_ms = SDL_GetTicks();
 #endif
     while (!qatomic_read(&qemu_exiting)) {
         poll_events(scon);
@@ -2385,8 +2391,13 @@ int main(int argc, char **argv)
         if ((uwp_frames & 7) == 0) {
             uwp_poll_quit_combo();
         }
-        /* asked for by the launch link: once the machine has been running for a few seconds */
-        if (uwp_load_state_wanted && uwp_frames > 240 && runstate_is_running()) {
+        /*
+         * Asked for by the launch link. Not before the game has had 45 seconds: a state
+         * loaded while the console is still booting can leave the audio processor (DSP)
+         * running a program that is not there (Halo 2: assertion in read_memory_p).
+         */
+        if (uwp_load_state_wanted && SDL_GetTicks() > uwp_started_ms + 45000 &&
+            runstate_is_running()) {
             uwp_load_state_wanted = false;
             uwp_state(false);
         }
@@ -2408,6 +2419,20 @@ int main(int argc, char **argv)
             uwp_prof_report((SDL_GetTicks() - (uwp_next_report - 3000)) / 1000.0);
             if ((uwp_frames / 180) % 3 == 0) {
                 uwp_log_memory();
+            }
+            {
+                extern unsigned int xemu_uwp_prim_hist[16];
+                static const char *const names[16] = { "points", "lines", "lineloop", "linestrip", "tris",
+                    "tristrip", "trifan", "quads", "quadstrip", "polygon", "lines_adj", "linestrip_adj",
+                    "tris_adj", "tristrip_adj", "patches", "other" };
+                char line[400] = "";
+                for (int i = 0; i < 16; i++) {
+                    if (xemu_uwp_prim_hist[i]) {
+                        g_snprintf(line + strlen(line), sizeof(line) - strlen(line), " %s %u", names[i], xemu_uwp_prim_hist[i]);
+                        xemu_uwp_prim_hist[i] = 0;
+                    }
+                }
+                uwp_log("draw primitives:%s", line);
             }
             uwp_next_report = SDL_GetTicks() + 3000;
         }
