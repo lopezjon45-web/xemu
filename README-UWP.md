@@ -7,7 +7,7 @@ app on an Xbox Series X in Dev Mode. It is based on upstream master `478b4f4`. T
 inside `#ifdef XEMU_UWP`; on top of that the branch carries a few fixes taken from open xemu pull requests
 (listed under "Taken from others") and one generic fix in `block/file-win32.c`.
 
-**Current build: 0.8.8.0** ([releases](https://github.com/skitzellez/xemu-uwp/releases)).
+**Current build: 0.8.9.0** ([releases](https://github.com/skitzellez/xemu-uwp/releases)).
 
 ## Controls added for the console
 
@@ -90,6 +90,12 @@ repository. Keep changes inside `#ifdef XEMU_UWP`.
   ([insignia.live](https://insignia.live), the replacement for the original Xbox Live service) runs, registers
   the emulated console and reports "All checks passed". Creating an account and playing a match have not been
   tried yet.
+- Dashboard from a game disc the user owns (0.8.9.0): online sign-up needs Microsoft's dashboard on the hard
+  disk, and the free hard disk image has none. Many Xbox Live games carry its installer (`dashupdate.xbe`).
+  When the game being started has one and the hard disk has no dashboard, or an older one, its files are
+  unpacked onto C: before the console boots (`ui/xemu-uwp-dash.c`: XDVDFS, the installer's file list, LZX
+  through libmspack, FATX; about a second; every XBE's section digests are checked first). `dash=0` in the
+  launch link turns it off. Nothing of Microsoft's is shipped. Tried with one game's disc image so far.
 - Buttons can be pressed from outside for testing: the launch link takes `press=down,down,a` (also `wait` and
   a number of milliseconds). `XemuUWP/tools/xlink.ps1` in the companion repository sends such links and takes
   a screenshot.

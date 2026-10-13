@@ -306,6 +306,10 @@ void xbox_init_common(MachineState *machine,
     PCIDevice *dev = pci_create_simple(pci_bus, PCI_DEVFN(9, 0), "piix3-ide");
     UWP_MARK("before ide");
     pci_ide_create_devs(dev);
+#ifdef XEMU_UWP
+    extern void xemu_uwp_dashboard_from_disc(void); /* ui/xemu.c */
+    xemu_uwp_dashboard_from_disc();
+#endif
     // idebus[0] = qdev_get_child_bus(&dev->qdev, "ide.0");
     // idebus[1] = qdev_get_child_bus(&dev->qdev, "ide.1");
 

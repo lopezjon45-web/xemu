@@ -20,6 +20,11 @@ system_ss.add(files(
 subdir('thirdparty')
 
 xemu_ss = ss.source_set()
+# LZX decoder for the dashboard installer found on game discs (UWP port)
+mspack = cc.find_library('mspack', required: false)
+if mspack.found()
+  xemu_ss.add(mspack)
+endif
 xemu_ss.add(files(
   'xemu-input.c',
   'xemu-monitor.c',
@@ -29,6 +34,7 @@ xemu_ss.add(files(
 
   'xemu.c',
   'xemu-uwp-audio.c',
+  'xemu-uwp-dash.c',
   'xemu-data.c',
   'xemu-snapshots.c',
   'xemu-thumbnail.cc',

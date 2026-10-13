@@ -60,6 +60,9 @@
 #include "xemu-uwp-audio.h"
 #endif
 #include "qemu/xemu-uwp.h"
+#include "system/block-backend.h"
+#include "system/blockdev.h"
+#include "xemu-uwp-dash.h"
 #include <signal.h>
 #include "ui/xemu-notifications.h"
 
@@ -2076,6 +2079,61 @@ static void uwp_glib_print(const gchar *text)
 /* How much memory the system still grants this app (the console ends an app that asks for more). */
 unsigned int xemu_uwp_counters[UWP_CNT_MAX];
 
+/*
+ * The dashboard from the user's own disc. Xbox Live sign-up (and with it
+ * online play through a replacement service) needs Microsoft's dashboard on
+ * the hard disk, and the free hard disk image has none. Many Xbox Live games
+ * carry its installer; when the game being started has one and the hard disk
+ * has no dashboard, or an older one, it is unpacked onto C: before the
+ * console boots (ui/xemu-uwp-dash.c). The link parameter dash=0 turns this off.
+ */
+static bool uwp_no_dash;
+
+static int uwp_dash_blk_read(void *opaque, uint64_t offset, void *buf, size_t len)
+{
+    return blk_pread(opaque, offset, len, buf, 0) < 0;
+}
+
+static int uwp_dash_blk_write(void *opaque, uint64_t offset, const void *buf, size_t len)
+{
+    return blk_pwrite(opaque, offset, len, buf, 0) < 0;
+}
+
+void xemu_uwp_dashboard_from_disc(void)
+{
+    DriveInfo *hd = drive_get(IF_IDE, 0, 0), *cd = drive_get(IF_IDE, 0, 1);
+    if (uwp_no_dash || !hd || !cd) {
+        return;
+    }
+    BlockBackend *hdd_blk = blk_by_legacy_dinfo(hd), *disc_blk = blk_by_legacy_dinfo(cd);
+    if (!hdd_blk || !disc_blk || !blk_is_inserted(disc_blk)) {
+        return;
+    }
+    UwpDashIo hdd = { uwp_dash_blk_read, uwp_dash_blk_write, hdd_blk };
+    UwpDashIo disc = { uwp_dash_blk_read, NULL, disc_blk };
+    uint32_t have = 0, offer = 0;
+    int installed = uwp_dash_installed(&hdd, &have);
+    if (installed < 0) {
+        uwp_log("dashboard: the hard disk has no Xbox C: partition, left alone");
+        return;
+    }
+    if (!uwp_dash_on_disc(&disc, &offer)) {
+        uwp_log("dashboard: %s on the hard disk; this disc carries no installer",
+                installed ? "present" : "none");
+        return;
+    }
+    if (installed && have >= offer) {
+        uwp_log("dashboard: %08x on the hard disk, the disc offers %08x: nothing to do", have, offer);
+        return;
+    }
+    uwp_log("dashboard: %s on the hard disk, installing %08x from the disc",
+            installed ? "an older one" : "none", offer);
+    if (uwp_dash_install(&disc, &hdd, uwp_log) > 0) {
+        blk_flush(hdd_blk);
+        xemu_queue_notification("Xbox dashboard installed from this disc");
+    }
+}
+
 static void uwp_log_memory(void)
 {
     typedef struct {
@@ -2153,6 +2211,9 @@ static char *uwp_take_activation_disc(void)
         }
         if (!strncmp(p, "press=", 6)) {
             uwp_press(p + 6);
+        }
+        if (!strcmp(p, "dash=0")) {
+            uwp_no_dash = true;
         }
         if (!strcmp(p, "noflush=1")) {
             extern bool xemu_uwp_skip_cb_flush;

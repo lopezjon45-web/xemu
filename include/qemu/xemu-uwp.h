@@ -39,6 +39,9 @@ static inline FARPROC xemu_uwp_kernelbase_proc(const char *name)
 typedef HANDLE (WINAPI *xemu_uwp_CreateFileFromAppW_fn)(
     LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 
+/* ui/xemu.c: called once the drives exist; installs the dashboard from the game disc if needed */
+void xemu_uwp_dashboard_from_disc(void);
+
 /* Counters for the memory report (ui/xemu.c): GPU objects made by the renderer. */
 enum {
     UWP_CNT_QUERIES_PENDING, /* pixel-count queries waiting for the game to read them (a level, not a rate) */
