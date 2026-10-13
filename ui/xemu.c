@@ -1111,6 +1111,17 @@ static void display_very_early_init(DisplayOptions *o)
     g_free(title);
     SDL_SetWindowMinimumSize(m_window, min_window_width, min_window_height);
 
+#ifdef XEMU_UWP
+    {
+        /* Internal resolution follows the TV picture, chosen again at every start: 4x (2560x1920 for a 640x480
+         * game) on a 4K picture, 2x on 1080p. Crash held 59-60 fps at 4x on the Series X. */
+        int pw = 0, ph = 0;
+        SDL_GetWindowSizeInPixels(m_window, &pw, &ph);
+        g_config.display.quality.surface_scale = ph >= 2160 ? 4 : ph >= 1080 ? 2 : 1;
+        uwp_log("output %dx%d, internal resolution %dx", pw, ph, g_config.display.quality.surface_scale);
+    }
+#endif
+
     const SDL_DisplayMode *disp_mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(m_window));
     if (disp_mode && (disp_mode->w < window_width || disp_mode->h < window_height)) {
         SDL_SetWindowSize(m_window, min_window_width, min_window_height);
