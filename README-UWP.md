@@ -6,9 +6,14 @@ This branch (`uwp`) makes [xemu](https://github.com/xemu-project/xemu), the orig
 app on an Xbox Series X in Dev Mode. It is based on upstream master `478b4f4`. Every change is inside
 `#ifdef XEMU_UWP`, except one generic fix in `block/file-win32.c`.
 
-**This code was written by an AI assistant (Claude) working with the repository owner.** QEMU and SDL both
-decline AI-generated contributions, so nothing here is meant to be sent upstream. It is published as a fork so
-that others can read it, test it, and take ideas from it.
+**This code was written by an AI assistant (Claude) working with the repository owner.** It is published as a
+fork so that others can read it, test it, and take ideas from it. xemu's own rules (`CONTRIBUTING.md`, "Use of
+AI Tooling") permit AI-assisted contributions when the submitter understands, has tested and can defend every
+line and names the model used; nothing here has been reviewed to that standard or offered to xemu. QEMU and SDL
+decline AI-generated contributions, so the generic QEMU and SDL changes are not for those projects.
+
+An earlier, separate UWP port of xemu exists: [rodrigoandrigo/xemu](https://github.com/rodrigoandrigo/xemu)
+(branch `UWP`), with its own interface, networking and releases.
 
 No BIOS, MCPX ROM, hard disk image or game is included. You need your own, as with desktop xemu.
 
