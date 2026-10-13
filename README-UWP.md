@@ -11,7 +11,31 @@ that others can read it, test it, and take ideas from it.
 No BIOS, MCPX ROM, hard disk image or game is included. You need your own, as with desktop xemu.
 
 Packaging scripts, the Device Portal tools and the launcher live in the companion repository
-`xbox-game-vault` (folder `XemuUWP`).
+[xbox-game-vault](https://github.com/skitzellez/xbox-game-vault) (folder `XemuUWP`).
+
+## Setup on the console
+
+There is no ready-made download yet; build it first (see "Building"). Then:
+
+1. Xbox Series X|S in Dev Mode, Device Portal switched on, a profile signed in.
+2. Install `Xemu_x64.appx` through the Device Portal (`https://<console>:11443`, "Add").
+3. In Dev Home, open the app's details and set **App type** to **Game**. As "App" it has about 145 MB of
+   memory and games will not run.
+4. With the Device Portal's file explorer, upload your own files to the app's `LocalState\xemu\xemu` folder:
+   `mcpx_1.0.bin`, a BIOS image and `xbox_hdd.qcow2` (see https://xemu.app/docs/required-files/), and an
+   `xemu.toml` that names them. A template is `XemuUWP/xemu.toml` in the companion repository; the folder's
+   path on the console is `Q:/Users/UserMgr0/AppData/Local/Packages/<package family name>/LocalState/xemu/xemu/`.
+5. Games: disc images (XISO or full dumps, `.iso`) on an NTFS USB drive on which app packages have full
+   control (`icacls X:\ /grant "*S-1-15-2-1:(OI)(CI)F"`). Either set `dvd_path` in `xemu.toml`, or start
+   games from the Game Vault launcher, which passes the disc with a link.
+6. Start xemu. `uwp_debug.log` in the same folder shows progress, frame rates and profiler lines.
+
+## Contributing
+
+Test reports, fixes and ideas are welcome: open an issue or a pull request against the `uwp` branch. The
+rules (no games or BIOS files, say what you tested, AI-assisted work is fine if disclosed) are in
+[CONTRIBUTING.md](https://github.com/skitzellez/xbox-game-vault/blob/main/CONTRIBUTING.md) of the companion
+repository. Keep changes inside `#ifdef XEMU_UWP`.
 
 ## What works (seen on a Series X, app type "Game")
 
