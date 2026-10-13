@@ -1783,6 +1783,111 @@ static char *uwp_take_activation_disc(void)
 }
 
 /* Before the machine is created: boot with the disc the launcher asked for. */
+/*
+ * Setting itself up. The launcher (Game Vault, same publisher) puts the boot
+ * ROM, the BIOS and the hard disk image it found on the user's USB drive into
+ * the publisher's shared folder "games\xbox-system". A path from xemu.toml
+ * wins when its file exists (someone who set things up by hand); otherwise
+ * the file from that folder, or one lying next to xemu.toml, is used, so no
+ * xemu.toml has to be written or uploaded at all.
+ */
+static bool uwp_file_exists(const char *path)
+{
+    if (!path || !path[0]) {
+        return false;
+    }
+    wchar_t *w = g_utf8_to_utf16(path, -1, NULL, NULL, NULL);
+    HANDLE h = w ? xemu_uwp_create_file_w(w, GENERIC_READ,
+                                          FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                          OPEN_EXISTING, 0)
+                 : INVALID_HANDLE_VALUE;
+    g_free(w);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    CloseHandle(h);
+    return true;
+}
+
+/* ...\Local\Packages\<name>_<publisher id>\LocalState\... -> ...\Local\Publishers\<publisher id>\games\xbox-system\ */
+static char *uwp_system_folder(void)
+{
+    char *base = SDL_GetPrefPath("xemu", "xemu");
+    char *result = NULL;
+    for (char *c = base; c && *c; c++) {
+        if (*c == '/') {
+            *c = '\\';
+        }
+    }
+    char *packages = base ? strstr(base, "\\Packages\\") : NULL;
+    if (packages) {
+        char *name = packages + strlen("\\Packages\\");
+        char *end = strchr(name, '\\');
+        char *id = NULL;
+        for (char *c = name; end && c < end; c++) {
+            if (*c == '_') {
+                id = c + 1;
+            }
+        }
+        if (id) {
+            result = g_strdup_printf("%.*s\\Publishers\\%.*s\\games\\xbox-system\\",
+                                     (int)(packages - base), base,
+                                     (int)(end - id), id);
+        }
+    }
+    SDL_free(base);
+    return result;
+}
+
+static void uwp_fill_one(const char **setting, const char *what,
+                         const char *folder, const char *own,
+                         const char *const *names)
+{
+    if (uwp_file_exists(*setting)) {
+        return;
+    }
+    const char *dirs[] = { folder, own };
+    for (int d = 0; d < 2; d++) {
+        for (int i = 0; dirs[d] && names[i]; i++) {
+            char *path = g_strdup_printf("%s%s", dirs[d], names[i]);
+            if (uwp_file_exists(path)) {
+                for (char *c = path; *c; c++) {
+                    if (*c == '\\') {
+                        *c = '/';
+                    }
+                }
+                uwp_log("%s: %s", what, path);
+                xemu_settings_set_string(setting, path);
+                g_free(path);
+                return;
+            }
+            g_free(path);
+        }
+    }
+    uwp_log("%s: not found (run the Xbox setup in Game Vault)", what);
+}
+
+static void uwp_fill_system_files(void)
+{
+    static const char *const mcpx[] = { "mcpx_1.0.bin", "mcpx.bin", NULL };
+    static const char *const bios[] = { "bios.bin", "Complex_4627.bin", NULL };
+    static const char *const hdd[] = { "xbox_hdd.qcow2", NULL };
+    char *folder = uwp_system_folder();
+    char *own = SDL_GetPrefPath("xemu", "xemu");
+
+    uwp_fill_one(&g_config.sys.files.bootrom_path, "boot ROM", folder, own, mcpx);
+    uwp_fill_one(&g_config.sys.files.flashrom_path, "BIOS", folder, own, bios);
+    uwp_fill_one(&g_config.sys.files.hdd_path, "hard disk", folder, own, hdd);
+    g_free(folder);
+    SDL_free(own);
+
+    /* what a console needs, whatever the settings file says (or if there is none) */
+    g_config.general.show_welcome = false;
+    g_config.general.updates.check = false;
+    g_config.display.renderer = CONFIG_DISPLAY_RENDERER_OPENGL;
+    g_config.display.window.fullscreen_on_startup = true;
+}
+
 static void uwp_startup_disc(void)
 {
     /* the activation arrives through the window's event queue */
@@ -1796,6 +1901,7 @@ static void uwp_startup_disc(void)
         xemu_settings_set_string(&g_config.sys.files.dvd_path, disc);
         g_free(disc);
     }
+    uwp_fill_system_files();
 }
 
 /*

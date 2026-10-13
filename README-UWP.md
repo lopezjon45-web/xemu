@@ -29,11 +29,12 @@ builds), or build it yourself (see "Building"). Then:
 2. Install `Xemu_x64.appx` through the Device Portal (`https://<console>:11443`, "Add").
 3. In Dev Home, open the app's details and set **App type** to **Game**. As "App" it has about 145 MB of
    memory and games will not run.
-4. With the Device Portal's file explorer, upload your own files to the app's `LocalState\xemu\xemu` folder:
-   `mcpx_1.0.bin`, a BIOS image and `xbox_hdd.qcow2` (see https://xemu.app/docs/required-files/), and an
-   `xemu.toml` that names them. A template is `XemuUWP/xemu.toml` in the companion repository; the folder's
-   path on the console is `Q:/Users/UserMgr0/AppData/Local/Packages/<package family name>/LocalState/xemu/xemu/`
-   (`GamerDad.Xemu_w8c8c10g47ykp` for the released package).
+4. System files (0.5.0.0 on): the easy way is the Game Vault launcher, whose first-run screen finds your
+   boot ROM and BIOS on the USB drive, fetches the xemu project's free blank hard disk if you have none, and
+   puts them in the publisher's shared folder `games\xbox-system`, where xemu looks by itself. No `xemu.toml`
+   is needed. By hand instead: upload `mcpx_1.0.bin`, `bios.bin` and `xbox_hdd.qcow2` (see
+   https://xemu.app/docs/required-files/) to the app's `LocalState\xemu\xemu` folder with the Device Portal;
+   they are found there as well. An `xemu.toml` that names files which exist takes precedence over both.
 5. Games: disc images (XISO or full dumps, `.iso`) on an NTFS USB drive on which app packages have full
    control (`icacls X:\ /grant "*S-1-15-2-1:(OI)(CI)F"`). Either set `dvd_path` in `xemu.toml`, or start
    games from the Game Vault launcher, which passes the disc with a link.
