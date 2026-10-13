@@ -1706,10 +1706,19 @@ static void uwp_state(bool save)
     char *name = uwp_state_name();
     Error *err = NULL;
     xemu_main_loop_lock();
+    bool was_running = runstate_is_running();
     if (save) {
         xemu_snapshots_save(name, &err);
     } else {
         xemu_snapshots_load(name, &err);
+    }
+    /*
+     * xemu_snapshots_load stops the machine first and starts it again only
+     * when the load worked: asking for a state that does not exist left the
+     * game frozen. Nothing has been changed in that case, so carry on.
+     */
+    if (err && was_running && !runstate_is_running()) {
+        vm_start();
     }
     xemu_main_loop_unlock();
     if (err) {
