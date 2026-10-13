@@ -7,7 +7,7 @@ app on an Xbox Series X in Dev Mode. It is based on upstream master `478b4f4`. T
 inside `#ifdef XEMU_UWP`; on top of that the branch carries a few fixes taken from open xemu pull requests
 (listed under "Taken from others") and one generic fix in `block/file-win32.c`.
 
-**Current build: 0.7.5.0** ([releases](https://github.com/skitzellez/xemu-uwp/releases)).
+**Current build: 0.8.1.0** ([releases](https://github.com/skitzellez/xemu-uwp/releases)).
 
 ## Controls added for the console
 
@@ -24,7 +24,7 @@ inside `#ifdef XEMU_UWP`; on top of that the branch carries a few fixes taken fr
 | Crash Bandicoot: The Wrath of Cortex | 59-60 fps in its attract demo |
 | Panzer Dragoon Orta | 59-60 fps in its demo; real play not checked |
 | OutRun 2 | menus full speed, about 30 fps in a race (target 60) |
-| Halo 2 | menus a steady 30 (its target); gameplay 26-30 in light scenes, 19-21 in a heavy combat room |
+| Halo 2 | menus a steady 30 (its target); gameplay 26-30 in light scenes, 17-30 in a heavy combat room (the emulated CPU is the limit there since 0.8.1.0; it was 17-21 with the renderer as the limit) |
 | A racing game with software-decoded intro movies | movies at 3-5 fps (the emulated CPU; same on desktop xemu), races 21-38 |
 
 That is the whole list. Expect breakage elsewhere, and please report what you find.
@@ -97,9 +97,8 @@ repository. Keep changes inside `#ifdef XEMU_UWP`.
 - Movies that are decoded with MMX/SSE in software run at a few frames a second in at least one game. The
   emulated CPU is the limit (same reports exist for desktop xemu, issues #2938, #1266, #1232).
 - One racing game stays near 30 fps in races although the renderer is not saturated; see "Open leads".
-- Heavy scenes with many draws are slow: about 22 microseconds are spent inside every GL draw call on this
-  GL-on-D3D12 stack (measured in Halo 2 at about 780 draws a frame: 19-21 fps where the game wants 30, and
-  30 with drawing switched off). See "Open leads".
+- In heavy scenes the emulated CPU is the limit (Halo 2, a combat room: one core flat out, about 30 % of
+  it in block lookup and dispatch). See "Open leads".
 - A state loaded while the emulated console is still booting can trip an assert in the DSP interpreter
   (`read_memory_p`); loaded later it works. Cause not understood.
 - The pause with broken-up sound when a new scene appears (Halo 2: intro to title) is textures being
@@ -167,6 +166,17 @@ The changes keep data on the GPU:
   now copied to the next free part of a 64 MB stream buffer through an unsynchronized mapping, with a table of
   the VRAM ranges it already holds; inline arrays and inline buffers go the same way. Halo 2's menu went
   from 23-30 fps to a steady 29-30.
+- Index buffers are created `GL_DYNAMIC_DRAW`, not `GL_STATIC_DRAW` (0.8.0.0, `gl/draw.c`). Mesa's D3D12
+  driver cannot map a static buffer directly (`can_map_directly` in `d3d12_resource.cpp`), and it has to read
+  the index buffer back for every indexed draw of a primitive type D3D12 lacks (triangle fans, through
+  `util_primconvert`): it copies the buffer on the GPU, flushes and waits for the GPU. About a hundred waits a
+  frame in Halo 2; the profiler showed them as `NtGdiDdDDIWaitForSynchronizationObjectFromCpu` under
+  `glDrawElements`. A dynamic buffer is read in place.
+- A colour target whose memory is being reused for another target is not copied back to guest RAM first
+  (0.8.1.0, `uwp_evict_without_download` in `gl/surface.c`): when the new target starts at the same address
+  with another pitch, or the two ranges overlap only partly. Halo 2 alternates 128x128 and 160x120 targets
+  over one pool, four read-backs a frame. A target lying wholly inside another, or keeping its pitch, is
+  still copied back. If a game shows a wrong picture after this, this rule is the first suspect.
 - Fixed in 0.5.4.0: the shortcut that skips a depth surface over a recent colour image left a depth-only
   pass with nothing bound (`assert(r->color_binding || r->zeta_binding)`, Halo 2 while loading a level). It
   now applies only while a colour target is bound.
@@ -185,10 +195,13 @@ and the hottest guest code blocks. `tools/sum.py` and `tools/sym.py` in the comp
 
 ## Open leads
 
-- The per-draw cost inside Mesa's D3D12 path (see above): half of the renderer thread's samples are in
-  `win32u.dll` / `ntdll.dll` and a quarter in `libgallium_wgl.dll`. The link parameter `skipdraws=1` and the
-  timers `PF_GLDRAW`, `PF_FLUSH_DRAW`, `PF_SURF_UPD`, `PF_BIND_SHADER` are there to measure it. Next: a Mesa
-  build with symbols, or merging draws.
+- The renderer thread still spends about 7 % in `NtGdiDdDDICreateAllocation` / `DestroyAllocation2`:
+  buffers being created and destroyed all the time (the 64 MB vertex stream buffer is replaced when full;
+  Mesa's own upload buffers may add to it). A small pool of stream buffers would end that.
+- How the waits were found, for the next one: the sampler logs, for the renderer thread, the export each
+  sample outside xemu.exe is in (`pfifo outside xemu, by export`), the first caller inside
+  `libgallium_wgl.dll` and the first caller in xemu.exe. `skipdraws=1` in the launch link and the timers
+  `PF_GLDRAW`, `PF_FLUSH_DRAW`, `PF_SURF_UPD`, `PF_BIND_SHADER` separate renderer cost from CPU cost.
 - The emulated CPU spends about 30 % of its time in block lookup and dispatch in Halo 2 (`cpu_exec_loop`,
   `helper_lookup_tb_ptr`, `qht_lookup_custom`): something keeps emptying the jump cache or the TLB.
 - The 30 fps racing game: about ten PGRAPH register accesses per frame from the vcpu wait on the renderer's

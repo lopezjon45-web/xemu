@@ -627,6 +627,36 @@ static bool check_surfaces_overlap(const SurfaceBinding *surface,
                                         other_surface->size);
 }
 
+#ifdef XEMU_UWP
+/*
+ * A colour surface that is being thrown out because a new colour target takes
+ * its memory normally has its pixels copied back to guest RAM first (a
+ * read-back, and on GL-on-D3D12 a wait for the GPU). When the memory is
+ * plainly being reused for something else, those pixels can no longer mean
+ * anything to the guest:
+ *  - the new target starts at the same address with another pitch, or
+ *  - the two ranges overlap only partly (neither lies inside the other).
+ * Halo 2 alternates 128x128 and 160x120 targets over one pool like this, four
+ * read-backs a frame. A target that lies wholly inside another (a window in
+ * the frame buffer) or keeps its pitch is still copied back.
+ */
+static bool uwp_evict_without_download(const SurfaceBinding *old,
+                                       const SurfaceBinding *incoming)
+{
+    if (!old->color || !incoming->color || !old->draw_dirty) {
+        return false;
+    }
+    hwaddr o0 = old->vram_addr, o1 = o0 + old->size;
+    hwaddr n0 = incoming->vram_addr, n1 = n0 + incoming->size;
+    if (o0 == n0) {
+        return old->pitch != incoming->pitch;
+    }
+    bool old_in_new = n0 <= o0 && o1 <= n1;
+    bool new_in_old = o0 <= n0 && n1 <= o1;
+    return !old_in_new && !new_in_old;
+}
+#endif
+
 static void invalidate_overlapping_surfaces(NV2AState *d, SurfaceBinding *surface)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -639,6 +669,11 @@ static void invalidate_overlapping_surfaces(NV2AState *d, SurfaceBinding *surfac
                 other_surface->vram_addr, other_surface->width, other_surface->height,
                 other_surface->pitch);
             UWP_DL_SITE(EVICT_OVERLAP);
+#ifdef XEMU_UWP
+            if (uwp_evict_without_download(other_surface, surface)) {
+                other_surface->draw_dirty = false;
+            }
+#endif
             pgraph_gl_surface_download_if_dirty(d, other_surface);
             pgraph_gl_surface_invalidate(d, other_surface);
         }
@@ -1493,6 +1528,11 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                 }
 #endif
                 UWP_DL_SITE(EVICT_INCOMPATIBLE);
+#ifdef XEMU_UWP
+                if (uwp_evict_without_download(found, &entry)) {
+                    found->draw_dirty = false;
+                }
+#endif
                 pgraph_gl_surface_download_if_dirty(d, found);
                 pgraph_gl_surface_invalidate(d, found);
             }

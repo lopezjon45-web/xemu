@@ -470,9 +470,24 @@ static void pgraph_gl_flush_draw_inner(NV2AState *d)
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, found->gl_buffer);
         if (!found->initialized) {
             nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_4);
+#ifdef XEMU_UWP
+            /*
+             * Not GL_STATIC_DRAW. Mesa's D3D12 driver cannot map a static
+             * buffer directly; when it has to read one back - it does for
+             * every indexed draw of a primitive type D3D12 lacks, such as a
+             * triangle fan, to rewrite the indices - it copies the buffer on
+             * the GPU, flushes, and waits for the GPU to finish everything
+             * queued. About a hundred such waits a frame in Halo 2. A dynamic
+             * buffer lives in CPU-visible memory and is read in place.
+             */
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                         pg->inline_elements_length * 4,
+                         pg->inline_elements, GL_DYNAMIC_DRAW);
+#else
             glBufferData(GL_ELEMENT_ARRAY_BUFFER,
                          pg->inline_elements_length * 4,
                          pg->inline_elements, GL_STATIC_DRAW);
+#endif
             found->initialized = true;
         } else {
             nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_4_NOTDIRTY);

@@ -1488,6 +1488,117 @@ static void uwp_prof_report(double seconds)
  * as "generated code" (the guest's own code, translated).
  */
 #define UWP_SAMPLES 16384
+#define UWP_STACK_FRAMES 10
+
+/*
+ * The name of the export a system DLL address belongs to (the nearest export
+ * at or below it). win32u.dll and ntdll.dll export every system call stub by
+ * name, so this says which kernel service a thread was in.
+ */
+static const char *uwp_export_name(HMODULE mod, uint64_t addr, uint32_t *off)
+{
+    const uint8_t *base = (const uint8_t *)mod;
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)
+        (base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY *dd =
+        &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dd->VirtualAddress) {
+        return NULL;
+    }
+    const IMAGE_EXPORT_DIRECTORY *ed =
+        (const IMAGE_EXPORT_DIRECTORY *)(base + dd->VirtualAddress);
+    const uint32_t *names = (const uint32_t *)(base + ed->AddressOfNames);
+    const uint16_t *ords = (const uint16_t *)(base + ed->AddressOfNameOrdinals);
+    const uint32_t *funcs = (const uint32_t *)(base + ed->AddressOfFunctions);
+    uint32_t rva = (uint32_t)(addr - (uint64_t)(uintptr_t)base), best = 0;
+    const char *name = NULL;
+    for (uint32_t i = 0; i < ed->NumberOfNames; i++) {
+        uint32_t f = funcs[ords[i]];
+        if (f <= rva && f >= best) {
+            best = f;
+            name = (const char *)(base + names[i]);
+        }
+    }
+    if (off) {
+        *off = rva - best;
+    }
+    return name;
+}
+
+/* Return addresses of a suspended thread, innermost first. Allocates nothing. */
+static int uwp_unwind(CONTEXT *ctx, uint64_t *out, int max)
+{
+    int n = 0;
+    while (n < max && ctx->Rip) {
+        DWORD64 image = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx->Rip, &image, NULL);
+        if (fn) {
+            void *handler_data = NULL;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx->Rip, fn, ctx,
+                             &handler_data, &establisher, NULL);
+        } else {
+            /* a leaf function: the return address is on top of the stack */
+            if (IsBadReadPtr((void *)ctx->Rsp, 8)) {
+                break;
+            }
+            ctx->Rip = *(DWORD64 *)ctx->Rsp;
+            ctx->Rsp += 8;
+        }
+        if (!ctx->Rip) {
+            break;
+        }
+        out[n++] = ctx->Rip;
+    }
+    return n;
+}
+
+struct uwp_count {
+    char name[72];
+    int count;
+};
+
+static void uwp_count_add(struct uwp_count *tab, int max, const char *name)
+{
+    for (int i = 0; i < max; i++) {
+        if (!tab[i].name[0]) {
+            g_strlcpy(tab[i].name, name, sizeof(tab[i].name));
+        }
+        if (!strcmp(tab[i].name, name)) {
+            tab[i].count++;
+            return;
+        }
+    }
+}
+
+static void uwp_count_log(const char *title, struct uwp_count *tab, int max, int rows)
+{
+    char line[1500];
+    int n = snprintf(line, sizeof(line), "%s:", title);
+    for (int rank = 0; rank < rows && n < (int)sizeof(line) - 100; rank++) {
+        int best = -1;
+        for (int i = 0; i < max && tab[i].name[0]; i++) {
+            if (tab[i].count > 0 && (best < 0 || tab[i].count > tab[best].count)) {
+                best = i;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        n += snprintf(line + n, sizeof(line) - n, " %s %d,", tab[best].name, tab[best].count);
+        tab[best].count = 0;
+    }
+    uwp_log("%s", line);
+}
+
+static void uwp_module_name(HMODULE mod, char *out, int size)
+{
+    char path[MAX_PATH] = "?";
+    GetModuleFileNameA(mod, path, sizeof(path));
+    const char *base = strrchr(path, '\\');
+    g_strlcpy(out, base ? base + 1 : path, size);
+}
+
 static DWORD WINAPI uwp_sampler_thread(void *arg)
 {
     const char *target = arg; /* which thread to watch: "vcpu" or "pfifo" */
@@ -1504,6 +1615,10 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
     int num = 0;
     HANDLE vcpu = NULL;
     DWORD next_dump = GetTickCount() + 30000;
+    /* for the renderer thread: who called, to tell what the graphics library asks the kernel for */
+    bool want_stacks = !strcmp(target, "pfifo");
+    uint64_t (*stacks)[UWP_STACK_FRAMES] =
+        want_stacks ? g_malloc0(UWP_SAMPLES * sizeof(*stacks)) : NULL;
 
     rcu_register_thread(); /* for uwp_read_guest */
 
@@ -1519,9 +1634,16 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
         }
         if (num < UWP_SAMPLES && SuspendThread(vcpu) != (DWORD)-1) {
             CONTEXT ctx;
-            ctx.ContextFlags = CONTEXT_CONTROL;
+            ctx.ContextFlags = want_stacks ? CONTEXT_FULL : CONTEXT_CONTROL;
             if (GetThreadContext(vcpu, &ctx)) {
-                samples[num++] = ctx.Rip;
+                samples[num] = ctx.Rip;
+                if (want_stacks) {
+                    memset(stacks[num], 0, sizeof(stacks[num]));
+                    if (ctx.Rip - exe_base >= exe_size) {
+                        uwp_unwind(&ctx, stacks[num], UWP_STACK_FRAMES);
+                    }
+                }
+                num++;
             }
             ResumeThread(vcpu);
         }
@@ -1593,6 +1715,66 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
             top[best].count = 0;
         }
         uwp_log("%s", line);
+
+        if (want_stacks) {
+            /*
+             * Samples outside xemu.exe: the export they are in (a system call
+             * stub in win32u / ntdll says which kernel service), the first
+             * caller inside the GL driver, and the first caller in xemu.exe.
+             */
+            static struct uwp_count where[160], gallium[160], ours[160];
+            memset(where, 0, sizeof(where));
+            memset(gallium, 0, sizeof(gallium));
+            memset(ours, 0, sizeof(ours));
+            for (int i = 0; i < num; i++) {
+                HMODULE mod = NULL;
+                if (samples[i] - exe_base < exe_size ||
+                    !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                        (LPCWSTR)(uintptr_t)samples[i], &mod) || !mod) {
+                    continue;
+                }
+                char name[72], modname[40];
+                uwp_module_name(mod, modname, sizeof(modname));
+                uint32_t off = 0;
+                const char *exp = uwp_export_name(mod, samples[i], &off);
+                if (exp && off < 0x400) {
+                    snprintf(name, sizeof(name), "%.12s!%.50s", modname, exp);
+                } else {
+                    snprintf(name, sizeof(name), "%.20s+%llx", modname,
+                             (unsigned long long)((samples[i] - (uint64_t)(uintptr_t)mod) & ~0xffull));
+                }
+                uwp_count_add(where, 160, name);
+                bool got_gallium = false, got_ours = false;
+                for (int f = 0; f < UWP_STACK_FRAMES && stacks[i][f]; f++) {
+                    uint64_t a = stacks[i][f];
+                    if (a - exe_base < exe_size) {
+                        if (!got_ours) {
+                            snprintf(name, sizeof(name), "+%llx", (unsigned long long)((a - exe_base) & ~0x3full));
+                            uwp_count_add(ours, 160, name);
+                            got_ours = true;
+                        }
+                        break;
+                    }
+                    HMODULE m2 = NULL;
+                    if (!got_gallium &&
+                        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           (LPCWSTR)(uintptr_t)a, &m2) && m2) {
+                        uwp_module_name(m2, modname, sizeof(modname));
+                        if (!g_ascii_strcasecmp(modname, "libgallium_wgl.dll")) {
+                            snprintf(name, sizeof(name), "+%llx",
+                                     (unsigned long long)((a - (uint64_t)(uintptr_t)m2) & ~0x7full));
+                            uwp_count_add(gallium, 160, name);
+                            got_gallium = true;
+                        }
+                    }
+                }
+            }
+            uwp_count_log("pfifo outside xemu, by export", where, 160, 24);
+            uwp_count_log("pfifo first caller in libgallium_wgl", gallium, 160, 24);
+            uwp_count_log("pfifo first caller in xemu.exe", ours, 160, 16);
+        }
 
         /* the same samples by guest address (start of the translated block) */
         if (jit) {
