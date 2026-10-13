@@ -867,6 +867,10 @@ int mem_access_callback_address_matches(CPUState *cpu, hwaddr addr, hwaddr len)
     return ret;
 }
 
+#ifdef XEMU_UWP
+bool xemu_uwp_skip_cb_flush;
+#endif
+
 static void do_mem_access_callback_insert(CPUState *cpu, run_on_cpu_data data)
 
 {
@@ -892,6 +896,10 @@ MemAccessCallback *mem_access_callback_insert(CPUState *cpu, MemoryRegion *mr,
                           RUN_ON_CPU_HOST_PTR(cb));
 
     // FIXME: flush only applicable pages
+#ifdef XEMU_UWP
+    /* measuring aid (link parameter noflush=1): what do these flushes cost? NOT correct to run with. */
+    if (!xemu_uwp_skip_cb_flush)
+#endif
     tlb_flush_all_cpus_synced(cpu);
 
     return cb;
@@ -915,6 +923,10 @@ void mem_access_callback_remove_by_ref(CPUState *cpu, MemAccessCallback *cb)
                           RUN_ON_CPU_HOST_PTR(cb));
 
     // FIXME: flush only applicable pages
+#ifdef XEMU_UWP
+    /* measuring aid (link parameter noflush=1): what do these flushes cost? NOT correct to run with. */
+    if (!xemu_uwp_skip_cb_flush)
+#endif
     tlb_flush_all_cpus_synced(cpu);
 }
 

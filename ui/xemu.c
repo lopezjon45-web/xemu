@@ -2067,6 +2067,11 @@ static char *uwp_take_activation_disc(void)
         if (!strcmp(p, "state=1")) {
             uwp_load_state_wanted = true;
         }
+        if (!strcmp(p, "noflush=1")) {
+            extern bool xemu_uwp_skip_cb_flush;
+            xemu_uwp_skip_cb_flush = true;
+            uwp_log("measuring: no TLB flush when a surface watch is added or removed");
+        }
         if (!strcmp(p, "skipdraws=1")) {
             extern bool xemu_uwp_skip_draws;
             xemu_uwp_skip_draws = true;
