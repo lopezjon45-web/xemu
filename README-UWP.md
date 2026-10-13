@@ -17,7 +17,8 @@ Packaging scripts, the Device Portal tools and the launcher live in the companio
 
 ## Setup on the console
 
-There is no ready-made download yet; build it first (see "Building"). Then:
+Take `Xemu_x64.appx` from the [releases page](https://github.com/skitzellez/xemu-uwp/releases) (early test
+builds), or build it yourself (see "Building"). Then:
 
 1. Xbox Series X|S in Dev Mode, Device Portal switched on, a profile signed in.
 2. Install `Xemu_x64.appx` through the Device Portal (`https://<console>:11443`, "Add").
@@ -26,7 +27,8 @@ There is no ready-made download yet; build it first (see "Building"). Then:
 4. With the Device Portal's file explorer, upload your own files to the app's `LocalState\xemu\xemu` folder:
    `mcpx_1.0.bin`, a BIOS image and `xbox_hdd.qcow2` (see https://xemu.app/docs/required-files/), and an
    `xemu.toml` that names them. A template is `XemuUWP/xemu.toml` in the companion repository; the folder's
-   path on the console is `Q:/Users/UserMgr0/AppData/Local/Packages/<package family name>/LocalState/xemu/xemu/`.
+   path on the console is `Q:/Users/UserMgr0/AppData/Local/Packages/<package family name>/LocalState/xemu/xemu/`
+   (`GamerDad.Xemu_w8c8c10g47ykp` for the released package).
 5. Games: disc images (XISO or full dumps, `.iso`) on an NTFS USB drive on which app packages have full
    control (`icacls X:\ /grant "*S-1-15-2-1:(OI)(CI)F"`). Either set `dvd_path` in `xemu.toml`, or start
    games from the Game Vault launcher, which passes the disc with a link.
