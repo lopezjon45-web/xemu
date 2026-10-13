@@ -504,6 +504,10 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
     }
 }
 
+#ifdef XEMU_UWP
+uint16_t xemu_uwp_injected_buttons;
+#endif
+
 void xemu_input_update_controller(ControllerState *state)
 {
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
@@ -517,6 +521,10 @@ void xemu_input_update_controller(ControllerState *state)
     } else if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
         xemu_input_update_sdl_controller_state(state);
     }
+#ifdef XEMU_UWP
+    /* buttons pressed from outside, through a launch link (see uwp_press in ui/xemu.c) */
+    state->buttons |= xemu_uwp_injected_buttons;
+#endif
 
     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 }

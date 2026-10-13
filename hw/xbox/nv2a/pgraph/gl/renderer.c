@@ -131,6 +131,16 @@ static void pgraph_gl_process_pending(NV2AState *d)
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
 
+#ifdef XEMU_UWP
+    if (pgraph_gl_uwp_stale_display_surface_pending()) {
+        qemu_mutex_unlock(&d->pfifo.lock);
+        qemu_mutex_lock(&d->pgraph.lock);
+        pgraph_gl_uwp_drop_stale_display_surface(d);
+        qemu_mutex_unlock(&d->pgraph.lock);
+        qemu_mutex_lock(&d->pfifo.lock);
+    }
+#endif
+
     if (qatomic_read(&r->downloads_pending) ||
         qatomic_read(&r->download_dirty_surfaces_pending) ||
         qatomic_read(&d->pgraph.sync_pending) ||

@@ -7,7 +7,7 @@ app on an Xbox Series X in Dev Mode. It is based on upstream master `478b4f4`. T
 inside `#ifdef XEMU_UWP`; on top of that the branch carries a few fixes taken from open xemu pull requests
 (listed under "Taken from others") and one generic fix in `block/file-win32.c`.
 
-**Current build: 0.8.1.0** ([releases](https://github.com/skitzellez/xemu-uwp/releases)).
+**Current build: 0.8.6.0** ([releases](https://github.com/skitzellez/xemu-uwp/releases)).
 
 ## Controls added for the console
 
@@ -86,6 +86,13 @@ repository. Keep changes inside `#ifdef XEMU_UWP`.
   snapshots in the hard disk image.
 - No settings file needed (0.5.0.0 on): the boot ROM, BIOS and hard disk are found in the launcher's shared
   folder or next to where `xemu.toml` would be. NAT networking is on by default.
+- Online (0.8.6.0): with the built-in NAT networking, Insignia's Setup Assistant
+  ([insignia.live](https://insignia.live), the replacement for the original Xbox Live service) runs, registers
+  the emulated console and reports "All checks passed". Creating an account and playing a match have not been
+  tried yet.
+- Buttons can be pressed from outside for testing: the launch link takes `press=down,down,a` (also `wait` and
+  a number of milliseconds). `XemuUWP/tools/xlink.ps1` in the companion repository sends such links and takes
+  a screenshot.
 - A failed internal check (assert) no longer vanishes without trace: `uwp_debug.log` gets the message and a
   module+offset backtrace (`ABORT` lines), to be looked up with `nm -n` on the unstripped exe.
 - When the console sends the app to the background, the virtual hard disk is flushed and the settings are
@@ -177,6 +184,10 @@ The changes keep data on the GPU:
   with another pitch, or the two ranges overlap only partly. Halo 2 alternates 128x128 and 160x120 targets
   over one pool, four read-backs a frame. A target lying wholly inside another, or keeping its pitch, is
   still copied back. If a game shows a wrong picture after this, this rule is the first suspect.
+- Fixed in 0.8.6.0: a program that draws its screen with the CPU into memory overlapping an old GPU surface
+  was shown shifted (the display took any surface containing the display address). A surface the GPU is not
+  drawing to that starts more than two lines away from the display address is now dropped
+  (`uwp_display_surface` in `gl/display.c`).
 - Fixed in 0.5.4.0: the shortcut that skips a depth surface over a recent colour image left a depth-only
   pass with nothing bound (`assert(r->color_binding || r->zeta_binding)`, Halo 2 while loading a level). It
   now applies only while a colour target is bound.

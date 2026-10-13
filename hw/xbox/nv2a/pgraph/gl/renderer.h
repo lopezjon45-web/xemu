@@ -273,6 +273,8 @@ void pgraph_gl_surface_update(NV2AState *d, bool upload, bool color_write, bool 
 void pgraph_gl_sync(NV2AState *d);
 #ifdef XEMU_UWP
 GLintptr pgraph_gl_uwp_stream_put(const void *data, size_t size);
+void pgraph_gl_uwp_drop_stale_display_surface(NV2AState *d);
+bool pgraph_gl_uwp_stale_display_surface_pending(void);
 #endif
 void pgraph_gl_update_entire_memory_buffer(NV2AState *d);
 void pgraph_gl_init_display(NV2AState *d);

@@ -287,6 +287,24 @@ static void render_display(NV2AState *d, SurfaceBinding *surface)
     d->vga.get_resolution(&d->vga, (int*)&width, (int*)&height);
     d->vga.get_params(&d->vga, &vga_display_params);
     int line_offset = vga_display_params.line_offset ? surface->pitch / vga_display_params.line_offset : 1;
+#ifdef XEMU_UWP
+    {
+        /* log the display set-up whenever it changes: a wrong picture usually starts here */
+        static unsigned int last[7];
+        unsigned int cur[7] = { width, height, surface->width, surface->height,
+                                surface->pitch, (unsigned)vga_display_params.line_offset,
+                                (unsigned)d->pcrtc.start };
+        if (memcmp(last, cur, sizeof(cur))) {
+            memcpy(last, cur, sizeof(cur));
+            uwp_log("display: mode %ux%u, surface %ux%u pitch %u at %x (fmt %x swz %d), "
+                    "vga line_offset %u, pcrtc.start %x, scale %u",
+                    width, height, surface->width, surface->height, surface->pitch,
+                    (unsigned)surface->vram_addr, surface->fmt.gl_internal_format,
+                    surface->swizzle, (unsigned)vga_display_params.line_offset,
+                    (unsigned)d->pcrtc.start, pg->surface_scale_factor);
+        }
+    }
+#endif
 
     /* Adjust viewport height for interlaced mode, used only in 1080i */
     if (d->vga.cr[NV_PRMCIO_INTERLACE_MODE] != NV_PRMCIO_INTERLACE_MODE_DISABLED) {
@@ -373,12 +391,69 @@ static void gl_fence(void)
     glDeleteSync(fence);
 }
 
+#ifdef XEMU_UWP
+/*
+ * The surface to show for the current display address. Upstream takes any
+ * surface that contains the address. That goes wrong when a program draws
+ * its screen with the CPU into memory that overlaps an old surface (seen
+ * with a homebrew tool started after the boot animation: its frame buffer
+ * began 74 lines into the animation's surface, and the picture came out
+ * shifted by that much). A surface that the GPU is not drawing to, and that
+ * starts more than two lines away from the display address, is not what is
+ * on screen: drop it and let the frame buffer in RAM be shown instead.
+ */
+static uint64_t uwp_stale_surface_addr; /* vram address + 1 of a surface to drop, 0 = none */
+
+static SurfaceBinding *uwp_display_surface(NV2AState *d, hwaddr line_offset)
+{
+    SurfaceBinding *surface =
+        pgraph_gl_surface_get_within(d, d->pcrtc.start + line_offset);
+    if (surface && surface->color && !surface->draw_dirty &&
+        d->pcrtc.start > surface->vram_addr &&
+        d->pcrtc.start - surface->vram_addr > 2 * (hwaddr)surface->pitch) {
+        /*
+         * Not invalidated here: this also runs on the UI thread, which does
+         * not own the renderer's state. The renderer thread does it when it
+         * next looks for pending work (pgraph_gl_uwp_drop_stale_display_surface).
+         */
+        qatomic_set(&uwp_stale_surface_addr, (uint64_t)surface->vram_addr + 1);
+        pfifo_kick(d);
+        return NULL;
+    }
+    return surface;
+}
+
+bool pgraph_gl_uwp_stale_display_surface_pending(void)
+{
+    return qatomic_read(&uwp_stale_surface_addr) != 0;
+}
+
+void pgraph_gl_uwp_drop_stale_display_surface(NV2AState *d)
+{
+    uint64_t addr = qatomic_xchg(&uwp_stale_surface_addr, 0);
+    if (!addr) {
+        return;
+    }
+    SurfaceBinding *surface = pgraph_gl_surface_get(d, addr - 1);
+    if (surface && surface->color && !surface->draw_dirty) {
+        uwp_log("display: dropped stale surface %ux%u at %x (display starts at %x)",
+                surface->width, surface->height, (unsigned)surface->vram_addr,
+                (unsigned)d->pcrtc.start);
+        pgraph_gl_surface_invalidate(d, surface);
+    }
+}
+#define UWP_DISPLAY_SURFACE(d, addr, line_offset) uwp_display_surface(d, line_offset)
+#else
+#define UWP_DISPLAY_SURFACE(d, addr, line_offset) pgraph_gl_surface_get_within(d, addr)
+#endif
+
 void pgraph_gl_sync(NV2AState *d)
 {
     VGADisplayParams vga_display_params;
     d->vga.get_params(&d->vga, &vga_display_params);
 
-    SurfaceBinding *surface = pgraph_gl_surface_get_within(d, d->pcrtc.start + vga_display_params.line_offset);
+    SurfaceBinding *surface = UWP_DISPLAY_SURFACE(d, d->pcrtc.start + vga_display_params.line_offset,
+                                                  vga_display_params.line_offset);
     if (surface == NULL || !surface->color || !surface->width || !surface->height) {
         qemu_event_set(&d->pgraph.sync_complete);
         return;
@@ -417,8 +492,9 @@ int pgraph_gl_get_framebuffer_surface(NV2AState *d)
     VGADisplayParams vga_display_params;
     d->vga.get_params(&d->vga, &vga_display_params);
 
-    SurfaceBinding *surface = pgraph_gl_surface_get_within(
-        d, d->pcrtc.start + vga_display_params.line_offset);
+    SurfaceBinding *surface = UWP_DISPLAY_SURFACE(
+        d, d->pcrtc.start + vga_display_params.line_offset,
+        vga_display_params.line_offset);
     if (surface == NULL || !surface->color) {
         qemu_mutex_unlock(&d->pfifo.lock);
         return 0;

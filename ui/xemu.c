@@ -1916,6 +1916,77 @@ static void uwp_state(bool save)
     g_free(name);
 }
 
+/*
+ * Pressing the emulated controller's buttons from outside, for testing and
+ * for setup screens that wait for a button when nobody is at the console:
+ * the launch link takes press=down,down,a (names below; "wait" is a pause of
+ * half a second, a number is a pause of that many milliseconds). Each press
+ * is held for 150 ms and followed by 350 ms of nothing.
+ */
+extern uint16_t xemu_uwp_injected_buttons;
+static uint16_t uwp_press_queue[64];
+static uint16_t uwp_press_pause[64];
+static int uwp_press_count, uwp_press_next;
+static uint64_t uwp_press_until, uwp_press_release_at;
+
+static void uwp_press(const char *list)
+{
+    static const struct {
+        const char *name;
+        uint16_t mask;
+    } names[] = {
+        { "a", CONTROLLER_BUTTON_A }, { "b", CONTROLLER_BUTTON_B },
+        { "x", CONTROLLER_BUTTON_X }, { "y", CONTROLLER_BUTTON_Y },
+        { "left", CONTROLLER_BUTTON_DPAD_LEFT }, { "up", CONTROLLER_BUTTON_DPAD_UP },
+        { "right", CONTROLLER_BUTTON_DPAD_RIGHT }, { "down", CONTROLLER_BUTTON_DPAD_DOWN },
+        { "back", CONTROLLER_BUTTON_BACK }, { "start", CONTROLLER_BUTTON_START },
+        { "white", CONTROLLER_BUTTON_WHITE }, { "black", CONTROLLER_BUTTON_BLACK },
+        { "ls", CONTROLLER_BUTTON_LSTICK }, { "rs", CONTROLLER_BUTTON_RSTICK },
+    };
+    char **parts = g_strsplit(list, ",", -1);
+    if (uwp_press_next >= uwp_press_count) {
+        uwp_press_count = uwp_press_next = 0;
+    }
+    for (int i = 0; parts[i] && uwp_press_count < ARRAY_SIZE(uwp_press_queue); i++) {
+        uint16_t mask = 0, pause = 0;
+        for (int n = 0; n < ARRAY_SIZE(names); n++) {
+            if (!g_ascii_strcasecmp(parts[i], names[n].name)) {
+                mask = names[n].mask;
+            }
+        }
+        if (!mask) {
+            pause = !g_ascii_strcasecmp(parts[i], "wait") ? 500 : (uint16_t)atoi(parts[i]);
+            if (!pause) {
+                continue;
+            }
+        }
+        uwp_press_queue[uwp_press_count] = mask;
+        uwp_press_pause[uwp_press_count++] = pause;
+    }
+    g_strfreev(parts);
+    uwp_log("remote buttons: %s", list);
+}
+
+static void uwp_press_poll(void)
+{
+    uint64_t now = SDL_GetTicks();
+    if (xemu_uwp_injected_buttons && now >= uwp_press_release_at) {
+        xemu_uwp_injected_buttons = 0;
+    }
+    if (uwp_press_next >= uwp_press_count || now < uwp_press_until) {
+        return;
+    }
+    uint16_t mask = uwp_press_queue[uwp_press_next];
+    uint16_t pause = uwp_press_pause[uwp_press_next++];
+    if (mask) {
+        xemu_uwp_injected_buttons = mask;
+        uwp_press_release_at = now + 150;
+        uwp_press_until = now + 500;
+    } else {
+        uwp_press_until = now + pause;
+    }
+}
+
 /* View + Menu (Back + Start) held together for two seconds quits. */
 static void uwp_poll_quit_combo(void)
 {
@@ -2066,6 +2137,9 @@ static char *uwp_take_activation_disc(void)
         }
         if (!strcmp(p, "state=1")) {
             uwp_load_state_wanted = true;
+        }
+        if (!strncmp(p, "press=", 6)) {
+            uwp_press(p + 6);
         }
         if (!strcmp(p, "noflush=1")) {
             extern bool xemu_uwp_skip_cb_flush;
@@ -2578,6 +2652,7 @@ int main(int argc, char **argv)
         if ((uwp_frames & 7) == 0) {
             uwp_poll_quit_combo();
         }
+        uwp_press_poll();
         /*
          * Asked for by the launch link. Not before the game has had 45 seconds: a state
          * loaded while the console is still booting can leave the audio processor (DSP)
