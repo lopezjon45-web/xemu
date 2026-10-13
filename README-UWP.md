@@ -3,8 +3,31 @@
 **UWP port by [Skitzelles](https://github.com/skitzellez).**
 
 This branch (`uwp`) makes [xemu](https://github.com/xemu-project/xemu), the original Xbox emulator, run as a UWP
-app on an Xbox Series X in Dev Mode. It is based on upstream master `478b4f4`. Every change is inside
-`#ifdef XEMU_UWP`, except one generic fix in `block/file-win32.c`.
+app on an Xbox Series X in Dev Mode. It is based on upstream master `478b4f4`. The port's own changes are
+inside `#ifdef XEMU_UWP`; on top of that the branch carries a few fixes taken from open xemu pull requests
+(listed under "Taken from others") and one generic fix in `block/file-win32.c`.
+
+**Current build: 0.7.5.0** ([releases](https://github.com/skitzellez/xemu-uwp/releases)).
+
+## Controls added for the console
+
+| Buttons | What |
+| --- | --- |
+| **View + RB** | Save a quick state (one per game, kept inside the virtual hard disk) |
+| **View + LB** | Load it. Not in the first seconds after starting a game: wait for the title screen |
+| **View + Menu**, held two seconds | Quit and return to the launcher |
+
+## Games tried so far (one Xbox Series X, 1080p, 1x internal resolution)
+
+| Game | Result |
+| --- | --- |
+| Crash Bandicoot: The Wrath of Cortex | 59-60 fps in its attract demo |
+| Panzer Dragoon Orta | 59-60 fps in its demo; real play not checked |
+| OutRun 2 | menus full speed, about 30 fps in a race (target 60) |
+| Halo 2 | menus a steady 30 (its target); gameplay 26-30 in light scenes, 19-21 in a heavy combat room |
+| A racing game with software-decoded intro movies | movies at 3-5 fps (the emulated CPU; same on desktop xemu), races 21-38 |
+
+That is the whole list. Expect breakage elsewhere, and please report what you find.
 
 **This code was written by an AI assistant (Claude) working with the repository owner.** It is published as a
 fork so that others can read it, test it, and take ideas from it. xemu's own rules (`CONTRIBUTING.md`, "Use of
@@ -57,8 +80,14 @@ repository. Keep changes inside `#ifdef XEMU_UWP`.
 - Full disc dumps (redump style) play without converting: the game partition is found and mounted at its offset.
 - Homebrew used for testing: `nxdk_pgraph_tests`, `xemu-perf-tests`.
 - Quitting: the link `xemu:?quit=1` ends the emulator and the launcher's `launchOnExit` link is opened
-  (seen working with Game Vault). Holding **View + Menu** (Back + Start) for two seconds does the same; that
-  was not yet tried with a real controller.
+  (seen working with Game Vault). Holding **View + Menu** (Back + Start) for two seconds does the same.
+- Quick save states (0.6.2.0 on): saved and loaded on the console from the controller and through the links
+  `xemu:?state=save` and `xemu:?state=1` (the latter loads 45 s after start). They are ordinary xemu
+  snapshots in the hard disk image.
+- No settings file needed (0.5.0.0 on): the boot ROM, BIOS and hard disk are found in the launcher's shared
+  folder or next to where `xemu.toml` would be. NAT networking is on by default.
+- A failed internal check (assert) no longer vanishes without trace: `uwp_debug.log` gets the message and a
+  module+offset backtrace (`ABORT` lines), to be looked up with `nm -n` on the unstripped exe.
 - When the console sends the app to the background, the virtual hard disk is flushed and the settings are
   saved, so a suspended app that is ended later does not lose saves (0.4.3.0).
 - With `[net] enable = true` (NAT) in `xemu.toml` the emulator starts and runs; no game was tried online.
@@ -68,6 +97,13 @@ repository. Keep changes inside `#ifdef XEMU_UWP`.
 - Movies that are decoded with MMX/SSE in software run at a few frames a second in at least one game. The
   emulated CPU is the limit (same reports exist for desktop xemu, issues #2938, #1266, #1232).
 - One racing game stays near 30 fps in races although the renderer is not saturated; see "Open leads".
+- Heavy scenes with many draws are slow: about 22 microseconds are spent inside every GL draw call on this
+  GL-on-D3D12 stack (measured in Halo 2 at about 780 draws a frame: 19-21 fps where the game wants 30, and
+  30 with drawing switched off). See "Open leads".
+- A state loaded while the emulated console is still booting can trip an assert in the DSP interpreter
+  (`read_memory_p`); loaded later it works. Cause not understood.
+- The pause with broken-up sound when a new scene appears (Halo 2: intro to title) is textures being
+  uploaded and shaders compiled for the first time; see the shader cache point below.
 - Disc swap while xemu is running is written but untested.
 - Disc images are opened with `CreateFileFromAppW` since 0.4.0.0, which should make FAT32 / exFAT USB drives
   work without the NTFS + permissions step. **Not yet tried on a FAT32 drive**; NTFS still works.
@@ -80,7 +116,15 @@ repository. Keep changes inside `#ifdef XEMU_UWP`.
   probes.
 - Only a handful of games were tried. Expect breakage.
 
-## Taken from the other UWP port
+## Taken from others
+
+Fixes from open pull requests on xemu-project/xemu, applied here as they are, with thanks to their authors:
+#3072 (EmmanuelARB) audio voice processor: skip a segment that is not ready instead of asserting;
+#2929 (flowa1911you) raise the PGRAPH interrupt from a bottom half; #2941 (xionic) lock-free read of the
+polled fence register; #2930 (flowa1911you) consume inline vertex arrays in bulk; #3028 (EqUiNoX-Labs) keep
+whole-page code invalidation off the running page; #2957 (EriKWDev) delay the DVD read-completion interrupt.
+
+### From the other UWP port
 
 [rodrigoandrigo/xemu](https://github.com/rodrigoandrigo/xemu) (branch `UWP`) was read after this port was
 published. Ideas adopted from it, with thanks: the APU frame thread raises its interrupt through a bottom half
@@ -117,6 +161,15 @@ The changes keep data on the GPU:
 - Depth surfaces sampled as textures (16 and 24 bit, formats 0x30, 0x2E, 0x12) are copied or drawn on the GPU.
 - A depth surface larger than the colour target stays bound instead of being read back and rebuilt.
 - `glFlush` instead of `glFinish` at flip.
+- Vertex data without waiting for the GPU (0.6.2.0, `gl/vertex.c`): upstream patches a GL buffer that mirrors
+  all of VRAM with `glBufferSubData` before a draw. That buffer is always referenced by queued draws, and
+  Mesa's D3D12 driver answers a write to a busy buffer by flushing and waiting. The pages a draw needs are
+  now copied to the next free part of a 64 MB stream buffer through an unsynchronized mapping, with a table of
+  the VRAM ranges it already holds; inline arrays and inline buffers go the same way. Halo 2's menu went
+  from 23-30 fps to a steady 29-30.
+- Fixed in 0.5.4.0: the shortcut that skips a depth surface over a recent colour image left a depth-only
+  pass with nothing bound (`assert(r->color_binding || r->zeta_binding)`, Halo 2 while loading a level). It
+  now applies only while a colour target is bound.
 
 Measured on the console: one platformer's attract demo went from 20-28 fps to 59-60; another game's demo from
 29-30 to 59-60 with read-backs at zero.
@@ -132,6 +185,12 @@ and the hottest guest code blocks. `tools/sum.py` and `tools/sym.py` in the comp
 
 ## Open leads
 
+- The per-draw cost inside Mesa's D3D12 path (see above): half of the renderer thread's samples are in
+  `win32u.dll` / `ntdll.dll` and a quarter in `libgallium_wgl.dll`. The link parameter `skipdraws=1` and the
+  timers `PF_GLDRAW`, `PF_FLUSH_DRAW`, `PF_SURF_UPD`, `PF_BIND_SHADER` are there to measure it. Next: a Mesa
+  build with symbols, or merging draws.
+- The emulated CPU spends about 30 % of its time in block lookup and dispatch in Halo 2 (`cpu_exec_loop`,
+  `helper_lookup_tb_ptr`, `qht_lookup_custom`): something keeps emptying the jump cache or the TLB.
 - The 30 fps racing game: about ten PGRAPH register accesses per frame from the vcpu wait on the renderer's
   locks (2-5 ms a frame). They are the guest's handler for a PGRAPH interrupt (bit 20) raised once a frame;
   `pgraph_write` takes `pfifo.lock` and `pg->lock` while the pfifo thread holds them.
