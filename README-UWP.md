@@ -55,19 +55,38 @@ repository. Keep changes inside `#ifdef XEMU_UWP`.
 - Starting a disc from another app with a link: `xemu:?disc=<escaped path>&launchOnExit=<uri>`.
 - Full disc dumps (redump style) play without converting: the game partition is found and mounted at its offset.
 - Homebrew used for testing: `nxdk_pgraph_tests`, `xemu-perf-tests`.
+- Quitting: the link `xemu:?quit=1` ends the emulator and the launcher's `launchOnExit` link is opened
+  (seen working with Game Vault). Holding **View + Menu** (Back + Start) for two seconds does the same; that
+  was not yet tried with a real controller.
+- When the console sends the app to the background, the virtual hard disk is flushed and the settings are
+  saved, so a suspended app that is ended later does not lose saves (0.4.3.0).
+- With `[net] enable = true` (NAT) in `xemu.toml` the emulator starts and runs; no game was tried online.
 
 ## What does not work, or is unfinished
 
 - Movies that are decoded with MMX/SSE in software run at a few frames a second in at least one game. The
   emulated CPU is the limit (same reports exist for desktop xemu, issues #2938, #1266, #1232).
 - One racing game stays near 30 fps in races although the renderer is not saturated; see "Open leads".
-- Disc swap while xemu is running and returning to the launcher on quit are written but untested.
-- There is no way to quit from the controller.
+- Disc swap while xemu is running is written but untested.
+- Disc images are opened with `CreateFileFromAppW` since 0.4.0.0, which should make FAT32 / exFAT USB drives
+  work without the NTFS + permissions step. **Not yet tried on a FAT32 drive**; NTFS still works.
+- No shader cache between runs: the Mesa UWP build has no disk cache and reports no program binary formats,
+  so xemu's own shader cache stays empty and every start compiles shaders again (the first seconds of a new
+  scene stutter). `MESA_SHADER_CACHE_DIR` is set, ready for a Mesa build that has the cache.
 - Debug leftovers are still in: `UWP_MARK` markers (`system/vl.c`, `hw/xbox/xbox.c`,
   `hw/xbox/mcpx/apu/monitor.c`), a listing of `*.iso` files on all drives at start-up (`ui/xemu.c`, it runs
   before the main loop and can delay start-up on a slow drive), `pgraph read/write` trace lines and two lock
   probes.
 - Only a handful of games were tried. Expect breakage.
+
+## Taken from the other UWP port
+
+[rodrigoandrigo/xemu](https://github.com/rodrigoandrigo/xemu) (branch `UWP`) was read after this port was
+published. Ideas adopted from it, with thanks: the APU frame thread raises its interrupt through a bottom half
+instead of taking the big QEMU lock, and the `MESA_SHADER_CACHE_DIR` setting. Its brokered-storage design was
+the prompt for the simpler `CreateFileFromAppW` route used here. The GPU read-back fixes listed under
+"Performance work" are not in that port at the time of writing (its 1.0.0.114 ran one game's demo levels at
+23-28 fps on the same console where this port holds 55-60).
 
 ## What had to change to run in a UWP app on the console
 

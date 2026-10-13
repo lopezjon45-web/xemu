@@ -41,6 +41,7 @@
 #include "ui/kbd-state.h"
 #include "system/runstate.h"
 #include "system/runstate-action.h"
+#include "block/block.h"
 #include "system/system.h"
 #include "xui/xemu-hud.h"
 #include "xemu-input.h"
@@ -1032,6 +1033,27 @@ static void display_very_early_init(DisplayOptions *o)
     SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "wayland,x11");
 #endif
 
+#ifdef XEMU_UWP
+    {
+        /*
+         * Give Mesa a folder for its shader cache. Without one it has no disk
+         * cache, reports no program binary formats, and xemu's own shader
+         * cache stays empty too: every start compiled every shader again.
+         * (rodrigoandrigo/xemu's UWP port sets the same variable.)
+         */
+        char *base = SDL_GetPrefPath("xemu", "xemu");
+        char *dir = g_strdup_printf("%smesa-shader-cache", base ? base : "");
+        wchar_t *wdir = g_utf8_to_utf16(dir, -1, NULL, NULL, NULL);
+        g_mkdir_with_parents(dir, 0700);
+        if (wdir) {
+            _wputenv_s(L"MESA_SHADER_CACHE_DIR", wdir);
+        }
+        g_free(wdir);
+        g_free(dir);
+        SDL_free(base);
+    }
+#endif
+
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "Failed to initialize SDL video subsystem: %s\n",
                 SDL_GetError());
@@ -1156,6 +1178,13 @@ static void display_very_early_init(DisplayOptions *o)
     fprintf(stderr, "GL_RENDERER: %s\n", glGetString(GL_RENDERER));
     fprintf(stderr, "GL_VERSION: %s\n", glGetString(GL_VERSION));
     fprintf(stderr, "GL_SHADING_LANGUAGE_VERSION: %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
+#ifdef XEMU_UWP
+    {
+        GLint formats = 0;
+        glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &formats);
+        uwp_log("GL program binary formats: %d (0 = shaders cannot be cached)", formats);
+    }
+#endif
 
     // Initialize offscreen rendering context now
     nv2a_context_init();
@@ -1632,6 +1661,78 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
  * out of it, or returns NULL when there is none. Free with g_free().
  */
 #define UWP_ACTIVATION_HINT "SDL_WINRT_ACTIVATION_URI"
+
+/*
+ * Leave the emulator the same way the Exit menu item does. When xemu's main
+ * returns, SDL opens the launcher's "launchOnExit" link, so this is also the
+ * way back to Game Vault.
+ */
+static void uwp_quit(const char *why)
+{
+    uwp_log("quitting: %s", why);
+    shutdown_action = SHUTDOWN_ACTION_POWEROFF;
+    qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+}
+
+/* View + Menu (Back + Start) held together for two seconds quits. */
+static void uwp_poll_quit_combo(void)
+{
+    static uint64_t held_since;
+    static bool fired;
+    bool held = false;
+    int count = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&count);
+    for (int i = 0; ids && i < count; i++) {
+        SDL_Gamepad *pad = SDL_GetGamepadFromID(ids[i]);
+        if (pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK) &&
+            SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_START)) {
+            held = true;
+        }
+    }
+    SDL_free(ids);
+    if (!held) {
+        held_since = 0;
+        fired = false;
+    } else if (!held_since) {
+        held_since = SDL_GetTicks();
+    } else if (!fired && SDL_GetTicks() - held_since >= 2000) {
+        fired = true;
+        uwp_quit("View + Menu held");
+    }
+}
+
+/*
+ * The console suspends an app that leaves the screen and may end it without
+ * another word. Write out what would be lost: the virtual hard disk's cached
+ * blocks (save games) and the settings.
+ */
+static bool uwp_machine_running;
+
+static void uwp_save_for_background(void)
+{
+    if (!uwp_machine_running) {
+        return;
+    }
+    xemu_main_loop_lock();
+    int ret = bdrv_flush_all();
+    xemu_main_loop_unlock();
+    xemu_settings_save();
+    uwp_log("going to the background: disks flushed (%d), settings saved", ret);
+}
+
+/*
+ * Runs inside SDL's event pump at the moment the system announces the
+ * suspension (the polling loop would only see the event after the app has
+ * been resumed, which may be never). No xemu lock is held here.
+ */
+static bool uwp_event_watch(void *userdata, SDL_Event *event)
+{
+    if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
+        uwp_save_for_background();
+    }
+    return true;
+}
+
 static char *uwp_take_activation_disc(void)
 {
     const char *hint = SDL_GetHint(UWP_ACTIVATION_HINT);
@@ -1647,6 +1748,9 @@ static char *uwp_take_activation_disc(void)
         char *end = strchr(p, '&');
         if (end) {
             *end = '\0';
+        }
+        if (!strcmp(p, "quit=1")) {
+            uwp_quit("asked by link");
         }
         if (!strncmp(p, "disc=", 5)) {
             /* undo the %XX escaping; xemu.toml uses forward slashes */
@@ -2011,6 +2115,8 @@ int main(int argc, char **argv)
     struct xemu_console *scon = &scon_list[0];
 #ifdef XEMU_UWP
     uwp_log("UI loop starting");
+    uwp_machine_running = true;
+    SDL_AddEventWatch(uwp_event_watch, NULL);
     UWP_PROF_THREAD("ui");
     CloseHandle(CreateThread(NULL, 0, uwp_sampler_thread, (void *)"vcpu", 0,
                              NULL));
@@ -2024,6 +2130,9 @@ int main(int argc, char **argv)
 #ifdef XEMU_UWP
         uwp_frames++;
         uwp_poll_activation();
+        if ((uwp_frames & 7) == 0) {
+            uwp_poll_quit_combo();
+        }
         if (SDL_GetTicks() >= uwp_next_report) {
             int w = 0, h = 0;
             SDL_GetWindowSizeInPixels(scon->real_window, &w, &h);
