@@ -293,7 +293,7 @@ static void render_display(NV2AState *d, SurfaceBinding *surface)
         static unsigned int last[7];
         unsigned int cur[7] = { width, height, surface->width, surface->height,
                                 surface->pitch, (unsigned)vga_display_params.line_offset,
-                                (unsigned)d->pcrtc.start };
+                                (unsigned)(d->pcrtc.start - surface->vram_addr) };
         if (memcmp(last, cur, sizeof(cur))) {
             memcpy(last, cur, sizeof(cur));
             uwp_log("display: mode %ux%u, surface %ux%u pitch %u at %x (fmt %x swz %d), "

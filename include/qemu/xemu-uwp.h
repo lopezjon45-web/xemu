@@ -39,6 +39,20 @@ static inline FARPROC xemu_uwp_kernelbase_proc(const char *name)
 typedef HANDLE (WINAPI *xemu_uwp_CreateFileFromAppW_fn)(
     LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 
+/* Counters for the memory report (ui/xemu.c): GPU objects made by the renderer. */
+enum {
+    UWP_CNT_QUERIES_PENDING, /* pixel-count queries waiting for the game to read them (a level, not a rate) */
+    UWP_CNT_QUERIES_FOLDED,  /* queries read back early because too many were waiting */
+    UWP_CNT_TEX_NEW,
+    UWP_CNT_TEX_DEL,
+    UWP_CNT_SURF_NEW,
+    UWP_CNT_SURF_DEL,
+    UWP_CNT_STREAM_WRAP,     /* 64 MB vertex stream buffer replaced */
+    UWP_CNT_GL_ERRORS,
+    UWP_CNT_MAX
+};
+extern unsigned int xemu_uwp_counters[UWP_CNT_MAX];
+
 static inline HANDLE xemu_uwp_create_file_w(LPCWSTR name, DWORD access,
                                             DWORD share, DWORD creation,
                                             DWORD flags)

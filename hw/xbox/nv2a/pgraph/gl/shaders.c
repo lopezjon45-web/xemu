@@ -762,7 +762,24 @@ static void apply_uniform_updates(const UniformInfo *info, int *locs,
         }
     }
 
+#ifdef XEMU_UWP
+    {
+        /*
+         * An error raised by any earlier GL call shows up here. Closing the
+         * emulator for it helps nobody on a console: note it and carry on.
+         */
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            if (xemu_uwp_counters[UWP_CNT_GL_ERRORS]++ < 20) {
+                uwp_log("GL error 0x%x seen at the uniform update (0x505 = out of memory)", err);
+            }
+            while (glGetError() != GL_NO_ERROR) {
+            }
+        }
+    }
+#else
     assert(glGetError() == GL_NO_ERROR);
+#endif
 }
 
 // FIXME: Dirty tracking

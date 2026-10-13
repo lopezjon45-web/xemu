@@ -87,6 +87,45 @@ static GLintptr uwp_stream_pos;
 static GLuint uwp_stream_buffer;
 
 /*
+ * When the stream buffer is full, the next of a few buffers is taken instead
+ * of asking GL for fresh storage (glBufferData). Fresh storage every time
+ * looked free, but on Mesa's D3D12 driver the old 64 MB allocations were not
+ * given back while a scene kept drawing: an online lobby went from 3.7 GB to
+ * the app's 5.1 GB allowance in under a minute and the emulator closed. A
+ * buffer is used again only after the GPU has finished the draws that read
+ * from it (a fence is put behind them when the buffer is left).
+ */
+#define UWP_STREAM_POOL 3
+static GLuint uwp_stream_pool[UWP_STREAM_POOL];
+static GLsync uwp_stream_fence[UWP_STREAM_POOL];
+static int uwp_stream_cur;
+
+/* Leaves the buffer bound to GL_ARRAY_BUFFER. */
+static void uwp_stream_next_buffer(void)
+{
+    if (uwp_stream_fence[uwp_stream_cur]) {
+        glDeleteSync(uwp_stream_fence[uwp_stream_cur]);
+    }
+    uwp_stream_fence[uwp_stream_cur] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    uwp_stream_cur = (uwp_stream_cur + 1) % UWP_STREAM_POOL;
+    if (uwp_stream_fence[uwp_stream_cur]) {
+        glClientWaitSync(uwp_stream_fence[uwp_stream_cur], GL_SYNC_FLUSH_COMMANDS_BIT,
+                         2000000000ull);
+        glDeleteSync(uwp_stream_fence[uwp_stream_cur]);
+        uwp_stream_fence[uwp_stream_cur] = NULL;
+    }
+    if (!uwp_stream_pool[uwp_stream_cur]) {
+        glGenBuffers(1, &uwp_stream_pool[uwp_stream_cur]);
+        glBindBuffer(GL_ARRAY_BUFFER, uwp_stream_pool[uwp_stream_cur]);
+        glBufferData(GL_ARRAY_BUFFER, UWP_STREAM_SIZE, NULL, GL_STREAM_DRAW);
+    }
+    uwp_stream_buffer = uwp_stream_pool[uwp_stream_cur];
+    glBindBuffer(GL_ARRAY_BUFFER, uwp_stream_buffer);
+    uwp_stream_gen++;
+    xemu_uwp_counters[UWP_CNT_STREAM_WRAP]++;
+}
+
+/*
  * Makes VRAM [addr, end) (page aligned) available in the stream buffer and
  * returns where; the offset is at least min_off, so that a pointer to an
  * attribute's element 0, which may lie before addr, does not go negative.
@@ -135,8 +174,7 @@ static GLintptr uwp_stream_vertices(NV2AState *d, hwaddr addr, hwaddr end,
     GLintptr pos = MAX((GLintptr)TARGET_PAGE_ALIGN(uwp_stream_pos),
                        (GLintptr)TARGET_PAGE_ALIGN(min_off));
     if (pos + (GLintptr)size > UWP_STREAM_SIZE) {
-        glBufferData(GL_ARRAY_BUFFER, UWP_STREAM_SIZE, NULL, GL_STREAM_DRAW);
-        uwp_stream_gen++;
+        uwp_stream_next_buffer();
         pos = TARGET_PAGE_ALIGN(min_off);
     }
     void *map = glMapBufferRange(GL_ARRAY_BUFFER, pos, size,
@@ -189,8 +227,7 @@ GLintptr pgraph_gl_uwp_stream_put(const void *data, size_t size)
         return pos % UWP_STREAM_SIZE;
     }
     if (pos + (GLintptr)size > UWP_STREAM_SIZE) {
-        glBufferData(GL_ARRAY_BUFFER, UWP_STREAM_SIZE, NULL, GL_STREAM_DRAW);
-        uwp_stream_gen++;
+        uwp_stream_next_buffer();
         pos = 0;
     }
     void *map = glMapBufferRange(GL_ARRAY_BUFFER, pos, size,
@@ -482,11 +519,11 @@ void pgraph_gl_init_buffers(NV2AState *d)
     glGenBuffers(1, &r->gl_inline_array_buffer);
 
 #ifdef XEMU_UWP
-    glGenBuffers(1, &uwp_stream_buffer);
-    glBindBuffer(GL_ARRAY_BUFFER, uwp_stream_buffer);
-    glBufferData(GL_ARRAY_BUFFER, UWP_STREAM_SIZE, NULL, GL_STREAM_DRAW);
+    memset(uwp_stream_pool, 0, sizeof(uwp_stream_pool));
+    memset(uwp_stream_fence, 0, sizeof(uwp_stream_fence));
+    uwp_stream_cur = UWP_STREAM_POOL - 1;
+    uwp_stream_next_buffer();
     uwp_stream_pos = 0;
-    uwp_stream_gen++;
 #endif
     glGenBuffers(1, &r->gl_memory_buffer);
     glBindBuffer(GL_ARRAY_BUFFER, r->gl_memory_buffer);

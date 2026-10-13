@@ -2074,6 +2074,8 @@ static void uwp_glib_print(const gchar *text)
 }
 
 /* How much memory the system still grants this app (the console ends an app that asks for more). */
+unsigned int xemu_uwp_counters[UWP_CNT_MAX];
+
 static void uwp_log_memory(void)
 {
     typedef struct {
@@ -2088,6 +2090,17 @@ static void uwp_log_memory(void)
                 (unsigned long long)(m.PrivateCommitUsage >> 20),
                 (unsigned long long)(m.AvailableCommit >> 20),
                 (unsigned long long)(m.PeakPrivateCommitUsage >> 20));
+    }
+    {
+        static unsigned int last[UWP_CNT_MAX];
+        unsigned int *c = xemu_uwp_counters;
+        uwp_log("gpu objects: queries waiting %u (read early %u), textures +%u -%u, surfaces +%u -%u, "
+                "stream buffers %u, GL errors %u",
+                c[UWP_CNT_QUERIES_PENDING], c[UWP_CNT_QUERIES_FOLDED] - last[UWP_CNT_QUERIES_FOLDED],
+                c[UWP_CNT_TEX_NEW] - last[UWP_CNT_TEX_NEW], c[UWP_CNT_TEX_DEL] - last[UWP_CNT_TEX_DEL],
+                c[UWP_CNT_SURF_NEW] - last[UWP_CNT_SURF_NEW], c[UWP_CNT_SURF_DEL] - last[UWP_CNT_SURF_DEL],
+                c[UWP_CNT_STREAM_WRAP] - last[UWP_CNT_STREAM_WRAP], c[UWP_CNT_GL_ERRORS]);
+        memcpy(last, c, sizeof(last));
     }
 }
 

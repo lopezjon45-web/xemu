@@ -169,6 +169,7 @@ typedef struct QueryReport {
     uint32_t parameter;
     unsigned int query_count;
     GLuint *queries;
+    uint64_t carry; /* XEMU_UWP: samples of queries that were read back early */
 } QueryReport;
 
 typedef struct PGRAPHGLState {
@@ -274,6 +275,7 @@ void pgraph_gl_sync(NV2AState *d);
 #ifdef XEMU_UWP
 GLintptr pgraph_gl_uwp_stream_put(const void *data, size_t size);
 void pgraph_gl_uwp_drop_stale_display_surface(NV2AState *d);
+void pgraph_gl_uwp_fold_queries(PGRAPHState *pg);
 bool pgraph_gl_uwp_stale_display_surface_pending(void);
 #endif
 void pgraph_gl_update_entire_memory_buffer(NV2AState *d);

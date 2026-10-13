@@ -697,6 +697,9 @@ static SurfaceBinding *surface_put(NV2AState *d, hwaddr addr,
     register_cpu_access_callback(d, surface_out);
 
     QTAILQ_INSERT_TAIL(&r->surfaces, surface_out, entry);
+#ifdef XEMU_UWP
+    xemu_uwp_counters[UWP_CNT_SURF_NEW]++;
+#endif
 
     return surface_out;
 }
@@ -751,6 +754,9 @@ void pgraph_gl_surface_invalidate(NV2AState *d, SurfaceBinding *surface)
     unregister_cpu_access_callback(d, surface);
 
     glDeleteTextures(1, &surface->gl_buffer);
+#ifdef XEMU_UWP
+    xemu_uwp_counters[UWP_CNT_SURF_DEL]++;
+#endif
 
     QTAILQ_REMOVE(&r->surfaces, surface, entry);
     g_free(surface);

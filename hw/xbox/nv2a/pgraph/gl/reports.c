@@ -22,6 +22,36 @@
 #include <hw/xbox/nv2a/nv2a_int.h>
 #include "renderer.h"
 
+#ifdef XEMU_UWP
+#include "qemu/xemu-uwp.h"
+/*
+ * A game can leave pixel counting switched on and never ask for the result
+ * (seen in an online lobby: about 950 draws a frame, each with a new query,
+ * until the app's memory allowance was gone after three minutes). So the
+ * queries waiting to be read are capped: beyond UWP_MAX_PENDING_QUERIES
+ * they are read back now, their sum is kept, and they are deleted.
+ */
+#define UWP_MAX_PENDING_QUERIES 4096
+static uint64_t uwp_query_carry;
+
+void pgraph_gl_uwp_fold_queries(PGRAPHState *pg)
+{
+    PGRAPHGLState *r = pg->gl_renderer_state;
+    xemu_uwp_counters[UWP_CNT_QUERIES_PENDING] = r->gl_zpass_pixel_count_query_count;
+    if (r->gl_zpass_pixel_count_query_count < UWP_MAX_PENDING_QUERIES) {
+        return;
+    }
+    for (int i = 0; i < r->gl_zpass_pixel_count_query_count; i++) {
+        GLuint result = 0;
+        glGetQueryObjectuiv(r->gl_zpass_pixel_count_queries[i], GL_QUERY_RESULT, &result);
+        uwp_query_carry += result;
+    }
+    glDeleteQueries(r->gl_zpass_pixel_count_query_count, r->gl_zpass_pixel_count_queries);
+    xemu_uwp_counters[UWP_CNT_QUERIES_FOLDED] += r->gl_zpass_pixel_count_query_count;
+    r->gl_zpass_pixel_count_query_count = 0;
+}
+#endif
+
 static void process_pending_report(NV2AState *d, QueryReport *report)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -45,6 +75,10 @@ static void process_pending_report(NV2AState *d, QueryReport *report)
         gl_query_result /= pg->surface_scale_factor * pg->surface_scale_factor;
         r->zpass_pixel_count_result += gl_query_result;
     }
+#ifdef XEMU_UWP
+    r->zpass_pixel_count_result +=
+        report->carry / (pg->surface_scale_factor * pg->surface_scale_factor);
+#endif
 
     if (report->query_count) {
         glDeleteQueries(report->query_count, report->queries);
@@ -80,6 +114,9 @@ void pgraph_gl_clear_report_value(NV2AState *d)
                         r->gl_zpass_pixel_count_queries);
         r->gl_zpass_pixel_count_query_count = 0;
     }
+#ifdef XEMU_UWP
+    uwp_query_carry = 0;
+#endif
 
     QueryReport *report = g_malloc(sizeof(QueryReport));
     report->clear = true;
@@ -104,6 +141,10 @@ void pgraph_gl_get_report(NV2AState *d, uint32_t parameter)
     report->parameter = parameter;
     report->query_count = r->gl_zpass_pixel_count_query_count;
     report->queries = r->gl_zpass_pixel_count_queries;
+#ifdef XEMU_UWP
+    report->carry = uwp_query_carry;
+    uwp_query_carry = 0;
+#endif
     QSIMPLEQ_INSERT_TAIL(&r->report_queue, report, entry);
 
     r->gl_zpass_pixel_count_query_count = 0;

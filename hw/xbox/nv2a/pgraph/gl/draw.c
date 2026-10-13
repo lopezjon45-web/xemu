@@ -332,6 +332,9 @@ void pgraph_gl_draw_begin(NV2AState *d)
 
     /* Visibility testing */
     if (pg->zpass_pixel_count_enable) {
+#ifdef XEMU_UWP
+        pgraph_gl_uwp_fold_queries(pg);
+#endif
         r->gl_zpass_pixel_count_query_count++;
         r->gl_zpass_pixel_count_queries = (GLuint*)g_realloc(
             r->gl_zpass_pixel_count_queries,

@@ -751,6 +751,9 @@ static TextureBinding* generate_texture(const TextureShape s,
     /* Create a new opengl texture */
     GLuint gl_texture;
     glGenTextures(1, &gl_texture);
+#ifdef XEMU_UWP
+    xemu_uwp_counters[UWP_CNT_TEX_NEW]++;
+#endif
 
     GLenum gl_target;
     if (s.cubemap) {
@@ -873,6 +876,9 @@ static void texture_binding_destroy(gpointer data)
     binding->refcnt--;
     if (binding->refcnt == 0) {
         glDeleteTextures(1, &binding->gl_texture);
+#ifdef XEMU_UWP
+        xemu_uwp_counters[UWP_CNT_TEX_DEL]++;
+#endif
         g_free(binding);
     }
 }
