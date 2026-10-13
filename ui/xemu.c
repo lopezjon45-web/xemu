@@ -59,6 +59,7 @@
 #include "xemu-uwp-audio.h"
 #endif
 #include "qemu/xemu-uwp.h"
+#include <signal.h>
 #include "ui/xemu-notifications.h"
 
 #include <stb_image.h>
@@ -1708,6 +1709,66 @@ static void uwp_poll_quit_combo(void)
  */
 static bool uwp_machine_running;
 
+/*
+ * Why the process ended, when it ends by itself: an abort() (failed assert)
+ * or a plain exit() leaves no crash dump on the console, and the last lines
+ * of a buffered stderr are lost with it.
+ */
+static void uwp_on_abort(int sig)
+{
+    /*
+     * The assert text goes to a message box that an Xbox app cannot show, so
+     * log where it happened instead: module + offset for every caller, to be
+     * looked up in the unstripped exe (addr2line -e xemu_<ver>_unstripped.exe).
+     */
+    void *frames[40];
+    USHORT n = RtlCaptureStackBackTrace(0, 40, frames, NULL);
+    uwp_log("ABORT (signal %d): a check inside the emulator failed, thread %lu",
+            sig, GetCurrentThreadId());
+    for (USHORT i = 0; i < n; i++) {
+        HMODULE mod = NULL;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)frames[i], &mod) && mod) {
+            GetModuleFileNameA(mod, name, sizeof(name));
+        }
+        const char *base = strrchr(name, '\\');
+        uwp_log("  #%u %s+0x%llx", i, base ? base + 1 : name,
+                (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)mod));
+    }
+    fflush(NULL);
+}
+
+static void uwp_on_exit(void)
+{
+    uwp_log("exit() reached");
+    fflush(NULL);
+}
+
+static void uwp_glib_print(const gchar *text)
+{
+    uwp_log("glib: %s", text);
+}
+
+/* How much memory the system still grants this app (the console ends an app that asks for more). */
+static void uwp_log_memory(void)
+{
+    typedef struct {
+        ULONG64 AvailableCommit, PrivateCommitUsage, PeakPrivateCommitUsage, TotalCommitUsage;
+    } UwpAppMemory;
+    typedef BOOL (WINAPI *GetProcessInformation_fn)(HANDLE, int, LPVOID, DWORD);
+    GetProcessInformation_fn fn = (GetProcessInformation_fn)
+        xemu_uwp_kernelbase_proc("GetProcessInformation");
+    UwpAppMemory m = { 0 };
+    if (fn && fn(GetCurrentProcess(), 2 /* ProcessAppMemoryInfo */, &m, sizeof(m))) {
+        uwp_log("memory: %llu MB in use, %llu MB more allowed, peak %llu MB",
+                (unsigned long long)(m.PrivateCommitUsage >> 20),
+                (unsigned long long)(m.AvailableCommit >> 20),
+                (unsigned long long)(m.PeakPrivateCommitUsage >> 20));
+    }
+}
+
 static void uwp_save_for_background(void)
 {
     if (!uwp_machine_running) {
@@ -1886,6 +1947,11 @@ static void uwp_fill_system_files(void)
     g_config.general.updates.check = false;
     g_config.display.renderer = CONFIG_DISPLAY_RENDERER_OPENGL;
     g_config.display.window.fullscreen_on_startup = true;
+    /* Network on, through xemu's own NAT: what an online service such as Insignia needs, and the
+     * only backend that works in an app container besides the UDP tunnel (no packet capture). */
+    if (g_config.net.backend == CONFIG_NET_BACKEND_NAT) {
+        g_config.net.enable = true;
+    }
 }
 
 static void uwp_startup_disc(void)
@@ -2222,6 +2288,11 @@ int main(int argc, char **argv)
 #ifdef XEMU_UWP
     uwp_log("UI loop starting");
     uwp_machine_running = true;
+    setvbuf(stderr, NULL, _IONBF, 0);
+    signal(SIGABRT, uwp_on_abort);
+    atexit(uwp_on_exit);
+    g_set_printerr_handler(uwp_glib_print);
+    uwp_log_memory();
     SDL_AddEventWatch(uwp_event_watch, NULL);
     UWP_PROF_THREAD("ui");
     CloseHandle(CreateThread(NULL, 0, uwp_sampler_thread, (void *)"vcpu", 0,
@@ -2251,6 +2322,9 @@ int main(int argc, char **argv)
                     RunState_str(runstate_get()), g_nv2a_stats.increment_fps,
                     pads, p1 ? p1->name : "(none)");
             uwp_prof_report((SDL_GetTicks() - (uwp_next_report - 3000)) / 1000.0);
+            if ((uwp_frames / 180) % 3 == 0) {
+                uwp_log_memory();
+            }
             uwp_next_report = SDL_GetTicks() + 3000;
         }
 #endif

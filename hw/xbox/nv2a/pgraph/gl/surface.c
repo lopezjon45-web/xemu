@@ -1351,7 +1351,7 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
             SurfaceBinding *other = (color ? r->zeta_binding
                                            : r->color_binding);
 #ifdef XEMU_UWP
-            if (!color && found->color &&
+            if (!color && found->color && r->color_binding != NULL &&
                 (found == other || pg->frame_time - found->frame_time <= 1)) {
                 /*
                  * The depth buffer set to memory that is a color image: the
@@ -1361,6 +1361,10 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                  * using depth. Making a depth surface there would throw the
                  * color surface away, with two read-backs, every frame:
                  * draw without a depth buffer instead.
+                 * Only while a color target is bound, though: a pass that
+                 * writes depth alone (Halo 2 does one while loading a
+                 * level) would be left with nothing to draw into, which
+                 * ends in the assert in pgraph_gl_draw_begin.
                  */
                 surface->buffer_dirty = false;
                 return;
