@@ -5,6 +5,9 @@
  * *FromApp memory functions (with the codeGeneration capability). MinGW only
  * declares those for _WIN32_WINNT >= Windows 10 while QEMU targets Windows 8,
  * so they are looked up at run time from kernelbase.dll.
+ *
+ * Copyright (c) 2026 Skitzellez (https://github.com/skitzellez/xemu-uwp)
+ * Licensed under the GNU GPL, version 2 or later, like the rest of xemu.
  */
 
 #ifndef QEMU_XEMU_UWP_H

@@ -1,6 +1,9 @@
 /*
  * Audio output for the Xbox (UWP, Dev Mode) build of xemu: plays the APU's
  * SDL_AudioStream through XAudio2. See xemu-uwp-audio.h.
+ *
+ * Copyright (c) 2026 Skitzellez (https://github.com/skitzellez/xemu-uwp)
+ * Licensed under the GNU GPL, version 2 or later, like the rest of xemu.
  */
 
 #ifdef XEMU_UWP
