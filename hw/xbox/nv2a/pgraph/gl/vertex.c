@@ -23,6 +23,7 @@
 #include <hw/xbox/nv2a/nv2a_int.h>
 #include "debug.h"
 #include "renderer.h"
+#include "qemu/xemu-uwp.h"
 
 static void update_memory_buffer(NV2AState *d, hwaddr addr, hwaddr size,
                                  bool quick)
@@ -52,11 +53,117 @@ static void update_memory_buffer(NV2AState *d, hwaddr addr, hwaddr size,
     }
 }
 
+#ifdef XEMU_UWP
+/*
+ * Vertex data on GL-on-D3D12. Upstream keeps one GL buffer that mirrors all
+ * of VRAM and patches the changed pages with glBufferSubData before a draw.
+ * That buffer is always referenced by draws that have not run yet, and Mesa's
+ * D3D12 driver answers a write to a busy buffer by flushing and waiting for
+ * the GPU: about 170 waits a frame in Halo 2, a third of the renderer
+ * thread's time inside the kernel.
+ *
+ * Here the pages a draw needs are copied to the next free part of a stream
+ * buffer instead, through an unsynchronized mapping: nothing that is queued
+ * can refer to that part, so nothing has to be waited for. When the buffer
+ * is full it is replaced (the old storage lives on until its draws are done).
+ * A small table remembers which VRAM ranges already sit in the current buffer
+ * so that unchanged vertex buffers are not copied again.
+ */
+#define UWP_STREAM_SIZE (64 * 1024 * 1024)
+#define UWP_STREAM_RANGES 256
+
+typedef struct UwpStreamRange {
+    hwaddr addr, end;
+    GLintptr off;
+    unsigned int gen; /* 0 = unused or stale */
+} UwpStreamRange;
+
+static UwpStreamRange uwp_stream_ranges[UWP_STREAM_RANGES];
+static unsigned int uwp_stream_next, uwp_stream_gen = 1;
+static GLintptr uwp_stream_pos;
+static GLuint uwp_stream_buffer;
+
+/*
+ * Makes VRAM [addr, end) (page aligned) available in the stream buffer and
+ * returns where; the offset is at least min_off, so that a pointer to an
+ * attribute's element 0, which may lie before addr, does not go negative.
+ */
+static GLintptr uwp_stream_vertices(NV2AState *d, hwaddr addr, hwaddr end,
+                                    hwaddr min_off)
+{
+    hwaddr size = end - addr;
+
+    if (size == 0) {
+        /* a draw of no vertices that starts on a page boundary: nothing to copy */
+        return MAX(uwp_stream_pos, (GLintptr)TARGET_PAGE_ALIGN(min_off)) % UWP_STREAM_SIZE;
+    }
+    if (memory_region_test_and_clear_dirty(d->vram, addr, size,
+                                           DIRTY_MEMORY_NV2A)) {
+        /* the guest wrote here: every copy that overlaps is out of date */
+        for (int i = 0; i < UWP_STREAM_RANGES; i++) {
+            UwpStreamRange *r = &uwp_stream_ranges[i];
+            if (r->gen == uwp_stream_gen && r->addr < end && addr < r->end) {
+                r->gen = 0;
+            }
+        }
+    } else {
+        for (int i = 0; i < UWP_STREAM_RANGES; i++) {
+            UwpStreamRange *r = &uwp_stream_ranges[i];
+            if (r->gen == uwp_stream_gen && r->addr <= addr && end <= r->end &&
+                r->off + (GLintptr)(addr - r->addr) >= (GLintptr)min_off) {
+                return r->off + (addr - r->addr);
+            }
+        }
+    }
+
+    GLintptr pos = MAX(uwp_stream_pos, (GLintptr)TARGET_PAGE_ALIGN(min_off));
+    if (pos + (GLintptr)size > UWP_STREAM_SIZE) {
+        glBufferData(GL_ARRAY_BUFFER, UWP_STREAM_SIZE, NULL, GL_STREAM_DRAW);
+        uwp_stream_gen++;
+        pos = TARGET_PAGE_ALIGN(min_off);
+    }
+    void *map = glMapBufferRange(GL_ARRAY_BUFFER, pos, size,
+                                 GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT |
+                                 GL_MAP_UNSYNCHRONIZED_BIT);
+    if (map) {
+        memcpy(map, d->vram_ptr + addr, size);
+        glUnmapBuffer(GL_ARRAY_BUFFER);
+    } else {
+        static int complaints;
+        GLenum err = glGetError();
+        if (complaints < 20) {
+            complaints++;
+            uwp_log("vertex stream: map failed, GL error 0x%x, pos %lld size %llu min_off %llu",
+                    err, (long long)pos, (unsigned long long)size,
+                    (unsigned long long)min_off);
+        }
+        while (glGetError() != GL_NO_ERROR) {
+        }
+        glBufferSubData(GL_ARRAY_BUFFER, pos, size, d->vram_ptr + addr);
+    }
+    nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_1);
+
+    UwpStreamRange *r = &uwp_stream_ranges[uwp_stream_next];
+    uwp_stream_next = (uwp_stream_next + 1) % UWP_STREAM_RANGES;
+    r->addr = addr;
+    r->end = end;
+    r->off = pos;
+    r->gen = uwp_stream_gen;
+    uwp_stream_pos = pos + size;
+    return pos;
+}
+#endif
+
 void pgraph_gl_update_entire_memory_buffer(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
 
+#ifdef XEMU_UWP
+    /* all of VRAM may have changed (a state was loaded): forget what the stream buffer holds */
+    uwp_stream_gen++;
+    uwp_stream_pos = UWP_STREAM_SIZE;
+#endif
     glBindBuffer(GL_ARRAY_BUFFER, r->gl_memory_buffer);
     glBufferSubData(GL_ARRAY_BUFFER, 0, memory_region_size(d->vram), d->vram_ptr);
 }
@@ -142,6 +249,10 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
         }
 
         hwaddr start = 0;
+#ifdef XEMU_UWP
+        GLintptr attrib_pointer = 0;
+        bool uwp_streamed = false;
+#endif
         if (inline_data) {
             glBindBuffer(GL_ARRAY_BUFFER, r->gl_inline_array_buffer);
             attrib_data_addr = attr->inline_array_offset;
@@ -155,10 +266,34 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
             attrib_data_addr = attr_data + attr->offset - d->vram_ptr;
             stride = attr->stride;
             start = attrib_data_addr + min_element * stride;
+#ifdef XEMU_UWP
+            {
+                hwaddr lo = start & TARGET_PAGE_MASK;
+                hwaddr hi = TARGET_PAGE_ALIGN(start + num_elements * stride);
+                assert(hi < memory_region_size(d->vram));
+                /* element 0 may lie before the first page that is needed */
+                hwaddr before = attrib_data_addr < lo ? lo - attrib_data_addr : 0;
+                if (before + (hi - lo) <= UWP_STREAM_SIZE / 4) {
+                    glBindBuffer(GL_ARRAY_BUFFER, uwp_stream_buffer);
+                    GLintptr off = uwp_stream_vertices(d, lo, hi, before);
+                    attrib_pointer = off + (GLintptr)attrib_data_addr - (GLintptr)lo;
+                    uwp_streamed = true;
+                } else {
+                    /* the mirror of all VRAM, patched in place (waits for the GPU) */
+                    update_memory_buffer(d, start, num_elements * stride, false);
+                }
+            }
+#else
             update_memory_buffer(d, start, num_elements * stride,
                                         updated_memory_buffer);
             updated_memory_buffer = true;
+#endif
         }
+#ifdef XEMU_UWP
+        if (!uwp_streamed) {
+            attrib_pointer = attrib_data_addr;
+        }
+#endif
 
         uint32_t provoking_element_index = provoking_element - min_element;
         size_t element_size = attr->size * attr->count;
@@ -179,13 +314,19 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
             continue;
         }
 
+#ifdef XEMU_UWP
+#define UWP_ATTRIB_POINTER ((void *)(uintptr_t)attrib_pointer)
+#else
+#define UWP_ATTRIB_POINTER ((void *)attrib_data_addr)
+#endif
         if (needs_conversion) {
             glVertexAttribIPointer(i, gl_count, gl_type, stride,
-                                   (void *)attrib_data_addr);
+                                   UWP_ATTRIB_POINTER);
         } else {
             glVertexAttribPointer(i, gl_count, gl_type, gl_normalize, stride,
-                                  (void *)attrib_data_addr);
+                                  UWP_ATTRIB_POINTER);
         }
+#undef UWP_ATTRIB_POINTER
 
         glEnableVertexAttribArray(i);
         last_entry += stride * provoking_element_index;
@@ -272,6 +413,13 @@ void pgraph_gl_init_buffers(NV2AState *d)
     glGenBuffers(NV2A_VERTEXSHADER_ATTRIBUTES, r->gl_inline_buffer);
     glGenBuffers(1, &r->gl_inline_array_buffer);
 
+#ifdef XEMU_UWP
+    glGenBuffers(1, &uwp_stream_buffer);
+    glBindBuffer(GL_ARRAY_BUFFER, uwp_stream_buffer);
+    glBufferData(GL_ARRAY_BUFFER, UWP_STREAM_SIZE, NULL, GL_STREAM_DRAW);
+    uwp_stream_pos = 0;
+    uwp_stream_gen++;
+#endif
     glGenBuffers(1, &r->gl_memory_buffer);
     glBindBuffer(GL_ARRAY_BUFFER, r->gl_memory_buffer);
     glBufferData(GL_ARRAY_BUFFER, memory_region_size(d->vram),

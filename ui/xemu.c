@@ -47,6 +47,7 @@
 #include "xemu-input.h"
 #include "xemu-settings.h"
 #include "xemu-snapshots.h"
+#include "xemu-notifications.h"
 #include "xemu-version.h"
 #include "xemu-os-utils.h"
 
@@ -1675,12 +1676,62 @@ static void uwp_quit(const char *why)
     qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
 }
 
+/*
+ * Quick save states. One per disc, kept as a snapshot inside the hard disk
+ * image like xemu's own snapshots (they show up in its Snapshots window too).
+ *   View + RB: save      View + LB: load
+ * and the launch link may say "state=1" to load the disc's state as soon as
+ * the machine runs, which skips logos and menus.
+ */
+static bool uwp_load_state_wanted, uwp_save_state_wanted;
+
+static char *uwp_state_name(void)
+{
+    const char *disc = g_config.sys.files.dvd_path;
+    const char *base = disc ? disc : "";
+    for (const char *c = base; *c; c++) {
+        if (*c == '/' || *c == '\\') {
+            base = c + 1;
+        }
+    }
+    char *name = g_strdup_printf("quick %s", base[0] ? base : "no disc");
+    if (strlen(name) > 120) {
+        name[120] = '\0';
+    }
+    return name;
+}
+
+static void uwp_state(bool save)
+{
+    char *name = uwp_state_name();
+    Error *err = NULL;
+    xemu_main_loop_lock();
+    if (save) {
+        xemu_snapshots_save(name, &err);
+    } else {
+        xemu_snapshots_load(name, &err);
+    }
+    xemu_main_loop_unlock();
+    if (err) {
+        uwp_log("state %s failed (%s): %s", save ? "save" : "load", name,
+                error_get_pretty(err));
+        xemu_queue_error_message(save ? "The state could not be saved"
+                                      : "There is no saved state for this game yet (View + RB saves one)");
+        error_free(err);
+    } else {
+        uwp_log("state %s: %s", save ? "saved" : "loaded", name);
+        xemu_queue_notification(save ? "State saved" : "State loaded");
+    }
+    g_free(name);
+}
+
 /* View + Menu (Back + Start) held together for two seconds quits. */
 static void uwp_poll_quit_combo(void)
 {
     static uint64_t held_since;
     static bool fired;
-    bool held = false;
+    static bool state_combo_was_down;
+    bool held = false, want_save = false, want_load = false;
     int count = 0;
     SDL_JoystickID *ids = SDL_GetGamepads(&count);
     for (int i = 0; ids && i < count; i++) {
@@ -1689,8 +1740,17 @@ static void uwp_poll_quit_combo(void)
             SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_START)) {
             held = true;
         }
+        if (pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK) &&
+            !SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_START)) {
+            want_save |= SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
+            want_load |= SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER);
+        }
     }
     SDL_free(ids);
+    if ((want_save || want_load) && !state_combo_was_down) {
+        uwp_state(want_save);
+    }
+    state_combo_was_down = want_save || want_load;
     if (!held) {
         held_since = 0;
         fired = false;
@@ -1812,6 +1872,12 @@ static char *uwp_take_activation_disc(void)
         }
         if (!strcmp(p, "quit=1")) {
             uwp_quit("asked by link");
+        }
+        if (!strcmp(p, "state=1")) {
+            uwp_load_state_wanted = true;
+        }
+        if (!strcmp(p, "state=save")) {
+            uwp_save_state_wanted = true;
         }
         if (!strncmp(p, "disc=", 5)) {
             /* undo the %XX escaping; xemu.toml uses forward slashes */
@@ -2309,6 +2375,15 @@ int main(int argc, char **argv)
         uwp_poll_activation();
         if ((uwp_frames & 7) == 0) {
             uwp_poll_quit_combo();
+        }
+        /* asked for by the launch link: once the machine has been running for a few seconds */
+        if (uwp_load_state_wanted && uwp_frames > 240 && runstate_is_running()) {
+            uwp_load_state_wanted = false;
+            uwp_state(false);
+        }
+        if (uwp_save_state_wanted && runstate_is_running()) {
+            uwp_save_state_wanted = false;
+            uwp_state(true);
         }
         if (SDL_GetTicks() >= uwp_next_report) {
             int w = 0, h = 0;
