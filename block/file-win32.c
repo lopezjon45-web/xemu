@@ -38,6 +38,7 @@
 #include <windows.h>
 #include <winioctl.h>
 #include <assert.h>
+#include "qemu/xemu-uwp.h"
 
 #define FTYPE_FILE 0
 #define FTYPE_CD     1
@@ -421,9 +422,14 @@ static int raw_open(BlockDriverState *bs, QDict *options, int flags,
         assert(access_flags == GENERIC_READ);
         sharing_flags = FILE_SHARE_READ | FILE_SHARE_WRITE;
     }
+#ifdef XEMU_UWP
+    s->hfile = xemu_uwp_create_file_w(wfilename, access_flags, sharing_flags,
+                                      OPEN_EXISTING, overlapped);
+#else
     s->hfile = CreateFileW(wfilename, access_flags,
                           sharing_flags, NULL,
                           OPEN_EXISTING, overlapped, NULL);
+#endif
 #else
     s->hfile = CreateFileW(wfilename, access_flags,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,

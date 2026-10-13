@@ -77,6 +77,9 @@ typedef struct MCPXAPUState {
 
     bool exiting;
     bool set_irq;
+#ifdef XEMU_UWP
+    QEMUBH *irq_bh;
+#endif
 
     QemuThread apu_thread;
     QemuMutex lock;

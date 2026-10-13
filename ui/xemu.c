@@ -2083,18 +2083,29 @@ char *xemu_uwp_disc_filename(const char *path)
     if (!path || !path[0] || !strncmp(path, "json:", 5)) {
         return g_strdup(path ? path : "");
     }
-    int fd = qemu_open_old(path, O_RDONLY | O_BINARY);
-    if (fd >= 0) {
+    /* Opened like the block layer opens it, so a FAT32 / exFAT USB drive works. */
+    wchar_t *wpath = g_utf8_to_utf16(path, -1, NULL, NULL, NULL);
+    HANDLE h = wpath ? xemu_uwp_create_file_w(wpath, GENERIC_READ,
+                                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                              OPEN_EXISTING, 0)
+                     : INVALID_HANDLE_VALUE;
+    g_free(wpath);
+    if (h != INVALID_HANDLE_VALUE) {
         for (int i = 0; i < ARRAY_SIZE(bases); i++) {
             char head[20];
-            if (lseek(fd, bases[i] + 0x10000, SEEK_SET) >= 0 &&
-                read(fd, head, sizeof(head)) == sizeof(head) &&
-                !memcmp(head, magic, sizeof(head))) {
+            LARGE_INTEGER pos;
+            DWORD got = 0;
+            pos.QuadPart = bases[i] + 0x10000;
+            if (SetFilePointerEx(h, pos, NULL, FILE_BEGIN) &&
+                ReadFile(h, head, sizeof(head), &got, NULL) &&
+                got == sizeof(head) && !memcmp(head, magic, sizeof(head))) {
                 found = bases[i];
                 break;
             }
         }
-        close(fd);
+        CloseHandle(h);
+    } else {
+        uwp_log("disc: cannot open %s (error %lu)", path, GetLastError());
     }
     if (!found) {
         return g_strdup(path);
