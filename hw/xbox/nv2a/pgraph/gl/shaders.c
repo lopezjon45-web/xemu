@@ -823,13 +823,17 @@ static void update_shader_uniforms(PGRAPHState *pg, ShaderBinding *binding)
  * binaries, no disk cache), and the console's driver compiles each shader at the first draw
  * that uses it, for that draw's setup (target formats, vertex layout, texture types). Every
  * start therefore compiled the Xbox logo animation's shaders while it was on screen: frames
- * of 0.1 to 1.4 s. The first draw of every shader in the first 30 s of a run is recorded per
- * disc in uwp_warm_<disc>.bin (shader state + draw setup); the next start replays those draws
- * off screen, with no pixels covered, before its first frame.
+ * of 0.1 to 1.4 s, and every new track or level stalled the same way. The first draw of every
+ * shader of a run is recorded per disc in uwp_warm_<disc>.bin (shader state + draw setup + when
+ * it was first needed); the next start replays those draws off screen, with no pixels covered:
+ * those needed in the first 30 s before the first frame, the rest in the background.
  */
-#define UWP_WARM_MAGIC 0x344d5257u /* "WRM4" */
-#define UWP_WARM_MAX 1024
-#define UWP_WARM_RECORD_MS 30000
+#define UWP_WARM_MAGIC 0x364d5257u /* "WRM6" */
+#define UWP_WARM_MAX 2048
+#define UWP_WARM_LAYOUT 1
+/* shaders first needed this soon after start are ready before the first frame; the rest
+   are prepared in the background while the game runs */
+#define UWP_WARM_BEFORE_MS 30000
 #define UWP_WARM_UNITS 4
 
 typedef struct UwpWarmPipe {
@@ -847,7 +851,8 @@ typedef struct UwpWarmPipe {
         stencil_write;
     struct {
         uint32_t type;
-        uint8_t enabled, size, normalized, integer;
+        int32_t size; /* 1-4, or GL_BGRA for Xbox colours */
+        uint8_t enabled, normalized, integer, pad;
     } attr[16];
     struct {
         uint32_t target, fmt;
@@ -856,6 +861,7 @@ typedef struct UwpWarmPipe {
 
 typedef struct UwpWarmRecord {
     uint64_t check;
+    uint32_t ms, pad; /* when it was first needed, ms after start */
     ShaderState state;
     UwpWarmPipe pipe;
 } UwpWarmRecord;
@@ -878,12 +884,17 @@ static void uwp_warm_header(uint32_t head[3])
 {
     head[0] = UWP_WARM_MAGIC;
     head[1] = sizeof(UwpWarmRecord);
-    head[2] = (uint32_t)fast_hash((const uint8_t *)xemu_version, strlen(xemu_version));
+    /*
+     * Not the xemu version: the list must survive updates (players would otherwise lose it
+     * with every new build). Raise UWP_WARM_LAYOUT when ShaderState or the GLSL generators
+     * change what a stored state means; a changed size is caught by head[1].
+     */
+    head[2] = UWP_WARM_LAYOUT;
 }
 
 static uint64_t uwp_warm_check(const UwpWarmRecord *rec)
 {
-    return fast_hash((const uint8_t *)&rec->state, sizeof(*rec) - sizeof(rec->check));
+    return fast_hash((const uint8_t *)&rec->ms, sizeof(*rec) - sizeof(rec->check));
 }
 
 /* a small texture of this kind and format, made once */
@@ -945,6 +956,19 @@ static void uwp_warm_enable(GLenum cap, bool on)
     }
 }
 
+/* testing aid: why a replay was skipped (first 12 of a run) */
+static void uwp_warm_why(const UwpWarmPipe *p, const char *what, unsigned int code)
+{
+    static int told;
+    if (qatomic_fetch_inc(&told) >= 12) {
+        return;
+    }
+    uwp_log("shader warm-up: skipped (%s 0x%x): color 0x%x depth 0x%x prim 0x%x tex %x:%x %x:%x "
+            "%x:%x %x:%x", what, code, p->color_fmt, p->depth_fmt, p->prim, p->tex[0].target,
+            p->tex[0].fmt, p->tex[1].target, p->tex[1].fmt, p->tex[2].target, p->tex[2].fmt,
+            p->tex[3].target, p->tex[3].fmt);
+}
+
 static bool uwp_warm_replay(const UwpWarmPipe *p, GLuint fbo, GLuint vao)
 {
     while (glGetError() != GL_NO_ERROR) {
@@ -952,6 +976,7 @@ static bool uwp_warm_replay(const UwpWarmPipe *p, GLuint fbo, GLuint vao)
     GLuint color = p->color_fmt ? uwp_warm_texture(GL_TEXTURE_2D, p->color_fmt) : 0;
     GLuint depth = p->depth_fmt ? uwp_warm_texture(GL_TEXTURE_2D, p->depth_fmt) : 0;
     if ((p->color_fmt && !color) || (p->depth_fmt && !depth)) {
+        uwp_warm_why(p, "target texture", p->color_fmt && !color ? p->color_fmt : p->depth_fmt);
         return false;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -960,7 +985,9 @@ static bool uwp_warm_replay(const UwpWarmPipe *p, GLuint fbo, GLuint vao)
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
     glFramebufferTexture2D(GL_FRAMEBUFFER, ds ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,
                            GL_TEXTURE_2D, depth, 0);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+    GLenum fb_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (fb_status != GL_FRAMEBUFFER_COMPLETE) {
+        uwp_warm_why(p, "framebuffer", fb_status);
         return false;
     }
     for (int u = 0; u < UWP_WARM_UNITS; u++) {
@@ -968,6 +995,11 @@ static bool uwp_warm_replay(const UwpWarmPipe *p, GLuint fbo, GLuint vao)
         if (p->tex[u].target) {
             glBindTexture(p->tex[u].target, uwp_warm_texture(p->tex[u].target, p->tex[u].fmt));
         }
+    }
+    GLenum stage_err = glGetError();
+    if (stage_err != GL_NO_ERROR) {
+        uwp_warm_why(p, "textures", stage_err);
+        return false;
     }
     glViewport(0, 0, 64, 64);
     glDisable(GL_SCISSOR_TEST);
@@ -1011,6 +1043,11 @@ static bool uwp_warm_replay(const UwpWarmPipe *p, GLuint fbo, GLuint vao)
     glStencilFunc(p->stencil_func, 0, p->stencil_mask);
     glStencilOp(p->stencil_fail, p->stencil_zfail, p->stencil_zpass);
     glStencilMask(p->stencil_write);
+    stage_err = glGetError();
+    if (stage_err != GL_NO_ERROR) {
+        uwp_warm_why(p, "state", stage_err);
+        return false;
+    }
     glBindVertexArray(vao);
     for (int i = 0; i < 16; i++) {
         if (!p->attr[i].enabled) {
@@ -1025,9 +1062,19 @@ static bool uwp_warm_replay(const UwpWarmPipe *p, GLuint fbo, GLuint vao)
         }
         glEnableVertexAttribArray(i);
     }
+    stage_err = glGetError();
+    if (stage_err != GL_NO_ERROR) {
+        uwp_warm_why(p, "attributes", stage_err);
+        return false;
+    }
     /* all vertices are zeros: the triangles cover no pixels */
     glDrawArrays(p->prim, 0, 6);
-    return glGetError() == GL_NO_ERROR;
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        uwp_warm_why(p, "draw", err);
+        return false;
+    }
+    return true;
 }
 
 /* the list read at start, replayed by the warm-up thread */
@@ -1036,6 +1083,9 @@ static int uwp_warm_list_len;
 #define UWP_WARM_THREADS 3
 extern GloContext *g_uwp_warm_context[UWP_WARM_THREADS]; /* renderer.c: one per warm-up thread */
 static int uwp_warm_threads_left;
+static char *uwp_warm_busy_path; /* exists while a warm-up runs */
+static int uwp_warm_progress[UWP_WARM_THREADS]; /* next entry each thread will take */
+static int uwp_warm_before; /* entries [0, uwp_warm_before) are needed before the first frame */
 
 typedef struct UwpWarmJob {
     PGRAPHGLState *r;
@@ -1060,6 +1110,7 @@ static void *uwp_warm_thread(void *arg)
 
     int built = 0, drawn = 0, failed = 0;
     for (int i = job->index; i < uwp_warm_list_len; i += UWP_WARM_THREADS) {
+        qatomic_set(&uwp_warm_progress[job->index], i);
         UwpWarmRecord *rec = &uwp_warm_list[i];
         uint64_t hash = fast_hash((uint8_t *)&rec->state, sizeof(ShaderState));
         qemu_mutex_lock(&r->shader_cache_lock);
@@ -1080,6 +1131,7 @@ static void *uwp_warm_thread(void *arg)
         glFlush(); /* hand each draw to the driver now, so its compiles start in order */
     }
     glFinish();
+    qatomic_set(&uwp_warm_progress[job->index], INT_MAX);
     glDeleteFramebuffers(1, &fbo);
     glDeleteVertexArrays(1, &vao);
     glDeleteBuffers(1, &buf);
@@ -1088,6 +1140,7 @@ static void *uwp_warm_thread(void *arg)
             "done at %lld ms", job->index, built, drawn, failed,
             (long long)(qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - uwp_warm_start_ms));
     if (qatomic_fetch_dec(&uwp_warm_threads_left) == 1) {
+        qemu_unlink(uwp_warm_busy_path);
         g_free(uwp_warm_list);
         uwp_warm_list = NULL;
     }
@@ -1104,6 +1157,14 @@ static void uwp_warm_start(PGRAPHGLState *r)
     gsize len = 0;
     uint32_t want[3];
     uwp_warm_header(want);
+    /* a warm-up that never finished last time (xemu ended in it): do not trust that list */
+    char *busy = g_strdup_printf("%s.busy", path);
+    if (g_file_test(busy, G_FILE_TEST_EXISTS)) {
+        qemu_unlink(path);
+        qemu_unlink(busy);
+        uwp_log("shader warm-up: the last one did not finish, starting a new list");
+    }
+    uwp_warm_busy_path = busy;
     if (!g_file_get_contents(path, &data, &len, NULL)) {
         uwp_log("shader warm-up: no list yet");
         g_free(path);
@@ -1133,6 +1194,13 @@ static void uwp_warm_start(PGRAPHGLState *r)
     g_free(path);
     uwp_warm_list_len = n;
     uwp_warm_count = n;
+    uwp_warm_before = 0;
+    while (uwp_warm_before < n && uwp_warm_list[uwp_warm_before].ms < UWP_WARM_BEFORE_MS) {
+        uwp_warm_before++;
+    }
+    for (int t = 0; t < UWP_WARM_THREADS; t++) {
+        uwp_warm_progress[t] = t;
+    }
 
     /* mark them as listed, so the game's own first draws do not list them again */
     qemu_mutex_lock(&r->shader_cache_lock);
@@ -1144,6 +1212,7 @@ static void uwp_warm_start(PGRAPHGLState *r)
     qemu_mutex_unlock(&r->shader_cache_lock);
 
     if (n > 0 && g_uwp_warm_context[0]) {
+        g_file_set_contents(uwp_warm_busy_path, "", 0, NULL);
         /* the driver compiles in parallel: several threads finish before the logo needs them */
         uwp_warm_threads_left = UWP_WARM_THREADS;
         for (int t = 0; t < UWP_WARM_THREADS; t++) {
@@ -1154,7 +1223,8 @@ static void uwp_warm_start(PGRAPHGLState *r)
             qemu_thread_create(&thread, "uwp.shader_warm", uwp_warm_thread, job,
                                QEMU_THREAD_DETACHED);
         }
-        uwp_log("shader warm-up: replaying %d draws on %d threads", n, UWP_WARM_THREADS);
+        uwp_log("shader warm-up: replaying %d draws on %d threads (%d before the first frame)", n,
+                UWP_WARM_THREADS, uwp_warm_before);
     }
 }
 
@@ -1172,8 +1242,18 @@ static void uwp_warm_wait(void)
     if (!qatomic_read(&uwp_warm_threads_left)) {
         return;
     }
-    while (qatomic_read(&uwp_warm_threads_left) &&
-           qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - t0 < 8000) {
+    for (;;) {
+        /* done when every thread has moved past the early entries (or finished) */
+        bool early_done = true;
+        for (int t = 0; t < UWP_WARM_THREADS; t++) {
+            if (qatomic_read(&uwp_warm_progress[t]) < uwp_warm_before) {
+                early_done = false;
+            }
+        }
+        if (early_done || !qatomic_read(&uwp_warm_threads_left) ||
+            qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - t0 >= 8000) {
+            break;
+        }
         g_usleep(2000);
     }
     uwp_log("shader warm-up: first draw waited %lld ms for it",
@@ -1188,15 +1268,14 @@ void uwp_warm_draw(PGRAPHGLState *r)
         return;
     }
     b->uwp_warm_noted = true;
-    if (uwp_warm_start_ms < 0 ||
-        qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - uwp_warm_start_ms > UWP_WARM_RECORD_MS ||
-        uwp_warm_count >= UWP_WARM_MAX) {
+    if (uwp_warm_start_ms < 0 || uwp_warm_count >= UWP_WARM_MAX) {
         return;
     }
 
     UwpWarmRecord *rec = g_malloc0(sizeof(UwpWarmRecord));
     UwpWarmPipe *p = &rec->pipe;
     memcpy(&rec->state, &b->state, sizeof(ShaderState));
+    rec->ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - uwp_warm_start_ms;
     p->prim = b->gl_primitive_mode;
 
     GLint v, type;

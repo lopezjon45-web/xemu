@@ -660,6 +660,26 @@ static void upload_gl_texture(GLenum gl_target,
                         8 : 16;
                 unsigned int physical_width = (width + 3) & ~3,
                              physical_height = (height + 3) & ~3;
+#ifdef XEMU_UWP
+                /*
+                 * The GPU reads DXT blocks itself: hand them over as they are instead of
+                 * unpacking every texture on the CPU (4-8x the data, and the unpacking was
+                 * a large part of loading). Not for a bordered cube map, whose faces are
+                 * cut out of the unpacked picture below; that depends only on the texture,
+                 * so all of its levels go the same way.
+                 */
+                if (!(s.cubemap && adjusted_width != s.width)) {
+                    glCompressedTexImage2D(
+                        gl_target, level, f.gl_internal_format, width, height, 0,
+                        physical_width / 4 * physical_height / 4 * block_size,
+                        texture_data);
+                    texture_data +=
+                        physical_width / 4 * physical_height / 4 * block_size;
+                    width /= 2;
+                    height /= 2;
+                    continue;
+                }
+#endif
                 uint8_t *converted = s3tc_decompress_2d(
                     gl_internal_format_to_s3tc_enum(f.gl_internal_format),
                     texture_data, width, height);
