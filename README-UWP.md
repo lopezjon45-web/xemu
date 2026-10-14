@@ -7,6 +7,8 @@ app on an Xbox Series X in Dev Mode. It is based on upstream master `478b4f4`. T
 inside `#ifdef XEMU_UWP`; on top of that the branch carries a few fixes taken from open xemu pull requests
 (listed under "Taken from others") and one generic fix in `block/file-win32.c`.
 
+**Support the project:** [patreon.com/Skitzelles](https://www.patreon.com/Skitzelles). Builds stay free; memberships keep the dev PC and test Xbox running.
+
 **Current build: 0.9.30.0** ([releases](https://github.com/skitzellez/xemu-uwp/releases)).
 
 ## Controls added for the console
