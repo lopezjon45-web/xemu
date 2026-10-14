@@ -1913,10 +1913,12 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
  * way back to Game Vault.
  */
 static void uwp_session_summary(const char *how);
+static void uwp_event(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
 
 static void uwp_quit(const char *why)
 {
     uwp_log("quitting: %s", why);
+    uwp_event("quit: %s", why);
     char *how = g_strdup_printf("quit normally (%s)", why);
     uwp_session_summary(how);
     g_free(how);
@@ -1951,6 +1953,7 @@ static char *uwp_state_name(void)
 
 static void uwp_state(bool save)
 {
+    uwp_event(save ? "quick save (View + RB)" : "quick load (View + LB)");
     char *name = uwp_state_name();
     Error *err = NULL;
     xemu_main_loop_lock();
@@ -2026,6 +2029,7 @@ static void uwp_press(const char *list)
         /* "<button>=<seconds>": hold a button down (a racing game's accelerator) */
         {
             const char *eq = strchr(parts[i], '=');
+            bool held = false;
             for (int n = 0; eq && n < ARRAY_SIZE(names); n++) {
                 if ((int)strlen(names[n].name) == eq - parts[i] &&
                     !g_ascii_strncasecmp(parts[i], names[n].name, eq - parts[i])) {
@@ -2033,10 +2037,10 @@ static void uwp_press(const char *list)
                     uwp_press_queue[uwp_press_count] = 0;
                     uwp_press_pause[uwp_press_count] = 0;
                     uwp_press_trigger[uwp_press_count++] = atoi(eq + 1);
-                    mask = 1;
+                    held = true;
                 }
             }
-            if (mask) {
+            if (held) {
                 continue;
             }
         }
@@ -2167,6 +2171,568 @@ static struct {
 } uwp_session = { .lowest = 1000, .slow_from = -1 };
 static uint64_t uwp_session_start_ms;
 
+/*
+ * Crash reports anyone can read. When xemu crashes or stops on an internal error, the log gets:
+ *  - what went wrong, in words, and which part of the emulator it happened in;
+ *  - where: the chain of functions that led there, with their names (xemu.sym in the package,
+ *    made from the unstripped exe when the package is built; system DLLs by their exports);
+ *  - the "black box": one line per second for the last minute (speed, memory, how busy the
+ *    emulated CPU and the graphics thread were), kept in memory and written only then.
+ * Everything here allocates nothing from the heap, which may be what broke.
+ */
+#define UWP_BOX_SECONDS 60
+static struct uwp_box_sample {
+    uint32_t sec;
+    int16_t fps, vcpu, gpu;
+    uint32_t mem_used, mem_left;   /* MB */
+    char state[12];
+} uwp_box[UWP_BOX_SECONDS];
+static unsigned uwp_box_count;
+uint64_t uwp_crash_test_at;   /* "crashtest=1" in the link (see uwp_take_activation_disc) */
+
+static bool uwp_memory(uint64_t *used, uint64_t *left)
+{
+    typedef struct {
+        ULONG64 AvailableCommit, PrivateCommitUsage, PeakPrivateCommitUsage, TotalCommitUsage;
+    } UwpAppMemory;
+    typedef BOOL (WINAPI *GetProcessInformation_fn)(HANDLE, int, LPVOID, DWORD);
+    GetProcessInformation_fn fn = (GetProcessInformation_fn)
+        xemu_uwp_kernelbase_proc("GetProcessInformation");
+    UwpAppMemory m = { 0 };
+    if (!fn || !fn(GetCurrentProcess(), 2 /* ProcessAppMemoryInfo */, &m, sizeof(m))) {
+        return false;
+    }
+    *used = m.PrivateCommitUsage;
+    *left = m.AvailableCommit;
+    return true;
+}
+
+static void uwp_box_sample(void)
+{
+    {
+        unsigned at = (unsigned)((SDL_GetTicks() - uwp_session_start_ms) / 1000);
+        uint64_t u = 0, l = 0;
+        uwp_memory(&u, &l);
+        extern char uwp_held_now_for_sec[];
+        uwp_log("SEC %u:%02u %d fps, CPU %d%%, graphics %d%%, memory %llu/%llu MB, holding: %s", at / 60, at % 60,
+                g_nv2a_stats.increment_fps, xemu_uwp_thread_busy("vcpu", 5), xemu_uwp_thread_busy("pfifo", 5),
+                (unsigned long long)(u >> 20), (unsigned long long)((u + l) >> 20),
+                uwp_held_now_for_sec[0] ? uwp_held_now_for_sec : "no buttons");
+    }
+    struct uwp_box_sample *b = &uwp_box[uwp_box_count % UWP_BOX_SECONDS];
+    uint64_t used = 0, left = 0;
+    uwp_memory(&used, &left);
+    b->sec = (uint32_t)((SDL_GetTicks() - uwp_session_start_ms) / 1000);
+    b->fps = (int16_t)g_nv2a_stats.increment_fps;
+    b->vcpu = (int16_t)xemu_uwp_thread_busy("vcpu", 6);
+    b->gpu = (int16_t)xemu_uwp_thread_busy("pfifo", 7);
+    b->mem_used = (uint32_t)(used >> 20);
+    b->mem_left = (uint32_t)(left >> 20);
+    snprintf(b->state, sizeof(b->state), "%s", RunState_str(runstate_get()));
+    uwp_box_count++;
+}
+
+/* A function name for an address in xemu.exe, from xemu.sym ("<rva hex> <name>" lines, sorted). */
+static char *uwp_sym_text;
+static DWORD uwp_sym_size;
+
+static void uwp_sym_load(void)
+{
+    static bool tried;
+    if (tried) {
+        return;
+    }
+    tried = true;
+    wchar_t path[MAX_PATH];
+    const char *base = SDL_GetBasePath();
+    if (!base || MultiByteToWideChar(CP_UTF8, 0, base, -1, path, MAX_PATH - 16) <= 0) {
+        return;
+    }
+    wcscat(path, L"xemu.sym");
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    DWORD size = GetFileSize(h, NULL), got = 0;
+    char *text = size && size < (64u << 20)
+                     ? xemu_uwp_virtual_alloc(NULL, size + 1, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) : NULL;
+    if (text && ReadFile(h, text, size, &got, NULL) && got == size) {
+        text[size] = '\0';
+        uwp_sym_text = text;
+        uwp_sym_size = size;
+    }
+    CloseHandle(h);
+}
+
+static bool uwp_sym_name(uint64_t rva, char *out, size_t n, uint64_t *off)
+{
+    uwp_sym_load();
+    const char *best = NULL;
+    uint64_t best_rva = 0;
+    for (const char *line = uwp_sym_text; line && *line;) {
+        uint64_t a = strtoull(line, NULL, 16);
+        if (a > rva) {
+            break;
+        }
+        best = line;
+        best_rva = a;
+        const char *nl = strchr(line, '\n');
+        line = nl ? nl + 1 : NULL;
+    }
+    if (!best) {
+        return false;
+    }
+    const char *name = strchr(best, ' ');
+    if (!name) {
+        return false;
+    }
+    name++;
+    size_t len = strcspn(name, "\r\n");
+    if (len >= n) {
+        len = n - 1;
+    }
+    memcpy(out, name, len);
+    out[len] = '\0';
+    *off = rva - best_rva;
+    return true;
+}
+
+/* "xemu.exe: pgraph_gl_draw_arrays+0x1c" or "ntdll.dll: RtlFreeHeap+0x40" */
+static void uwp_where(uint64_t addr, char *out, size_t n)
+{
+    HMODULE mod = NULL;
+    char path[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)addr, &mod) && mod) {
+        GetModuleFileNameA(mod, path, sizeof(path));
+    }
+    const char *file = strrchr(path, '\\');
+    file = file ? file + 1 : path;
+    uint64_t rva = addr - (uint64_t)(uintptr_t)mod;
+    char name[200];
+    uint64_t off = 0;
+    uint32_t off32 = 0;
+    const char *exp;
+    if (mod && mod == GetModuleHandleA(NULL) && uwp_sym_name(rva, name, sizeof(name), &off)) {
+        snprintf(out, n, "%s: %s+0x%llx", file, name, (unsigned long long)off);
+    } else if (mod && mod != GetModuleHandleA(NULL) && (exp = uwp_export_name(mod, addr, &off32))) {
+        snprintf(out, n, "%s: %s+0x%x", file, exp, off32);
+    } else {
+        snprintf(out, n, "%s+0x%llx", file, (unsigned long long)rva);
+    }
+}
+
+static const char *uwp_thread_role(char *name, size_t n)
+{
+    DWORD me = GetCurrentThreadId();
+    for (int i = 0; i < uwp_prof_num_threads; i++) {
+        if (uwp_prof_threads[i].tid == me) {
+            snprintf(name, n, "%s", uwp_prof_threads[i].name);
+            if (!strncmp(name, "vcpu", 4)) {
+                return "the emulated Xbox CPU (running the game's own code)";
+            }
+            if (!strncmp(name, "pfifo", 5)) {
+                return "the graphics thread (drawing what the Xbox GPU was told to draw)";
+            }
+            if (!strncmp(name, "ui", 2)) {
+                return "the screen thread (showing frames, controller, menus)";
+            }
+            return "a helper thread";
+        }
+    }
+    snprintf(name, n, "thread %lu", me);
+    return "a thread of the emulator or of the system (sound, disk, network)";
+}
+
+static void uwp_crash_report(const char *what, CONTEXT *ctx, void *const *frames, int nframes)
+{
+    char name[40], line[320];
+    const char *role = uwp_thread_role(name, sizeof(name));
+    uwp_log("===== CRASH REPORT =====");
+    uwp_log("What happened: %s", what);
+    uwp_log("In: %s (%s)", role, name);
+    uwp_log("Where it happened, innermost first:");
+    uint64_t pcs[40];
+    int n = 0;
+    if (ctx) {
+        CONTEXT copy = *ctx;
+        pcs[n++] = copy.Rip;
+        n += uwp_unwind(&copy, pcs + 1, 39);
+    } else {
+        for (int i = 0; i < nframes && n < 40; i++) {
+            pcs[n++] = (uint64_t)(uintptr_t)frames[i];
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        uwp_where(pcs[i], line, sizeof(line));
+        uwp_log("  %2d  %s", i, line);
+    }
+    unsigned have = uwp_box_count < UWP_BOX_SECONDS ? uwp_box_count : UWP_BOX_SECONDS;
+    uwp_log("The last %u seconds (time into the session: game fps, memory in use / still allowed, emulated CPU busy, "
+            "graphics busy, state):", have);
+    for (unsigned i = uwp_box_count - have; i < uwp_box_count; i++) {
+        struct uwp_box_sample *b = &uwp_box[i % UWP_BOX_SECONDS];
+        uwp_log("  %3u:%02u  %3d fps  %5u MB / %5u MB  cpu %3d%%  gpu %3d%%  %s", b->sec / 60, b->sec % 60,
+                b->fps, b->mem_used, b->mem_left, b->vcpu, b->gpu, b->state);
+    }
+    uint64_t used = 0, left = 0;
+    if (uwp_memory(&used, &left)) {
+        uwp_log("Memory at the end: %llu MB in use, %llu MB still allowed%s", (unsigned long long)(used >> 20),
+                (unsigned long long)(left >> 20),
+                left < (200ull << 20) ? " (almost none left: running out of memory is the likely cause)" : "");
+    }
+    uwp_log("===== END OF CRASH REPORT =====");
+    fflush(NULL);
+}
+
+static const char *uwp_exception_words(EXCEPTION_RECORD *r, char *out, size_t n)
+{
+    DWORD code = r ? r->ExceptionCode : 0;
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+        snprintf(out, n, "it tried to %s memory it may not touch (address 0x%llx)",
+                 r->NumberParameters > 0 && r->ExceptionInformation[0] == 1 ? "write to"
+                 : r->NumberParameters > 0 && r->ExceptionInformation[0] == 8 ? "run code in" : "read from",
+                 r->NumberParameters > 1 ? (unsigned long long)r->ExceptionInformation[1] : 0ull);
+        break;
+    case EXCEPTION_STACK_OVERFLOW:
+        snprintf(out, n, "it ran out of stack (a function called itself too deep)");
+        break;
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+        snprintf(out, n, "it ran an instruction this CPU does not have");
+        break;
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+        snprintf(out, n, "it divided by zero");
+        break;
+    case 0xC0000409:
+        snprintf(out, n, "it stopped itself after finding damaged memory (fail-fast)");
+        break;
+    case 0xC0000374:
+        snprintf(out, n, "its memory bookkeeping (heap) was damaged");
+        break;
+    default:
+        snprintf(out, n, "exception 0x%08lx", code);
+    }
+    return out;
+}
+
+/*
+ * The session recording, so a session can be read back without playing it:
+ *  - "SEC" lines, one a second: speed, how busy the emulated CPU and the graphics thread were,
+ *    memory, and the controller as it was held at that moment;
+ *  - "INPUT" lines whenever the player's controller (port 1) changes: buttons pressed and let go,
+ *    sticks and triggers rounded to a few levels (at most 10 lines a second for those);
+ *  - small pictures of the screen (320x240 PNG) every 10 seconds and at every event, in
+ *    "<game> screens" next to the log, named by the time into the session. Only the newest session
+ *    of a game is kept, and a session stops at 360 pictures or 40 MB (from then on one a minute,
+ *    and none past 600), so a long session cannot fill a drive.
+ */
+#define UWP_SHOTS_SOFT 360
+#define UWP_SHOTS_HARD 600
+#define UWP_SHOTS_BYTES (40u << 20)
+static char *uwp_shot_dir;          /* "<publisher>\logs\<game> screens" */
+static char uwp_shot_label[48];
+static bool uwp_shot_pending;
+static unsigned uwp_shot_count;
+static uint64_t uwp_shot_bytes, uwp_next_shot;
+char uwp_held_now_for_sec[96];      /* the controller as held now, for the SEC line */
+
+static void uwp_shot_request(const char *label)
+{
+    snprintf(uwp_shot_label, sizeof(uwp_shot_label), "%s", label ? label : "");
+    uwp_shot_pending = true;
+}
+
+/* asked by the UI (ui/xui/main.cc) once per frame: a picture to take now? */
+const char *xemu_uwp_shot_wanted(void)
+{
+    if (!uwp_shot_pending || !uwp_shot_dir) {
+        return NULL;
+    }
+    uwp_shot_pending = false;
+    if (uwp_shot_count >= UWP_SHOTS_HARD) {
+        return NULL;
+    }
+    return uwp_shot_label;
+}
+
+void xemu_uwp_shot_save(const char *label, const void *png, size_t size)
+{
+    unsigned at = (unsigned)((SDL_GetTicks() - uwp_session_start_ms) / 1000);
+    char name[96];
+    snprintf(name, sizeof(name), "%03u-%02u%s%s.png", at / 60, at % 60, label[0] ? " " : "", label);
+    char *path = g_strdup_printf("%s\\%s", uwp_shot_dir, name);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(png, 1, size, f);
+        fclose(f);
+        uwp_shot_count++;
+        uwp_shot_bytes += size;
+        uwp_log("SCREEN %s", name);
+    }
+    g_free(path);
+}
+
+/* a new session: the folder of the game's pictures, emptied of the last session's */
+static void uwp_shots_start(const char *share_log_path)
+{
+    char *dir = g_strdup(share_log_path);
+    char *dot = strrchr(dir, '.');
+    if (dot) {
+        *dot = '\0';
+    }
+    uwp_shot_dir = g_strdup_printf("%s screens", dir);
+    g_free(dir);
+    g_mkdir_with_parents(uwp_shot_dir, 0755);
+    GDir *d = g_dir_open(uwp_shot_dir, 0, NULL);
+    for (const char *f; d && (f = g_dir_read_name(d));) {
+        char *p = g_strdup_printf("%s\\%s", uwp_shot_dir, f);
+        remove(p);
+        g_free(p);
+    }
+    if (d) {
+        g_dir_close(d);
+    }
+}
+
+/* every 10 s a picture, fewer once the session has many */
+static void uwp_shots_tick(void)
+{
+    if (!uwp_shot_dir || SDL_GetTicks() < uwp_next_shot) {
+        return;
+    }
+    bool many = uwp_shot_count >= UWP_SHOTS_SOFT || uwp_shot_bytes >= UWP_SHOTS_BYTES;
+    uwp_next_shot = SDL_GetTicks() + (many ? 60000 : 10000);
+    uwp_shot_request("");
+}
+
+/* port 1's controller, from ui/xemu-input.c on every update */
+static const char *uwp_stick_words(int x, int y, char *out, size_t n)
+{
+    int mag = (int)sqrt((double)x * x + (double)y * y);
+    if (mag < 8000) {
+        snprintf(out, n, "centre");
+        return out;
+    }
+    static const char *const dirs[8] = { "right", "down-right", "down", "down-left", "left", "up-left", "up",
+                                         "up-right" };
+    double a = atan2((double)-y, (double)x);   /* screen y grows downwards: up is negative */
+    int sector = ((int)lround(a / (M_PI / 4)) + 8) % 8;
+    /* atan2 counts counter-clockwise from right: right, up-right, up, ... */
+    static const int ccw_to_name[8] = { 0, 7, 6, 5, 4, 3, 2, 1 };
+    snprintf(out, n, "%s %s", dirs[ccw_to_name[sector]], mag > 26000 ? "full" : "half");
+    return out;
+}
+
+static const char *uwp_trigger_words(int v)
+{
+    return v < 4000 ? "off" : v < 24000 ? "half" : "full";
+}
+
+void xemu_uwp_note_input(uint32_t buttons, const int16_t *axis)
+{
+    static const char *const names[15] = { "A", "B", "X", "Y", "Left", "Up", "Right", "Down", "Back", "Start",
+                                           "White", "Black", "LS-click", "RS-click", "Guide" };
+    static uint32_t last_buttons;
+    static char last_analog[96];
+    static uint64_t next_analog;
+    if (!uwp_session_start_ms) {
+        return;
+    }
+    unsigned at = (unsigned)((SDL_GetTicks() - uwp_session_start_ms) / 100);
+    uint32_t changed = buttons ^ last_buttons;
+    if (changed) {
+        char line[160] = "";
+        for (int i = 0; i < 15; i++) {
+            if (changed & (1u << i)) {
+                size_t len = strlen(line);
+                snprintf(line + len, sizeof(line) - len, " %s%s", buttons & (1u << i) ? "+" : "-", names[i]);
+            }
+        }
+        uwp_log("INPUT %u:%02u.%u%s", at / 600, (at / 10) % 60, at % 10, line);
+        last_buttons = buttons;
+    }
+    char ls[24], rs[24], analog[96];
+    snprintf(analog, sizeof(analog), "LS %s, RS %s, LT %s, RT %s",
+             uwp_stick_words(axis[CONTROLLER_AXIS_LSTICK_X], axis[CONTROLLER_AXIS_LSTICK_Y], ls, sizeof(ls)),
+             uwp_stick_words(axis[CONTROLLER_AXIS_RSTICK_X], axis[CONTROLLER_AXIS_RSTICK_Y], rs, sizeof(rs)),
+             uwp_trigger_words(axis[CONTROLLER_AXIS_LTRIG]), uwp_trigger_words(axis[CONTROLLER_AXIS_RTRIG]));
+    if (strcmp(analog, last_analog) && SDL_GetTicks() >= next_analog) {
+        uwp_log("INPUT %u:%02u.%u %s", at / 600, (at / 10) % 60, at % 10, analog);
+        snprintf(last_analog, sizeof(last_analog), "%s", analog);
+        next_analog = SDL_GetTicks() + 100;
+    }
+    /* what is held right now, for the SEC line */
+    char held[96] = "";
+    for (int i = 0; i < 15; i++) {
+        if (buttons & (1u << i)) {
+            size_t len = strlen(held);
+            snprintf(held + len, sizeof(held) - len, "%s%s", len ? "+" : "", names[i]);
+        }
+    }
+    snprintf(uwp_held_now_for_sec, sizeof(uwp_held_now_for_sec), "%s%s%s", held[0] ? held : "no buttons",
+             strcmp(analog, "LS centre, RS centre, LT off, RT off") ? "; " : "",
+             strcmp(analog, "LS centre, RS centre, LT off, RT off") ? analog : "");
+}
+
+/*
+ * The story of the session, in plain words, so a log answers "what happened, and why" by itself:
+ *  - events as they happen ("EVENT 2:16 went to the background ..."): the console's own events
+ *    (Home screen, back, low memory, closing), controllers, quick save / load, quitting, and
+ *    sudden changes of speed with what held it back;
+ *  - every 30 seconds one line ("PERIOD ..."): average and lowest speed, what held it back (the
+ *    emulated CPU, the graphics thread, or neither: then the game was waiting, on timing or on
+ *    itself), and whether the player was playing;
+ *  - the summary repeats both, so the first screen of a log tells the story.
+ */
+#define UWP_STORY_EVENTS 96
+#define UWP_STORY_PERIODS 240
+static char uwp_story_events[UWP_STORY_EVENTS][140];
+static unsigned uwp_story_event_count;
+static char uwp_story_periods[UWP_STORY_PERIODS][150];
+static unsigned uwp_story_period_count;
+static uint64_t uwp_background_since, uwp_foreground_at;
+unsigned xemu_uwp_input_activity;   /* controller updates with something pressed (ui/xemu-input.c) */
+
+static void uwp_event(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+static void uwp_event(const char *fmt, ...)
+{
+    char text[120];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(text, sizeof(text), fmt, ap);
+    va_end(ap);
+    unsigned at = uwp_session_start_ms ? (unsigned)((SDL_GetTicks() - uwp_session_start_ms) / 1000) : 0;
+    char *slot = uwp_story_events[uwp_story_event_count % UWP_STORY_EVENTS];
+    snprintf(slot, sizeof(uwp_story_events[0]), "%3u:%02u  %s", at / 60, at % 60, text);
+    uwp_story_event_count++;
+    uwp_log("EVENT %s", slot);
+    /* a picture of the screen at the moment, named after the event's first words */
+    char label[40];
+    snprintf(label, sizeof(label), "%s", text);
+    for (char *c = label; *c; c++) {
+        if (strchr("\\/:*?\"<>|;,()", *c)) {
+            *c = ' ';
+        }
+    }
+    uwp_shot_request(label);
+}
+
+/* what held the speed back, from how busy the two threads were */
+static const char *uwp_limit_words(int vcpu, int gpu)
+{
+    if (gpu >= 85) {
+        return "the graphics thread";
+    }
+    if (vcpu >= 92) {
+        return "the emulated CPU (the game's own work)";
+    }
+    return "neither thread (the game was waiting: timing, loading, or itself)";
+}
+
+/* 3-second samples into 30-second periods, and sudden speed changes */
+static struct {
+    unsigned n, fps_sum, active_from;
+    int fps_min, vcpu_sum, gpu_sum, start;
+    double last_avg;
+    uint64_t next_change_ok;
+} uwp_period = { .fps_min = 1000, .start = -1 };
+
+static void uwp_story_sample(int fps)
+{
+    int at = (int)((SDL_GetTicks() - uwp_session_start_ms) / 1000);
+    int vcpu = xemu_uwp_thread_busy("vcpu", 4), gpu = xemu_uwp_thread_busy("pfifo", 4);
+    if (uwp_period.start < 0) {
+        uwp_period.start = at;
+        uwp_period.active_from = xemu_uwp_input_activity;
+    }
+    /* a sudden drop against the last period's average */
+    /* (not in the first seconds back from the background: that sample still holds the paused time) */
+    bool settling = uwp_foreground_at && SDL_GetTicks() - uwp_foreground_at < 6000;
+    if (uwp_period.last_avg >= 20 && fps < uwp_period.last_avg * 0.5 && SDL_GetTicks() >= uwp_period.next_change_ok &&
+        !uwp_background_since && !settling) {
+        char after[64] = "";
+        if (uwp_foreground_at && SDL_GetTicks() - uwp_foreground_at < 30000) {
+            snprintf(after, sizeof(after), ", %u s after coming back from the background",
+                     (unsigned)((SDL_GetTicks() - uwp_foreground_at) / 1000));
+        }
+        uwp_event("speed dropped from %.0f to %d fps%s; held back by %s (CPU %d%%, graphics %d%%)",
+                  uwp_period.last_avg, fps, after, uwp_limit_words(vcpu, gpu), vcpu, gpu);
+        uwp_period.next_change_ok = SDL_GetTicks() + 30000;
+    }
+    uwp_period.n++;
+    uwp_period.fps_sum += fps > 0 ? fps : 0;
+    if (fps < uwp_period.fps_min) {
+        uwp_period.fps_min = fps;
+    }
+    uwp_period.vcpu_sum += vcpu > 0 ? vcpu : 0;
+    uwp_period.gpu_sum += gpu > 0 ? gpu : 0;
+    if (uwp_period.n < 10) {
+        return;
+    }
+    double avg = (double)uwp_period.fps_sum / uwp_period.n;
+    int v = uwp_period.vcpu_sum / (int)uwp_period.n, g = uwp_period.gpu_sum / (int)uwp_period.n;
+    unsigned presses = xemu_uwp_input_activity - uwp_period.active_from;
+    char *line = uwp_story_periods[uwp_story_period_count % UWP_STORY_PERIODS];
+    snprintf(line, sizeof(uwp_story_periods[0]), "%3d:%02d-%d:%02d  %3.0f fps (lowest %2d)  %-22s  %s",
+             uwp_period.start / 60, uwp_period.start % 60, at / 60, at % 60, avg, uwp_period.fps_min,
+             presses > 10 ? "player playing" : "no controller input",
+             avg < 1 ? "nothing drawn (loading, paused or stuck)" : uwp_limit_words(v, g));
+    uwp_story_period_count++;
+    uwp_log("PERIOD %s (CPU %d%%, graphics %d%%)", line, v, g);
+    uwp_period.last_avg = avg;
+    uwp_period.n = uwp_period.fps_sum = 0;
+    uwp_period.vcpu_sum = uwp_period.gpu_sum = 0;
+    uwp_period.fps_min = 1000;
+    uwp_period.start = -1;
+}
+
+uint64_t uwp_background_since_ms(bool set, bool clear)
+{
+    uint64_t was = uwp_background_since;
+    if (set) {
+        uwp_background_since = SDL_GetTicks();
+    }
+    if (clear) {
+        uwp_background_since = 0;
+        uwp_foreground_at = SDL_GetTicks();
+        uwp_period.next_change_ok = 0;
+    }
+    return was;
+}
+
+static void uwp_story_print(void)
+{
+    unsigned first = uwp_story_event_count > UWP_STORY_EVENTS ? uwp_story_event_count - UWP_STORY_EVENTS : 0;
+    uwp_log("What happened (time into the session):");
+    for (unsigned i = first; i < uwp_story_event_count; i++) {
+        uwp_log("  %s", uwp_story_events[i % UWP_STORY_EVENTS]);
+    }
+    first = uwp_story_period_count > UWP_STORY_PERIODS ? uwp_story_period_count - UWP_STORY_PERIODS : 0;
+    uwp_log("Every 30 seconds (speed, the player, what held the speed back):");
+    for (unsigned i = first; i < uwp_story_period_count; i++) {
+        uwp_log("  %s", uwp_story_periods[i % UWP_STORY_PERIODS]);
+    }
+}
+
+/* the start: the console, the TV, the memory the console grants (it tells App type Game from App) */
+static void uwp_story_start(int w, int h)
+{
+    uint64_t used = 0, left = 0;
+    uwp_memory(&used, &left);
+    unsigned total = (unsigned)((used + left) >> 20);
+    const char *disc = g_config.sys.files.dvd_path && g_config.sys.files.dvd_path[0]
+                           ? g_config.sys.files.dvd_path : "(no disc: the dashboard)";
+    uwp_event("started: %s", disc);
+    uwp_event("screen %dx%d; memory allowed %u MB (%s)", w, h, total,
+              total >= 3000 ? "App type Game: good" : "App type App? Set it to Game in Dev Home");
+    uwp_event("BIOS: %s; hard disk: %s",
+              strstr(g_config.sys.files.flashrom_path ? g_config.sys.files.flashrom_path : "", "SpiritBoot")
+                  ? "the free one (offline only)" : "the player's own",
+              g_config.sys.files.hdd_path && strstr(g_config.sys.files.hdd_path, "/xbox/")
+                  ? "the copy on the USB drive (no disk on the console)" : "the console's");
+}
+
 static void uwp_session_sample(int fps)
 {
     int at = (int)((SDL_GetTicks() - uwp_session_start_ms) / 1000);
@@ -2222,13 +2788,16 @@ static void uwp_session_summary(const char *how)
         uwp_log("Speed: the game never drew a frame");
     }
     uwp_log("Ended: %s", how);
+    uwp_story_print();
     uwp_log("===== END OF SUMMARY =====");
     fflush(NULL);
 }
 
 static LONG WINAPI uwp_on_crash(EXCEPTION_POINTERS *e)
 {
-    char how[160];
+    char how[160], words[160];
+    uwp_crash_report(uwp_exception_words(e ? e->ExceptionRecord : NULL, words, sizeof(words)),
+                     e ? e->ContextRecord : NULL, NULL, 0);
     DWORD code = e && e->ExceptionRecord ? e->ExceptionRecord->ExceptionCode : 0;
     HMODULE mod = NULL;
     char name[MAX_PATH] = "?";
@@ -2253,6 +2822,7 @@ static void uwp_on_abort(int sig)
      */
     void *frames[40];
     USHORT n = RtlCaptureStackBackTrace(0, 40, frames, NULL);
+    uwp_crash_report("a check inside the emulator failed (assert / abort)", NULL, frames, n);
     uwp_log("ABORT (signal %d): a check inside the emulator failed, thread %lu",
             sig, GetCurrentThreadId());
     for (USHORT i = 0; i < n; i++) {
@@ -2418,10 +2988,44 @@ static void uwp_save_for_background(void)
  * suspension (the polling loop would only see the event after the app has
  * been resumed, which may be never). No xemu lock is held here.
  */
+static void uwp_event(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+extern uint64_t uwp_background_since_ms(bool set, bool clear);
+
 static bool uwp_event_watch(void *userdata, SDL_Event *event)
 {
-    if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
+    switch (event->type) {
+    case SDL_EVENT_WILL_ENTER_BACKGROUND:
+        uwp_background_since_ms(true, false);
+        uwp_event("went to the background (Xbox button, Home screen or another app); the console may pause or "
+                  "close xemu now");
         uwp_save_for_background();
+        break;
+    case SDL_EVENT_DID_ENTER_FOREGROUND: {
+        uint64_t since = uwp_background_since_ms(false, true);
+        uwp_event("came back to the game after %u s in the background",
+                  since ? (unsigned)((SDL_GetTicks() - since) / 1000) : 0);
+        break;
+    }
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        uwp_event("the game lost focus (the guide, a notification or another app over it)");
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        uwp_event("the game has focus again");
+        break;
+    case SDL_EVENT_LOW_MEMORY:
+        uwp_event("the console warned that memory is low");
+        break;
+    case SDL_EVENT_TERMINATING:
+        uwp_event("the console is closing xemu");
+        break;
+    case SDL_EVENT_GAMEPAD_ADDED:
+        uwp_event("controller connected");
+        break;
+    case SDL_EVENT_GAMEPAD_REMOVED:
+        uwp_event("controller disconnected");
+        break;
+    default:
+        break;
     }
     return true;
 }
@@ -2482,6 +3086,12 @@ static char *uwp_take_activation_disc(void)
         }
         if (!strncmp(p, "press=", 6)) {
             uwp_press(p + 6);
+        }
+        if (!strcmp(p, "crashtest=1")) {
+            /* checks the crash report: a deliberate bad memory read on the screen thread, 20 s from now */
+            extern uint64_t uwp_crash_test_at;
+            uwp_crash_test_at = SDL_GetTicks() + 20000;
+            uwp_log("crash test: xemu will crash on purpose in 20 s");
         }
         if (!strcmp(p, "dash=0")) {
             uwp_no_dash = true;
@@ -2641,6 +3251,7 @@ static void uwp_log_share(const char *disc)
         g_free(log);
         SDL_free(own);
         uwp_log_copy = copy;
+        uwp_shots_start(path);
     }
     g_free(path);
     g_free(name);
@@ -3356,6 +3967,11 @@ int main(int argc, char **argv)
     signal(SIGABRT, uwp_on_abort);
     SetUnhandledExceptionFilter(uwp_on_crash);
     uwp_session_start_ms = SDL_GetTicks();
+    {
+        int w = 0, h = 0;
+        SDL_GetWindowSizeInPixels(scon->real_window, &w, &h);
+        uwp_story_start(w, h);
+    }
     atexit(uwp_on_exit);
     g_set_printerr_handler(uwp_glib_print);
     uwp_log_memory();
@@ -3392,6 +4008,17 @@ int main(int argc, char **argv)
             uwp_save_state_wanted = false;
             uwp_state(true);
         }
+        static uint64_t uwp_next_box;
+        if (uwp_crash_test_at && SDL_GetTicks() >= uwp_crash_test_at) {
+            uwp_crash_test_at = 0;
+            volatile int *bad = (volatile int *)(uintptr_t)0x10;
+            *bad = 1;
+        }
+        uwp_shots_tick();
+        if (SDL_GetTicks() >= uwp_next_box) {
+            uwp_next_box = SDL_GetTicks() + 1000;
+            uwp_box_sample();
+        }
         if (SDL_GetTicks() >= uwp_next_report) {
             int w = 0, h = 0;
             SDL_GetWindowSizeInPixels(scon->real_window, &w, &h);
@@ -3405,9 +4032,8 @@ int main(int argc, char **argv)
                     pads, p1 ? p1->name : "(none)");
             uwp_prof_report((SDL_GetTicks() - (uwp_next_report - 3000)) / 1000.0);
             uwp_session_sample(g_nv2a_stats.increment_fps);
-            if ((uwp_frames / 180) % 3 == 0) {
-                uwp_log_memory();
-            }
+            uwp_story_sample(g_nv2a_stats.increment_fps);
+            uwp_log_memory();   /* every 3 s: a log that just stops shows how close to the limit it was */
             {
                 extern unsigned int xemu_uwp_prim_hist[16];
                 static const char *const names[16] = { "points", "lines", "lineloop", "linestrip", "tris",

@@ -57,6 +57,10 @@
 /* shown while Game Vault asks for it (ui/xemu.c) */
 extern "C" bool xemu_uwp_fps_on;
 #endif
+#ifdef XEMU_UWP
+extern "C" const char *xemu_uwp_shot_wanted(void);
+extern "C" void xemu_uwp_shot_save(const char *label, const void *png, size_t size);
+#endif
 #include "compat.hh"
 #if defined(_WIN32)
 #include "update.hh"
@@ -215,6 +219,14 @@ void xemu_hud_update(void)
         int ww, wh;
         SDL_GetWindowSizeInPixels(xemu_get_window(), &ww, &wh);
         RenderFramebuffer(g_tex, ww, wh, g_flip_req);
+#ifdef XEMU_UWP
+        /* the session recording's pictures of the screen (ui/xemu.c) */
+        const char *label = xemu_uwp_shot_wanted();
+        std::vector<uint8_t> png;
+        if (label && g_tex && RenderFramebufferToPng(g_tex, g_flip_req, png, 320, 240)) {
+            xemu_uwp_shot_save(label, png.data(), png.size());
+        }
+#endif
     }
 
     ImGui_ImplOpenGL3_NewFrame();

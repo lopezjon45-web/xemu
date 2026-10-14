@@ -38,7 +38,7 @@
 | ⚡ **Smooth start-up** | Graphics are prepared ahead, so the Xbox logo and the parts you have seen before play without hitches. |
 | ⏸️ **Quick save states** | View + RB saves, View + LB loads, at any moment. |
 | 🌐 **Online through Insignia** | The Xbox Live replacement works, with your own Xbox BIOS and the dashboard (which xemu installs from a game disc by itself). |
-| 📝 **Logs you can read** | Every session ends with a plain summary: time played, speed, slow stretches, and how it ended. |
+| 📝 **Sessions you can read back** | Each log starts with a plain summary and a timeline (Home screen and back, speed drops and their cause, how it ended), then one line per second and every button press. Small screenshots every 10 seconds and at every event. A crash report says in words what went wrong and where. |
 
 ## 🚀 Getting started
 

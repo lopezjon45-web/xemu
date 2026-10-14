@@ -538,6 +538,22 @@ void xemu_input_update_controller(ControllerState *state)
     if (SDL_GetTicks() < xemu_uwp_injected_lt_until) {
         state->axis[CONTROLLER_AXIS_LTRIG] = INT16_MAX;
     }
+    {
+        /* for the log: whether the player is playing (a button held or a stick / trigger moved) */
+        extern unsigned xemu_uwp_input_activity;
+        bool active = state->buttons != 0;
+        for (int i = 0; i < CONTROLLER_AXIS__COUNT && !active; i++) {
+            active = state->axis[i] > 8000 || state->axis[i] < -8000;
+        }
+        if (active) {
+            xemu_uwp_input_activity++;
+        }
+        /* the session recording (ui/xemu.c): port 1's controller */
+        extern void xemu_uwp_note_input(uint32_t buttons, const int16_t *axis);
+        if (state->bound == 0) {
+            xemu_uwp_note_input(state->buttons, state->axis);
+        }
+    }
 #endif
 
     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
