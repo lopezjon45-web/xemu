@@ -1987,7 +1987,8 @@ static void uwp_state(bool save)
 extern uint16_t xemu_uwp_injected_buttons;
 static uint16_t uwp_press_queue[64];
 static uint16_t uwp_press_pause[64];
-static int16_t uwp_press_trigger[64]; /* > 0: right trigger seconds, < 0: left */
+static int16_t uwp_press_trigger[64];
+static uint16_t uwp_press_hold_mask[64]; /* "<button>=<s>": button held, seconds in uwp_press_trigger */ /* > 0: right trigger seconds, < 0: left */
 static int uwp_press_count, uwp_press_next;
 static uint64_t uwp_press_until, uwp_press_release_at;
 
@@ -2011,9 +2012,27 @@ static void uwp_press(const char *list)
     }
     for (int i = 0; parts[i] && uwp_press_count < ARRAY_SIZE(uwp_press_queue); i++) {
         uint16_t mask = 0, pause = 0;
+        uwp_press_hold_mask[uwp_press_count] = 0;
         for (int n = 0; n < ARRAY_SIZE(names); n++) {
             if (!g_ascii_strcasecmp(parts[i], names[n].name)) {
                 mask = names[n].mask;
+            }
+        }
+        /* "<button>=<seconds>": hold a button down (a racing game's accelerator) */
+        {
+            const char *eq = strchr(parts[i], '=');
+            for (int n = 0; eq && n < ARRAY_SIZE(names); n++) {
+                if ((int)strlen(names[n].name) == eq - parts[i] &&
+                    !g_ascii_strncasecmp(parts[i], names[n].name, eq - parts[i])) {
+                    uwp_press_hold_mask[uwp_press_count] = names[n].mask;
+                    uwp_press_queue[uwp_press_count] = 0;
+                    uwp_press_pause[uwp_press_count] = 0;
+                    uwp_press_trigger[uwp_press_count++] = atoi(eq + 1);
+                    mask = 1;
+                }
+            }
+            if (mask) {
+                continue;
             }
         }
         /* "rt=<seconds>" / "lt=<seconds>": hold a trigger fully down (racing games) */
@@ -2054,7 +2073,14 @@ static void uwp_press_poll(void)
     uint16_t mask = uwp_press_queue[uwp_press_next];
     int16_t trigger = uwp_press_trigger[uwp_press_next];
     uint16_t pause = uwp_press_pause[uwp_press_next++];
-    if (trigger) {
+    uint16_t hold = uwp_press_hold_mask[uwp_press_next - 1];
+    if (hold) {
+        extern uint16_t xemu_uwp_held_buttons;
+        extern uint64_t xemu_uwp_held_until;
+        xemu_uwp_held_buttons = hold;
+        xemu_uwp_held_until = now + (uint64_t)trigger * 1000;
+        uwp_log("remote buttons: button 0x%x held for %d s", hold, trigger);
+    } else if (trigger) {
         extern uint64_t xemu_uwp_injected_rt_until, xemu_uwp_injected_lt_until;
         uint64_t until = now + (uint64_t)ABS(trigger) * 1000;
         if (trigger > 0) {
