@@ -2162,21 +2162,34 @@ static void uwp_log_memory(void)
     }
 }
 
-/* xemu.toml said flashrom_path = 'spiritboot': it is written back as that word, not as
- * the package's path, which changes with every version */
-static bool uwp_free_bios_word;
+/*
+ * The three system files as xemu.toml gave them (empty when there is no xemu.toml). What xemu
+ * picks by itself at startup (Game Vault's folder, the free BIOS, a new blank disk) is never
+ * written back: otherwise a path chosen once would stick, and a BIOS found later on the
+ * player's USB drive, or a new package version with another install path, would be ignored.
+ */
+static char *uwp_toml_bootrom, *uwp_toml_bios, *uwp_toml_hdd;
+static bool uwp_toml_remembered;
 
 static void uwp_save_settings(void)
 {
-    char *bios = NULL;
-    if (uwp_free_bios_word) {
-        bios = g_strdup(g_config.sys.files.flashrom_path);
-        xemu_settings_set_string(&g_config.sys.files.flashrom_path, "spiritboot");
+    if (!uwp_toml_remembered) {
+        xemu_settings_save();
+        return;
+    }
+    const char **slot[] = { &g_config.sys.files.bootrom_path,
+                            &g_config.sys.files.flashrom_path,
+                            &g_config.sys.files.hdd_path };
+    char *toml[] = { uwp_toml_bootrom, uwp_toml_bios, uwp_toml_hdd };
+    char *now[3];
+    for (int i = 0; i < 3; i++) {
+        now[i] = g_strdup(*slot[i] ? *slot[i] : "");
+        xemu_settings_set_string(slot[i], toml[i]);
     }
     xemu_settings_save();
-    if (bios) {
-        xemu_settings_set_string(&g_config.sys.files.flashrom_path, bios);
-        g_free(bios);
+    for (int i = 0; i < 3; i++) {
+        xemu_settings_set_string(slot[i], now[i]);
+        g_free(now[i]);
     }
 }
 
@@ -2333,94 +2346,150 @@ static char *uwp_system_folder(void)
     return result;
 }
 
-static void uwp_fill_one(const char **setting, const char *what,
+static void uwp_set_path(const char **setting, const char *what, char *path)
+{
+    for (char *c = path; *c; c++) {
+        if (*c == '\\') {
+            *c = '/';
+        }
+    }
+    uwp_log("%s: %s", what, path);
+    xemu_settings_set_string(setting, path);
+}
+
+/* Keeps the setting when its file exists, else looks for the names in the two folders. */
+static bool uwp_fill_one(const char **setting, const char *what,
                          const char *folder, const char *own,
                          const char *const *names)
 {
     if (uwp_file_exists(*setting)) {
-        return;
+        return true;
     }
     const char *dirs[] = { folder, own };
     for (int d = 0; d < 2; d++) {
         for (int i = 0; dirs[d] && names[i]; i++) {
             char *path = g_strdup_printf("%s%s", dirs[d], names[i]);
             if (uwp_file_exists(path)) {
-                for (char *c = path; *c; c++) {
-                    if (*c == '\\') {
-                        *c = '/';
-                    }
-                }
-                uwp_log("%s: %s", what, path);
-                xemu_settings_set_string(setting, path);
+                uwp_set_path(setting, what, path);
                 g_free(path);
-                return;
+                return true;
             }
             g_free(path);
         }
     }
-    uwp_log("%s: not found (run the Xbox setup in Game Vault)", what);
+    return false;
 }
 
 /*
- * No BIOS of the user's own anywhere: use the free SpiritBoot BIOS shipped in
- * the package (GPL-2.0, github.com/Mainkill1/SpiritBoot, release v1.0.0, see
- * spiritboot\README.txt next to xemu.exe). It boots without the MCPX boot ROM
- * as well. Saves made with it do not work with a Microsoft BIOS and the other
- * way round, so it is never used when the user has a BIOS of their own.
+ * A new, empty hard disk from the copy of the xemu project's copyright-free blank image
+ * (github.com/xemu-project/xemu-hdd-image, release 1.0) that comes with the package. Made in
+ * the publisher's folder when possible, so it survives reinstalling xemu.
  */
-static bool uwp_free_bios_asked(void)
+static bool uwp_new_hdd(const char *folder, const char *own, const char *name)
 {
-    const char *bios = g_config.sys.files.flashrom_path;
-    return bios && !g_ascii_strcasecmp(bios, "spiritboot");
+    char *blank = g_strdup_printf("%sxbox_hdd_blank.qcow2", SDL_GetBasePath());
+    gchar *data = NULL;
+    gsize size = 0;
+    bool ok = false;
+    if (!g_file_get_contents(blank, &data, &size, NULL) || size < 4 ||
+        memcmp(data, "QFI\xfb", 4)) {
+        uwp_log("hard disk: the blank image in the package is missing or damaged (%s)", blank);
+    } else {
+        const char *dirs[] = { folder, own };
+        for (int d = 0; d < 2 && !ok; d++) {
+            if (!dirs[d]) {
+                continue;
+            }
+            g_mkdir_with_parents(dirs[d], 0755);
+            char *path = g_strdup_printf("%s%s", dirs[d], name);
+            GError *err = NULL;
+            if (g_file_set_contents(path, data, size, &err)) {
+                uwp_log("hard disk: none yet, made a new blank one");
+                uwp_set_path(&g_config.sys.files.hdd_path, "hard disk", path);
+                ok = true;
+            } else {
+                uwp_log("hard disk: could not make %s: %s", path, err->message);
+                g_error_free(err);
+            }
+            g_free(path);
+        }
+    }
+    g_free(data);
+    g_free(blank);
+    return ok;
 }
 
-static void uwp_free_bios_fallback(void)
+/*
+ * The free SpiritBoot BIOS shipped in the package (GPL-2.0, github.com/Mainkill1/SpiritBoot,
+ * release v1.0.0, see spiritboot\README.txt next to xemu.exe). It boots without the MCPX boot
+ * ROM. It cannot do Xbox Live / Insignia (no Microsoft keys), and its saves do not work with a
+ * Microsoft BIOS and the other way round, which is why it gets a hard disk of its own.
+ */
+static bool uwp_use_free_bios(void)
 {
-    /* flashrom_path = 'spiritboot' in xemu.toml chooses it on purpose */
-    if (!uwp_free_bios_asked() &&
-        uwp_file_exists(g_config.sys.files.flashrom_path)) {
-        return;
-    }
-    const char *base = SDL_GetBasePath();
     bool big = g_config.sys.mem_limit == CONFIG_SYS_MEM_LIMIT_128;
     char *path = g_strdup_printf("%sspiritboot\\SpiritBoot-v1.0.0-%s.bin",
-                                 base ? base : "", big ? "128MB" : "64MB");
-    if (uwp_file_exists(path)) {
-        for (char *c = path; *c; c++) {
-            if (*c == '\\') {
-                *c = '/';
-            }
-        }
-        uwp_free_bios_word = uwp_free_bios_asked();
-        uwp_log("BIOS: %s, using the free SpiritBoot: %s",
-                uwp_free_bios_word ? "chosen in xemu.toml" : "none of the user's own", path);
-        xemu_settings_set_string(&g_config.sys.files.flashrom_path, path);
+                                 SDL_GetBasePath(), big ? "128MB" : "64MB");
+    bool ok = uwp_file_exists(path);
+    if (ok) {
+        uwp_set_path(&g_config.sys.files.flashrom_path, "BIOS (the free SpiritBoot)", path);
         if (!uwp_file_exists(g_config.sys.files.bootrom_path)) {
-            /* SpiritBoot starts straight from the flash image */
             xemu_settings_set_string(&g_config.sys.files.bootrom_path, "");
         }
     } else {
-        uwp_log("BIOS: the free SpiritBoot is not in this package either (%s)", path);
+        uwp_log("BIOS: the free SpiritBoot is missing from the package (%s)", path);
     }
     g_free(path);
+    return ok;
 }
 
+/*
+ * Which BIOS and hard disk to use, with nothing for the player to do:
+ *  - the player's own files (from xemu.toml, or what Game Vault found on their USB drive and
+ *    put in the publisher's folder): their BIOS with the boot ROM, their hard disk;
+ *  - otherwise the free BIOS with its own hard disk, xbox_hdd_free.qcow2;
+ *  - a hard disk that does not exist yet is made from the blank image.
+ * xemu.toml can choose the free BIOS on purpose: flashrom_path = 'spiritboot'.
+ */
 static void uwp_fill_system_files(void)
 {
     static const char *const mcpx[] = { "mcpx_1.0.bin", "mcpx.bin", NULL };
     static const char *const bios[] = { "bios.bin", "Complex_4627.bin", NULL };
-    static const char *const hdd[] = { "xbox_hdd.qcow2", NULL };
+    static const char *const own_hdd[] = { "xbox_hdd.qcow2", NULL };
+    static const char *const free_hdd[] = { "xbox_hdd_free.qcow2", NULL };
     char *folder = uwp_system_folder();
     char *own = SDL_GetPrefPath("xemu", "xemu");
 
-    uwp_fill_one(&g_config.sys.files.bootrom_path, "boot ROM", folder, own, mcpx);
-    if (!uwp_free_bios_asked()) {
-        uwp_fill_one(&g_config.sys.files.flashrom_path, "BIOS", folder, own, bios);
+    uwp_toml_bootrom = g_strdup(g_config.sys.files.bootrom_path ? g_config.sys.files.bootrom_path : "");
+    uwp_toml_bios = g_strdup(g_config.sys.files.flashrom_path ? g_config.sys.files.flashrom_path : "");
+    uwp_toml_hdd = g_strdup(g_config.sys.files.hdd_path ? g_config.sys.files.hdd_path : "");
+    uwp_toml_remembered = true;
+
+    bool asked_free = !g_ascii_strcasecmp(uwp_toml_bios, "spiritboot");
+    bool toml_bios = uwp_file_exists(uwp_toml_bios);
+    bool have_mcpx = uwp_fill_one(&g_config.sys.files.bootrom_path, "boot ROM", folder, own, mcpx);
+    bool own_bios = !asked_free &&
+                    uwp_fill_one(&g_config.sys.files.flashrom_path, "BIOS", folder, own, bios);
+    if (own_bios && !have_mcpx && !toml_bios) {
+        /* a Microsoft BIOS does not start without the boot ROM */
+        uwp_log("BIOS: found one, but no boot ROM (MCPX) to start it with");
+        own_bios = false;
     }
-    uwp_fill_one(&g_config.sys.files.hdd_path, "hard disk", folder, own, hdd);
+    bool free_bios = !own_bios && uwp_use_free_bios();
+    if (!own_bios && !free_bios) {
+        uwp_log("BIOS: none (run the Xbox setup in Game Vault)");
+    }
+    uwp_log("Xbox BIOS in use: %s", own_bios ? "the player's own" : free_bios ? "free (offline only)" : "none");
+
+    if (!uwp_file_exists(uwp_toml_hdd)) {
+        const char *const *names = free_bios ? free_hdd : own_hdd;
+        xemu_settings_set_string(&g_config.sys.files.hdd_path, "");
+        if (!uwp_fill_one(&g_config.sys.files.hdd_path, "hard disk", folder, own, names)) {
+            uwp_new_hdd(folder, own, names[0]);
+        }
+    }
     g_free(folder);
     SDL_free(own);
-    uwp_free_bios_fallback();
 
     /* what a console needs, whatever the settings file says (or if there is none) */
     g_config.general.show_welcome = false;
@@ -2657,7 +2726,11 @@ int main(int argc, char **argv)
         SDL_Quit();
         exit(1);
     }
+#ifdef XEMU_UWP
+    atexit(uwp_save_settings);
+#else
     atexit(xemu_settings_save);
+#endif
 
 #ifdef _WIN32
     if (g_config.display.setup_nvidia_profile) {
