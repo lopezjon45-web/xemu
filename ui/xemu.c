@@ -2162,6 +2162,24 @@ static void uwp_log_memory(void)
     }
 }
 
+/* xemu.toml said flashrom_path = 'spiritboot': it is written back as that word, not as
+ * the package's path, which changes with every version */
+static bool uwp_free_bios_word;
+
+static void uwp_save_settings(void)
+{
+    char *bios = NULL;
+    if (uwp_free_bios_word) {
+        bios = g_strdup(g_config.sys.files.flashrom_path);
+        xemu_settings_set_string(&g_config.sys.files.flashrom_path, "spiritboot");
+    }
+    xemu_settings_save();
+    if (bios) {
+        xemu_settings_set_string(&g_config.sys.files.flashrom_path, bios);
+        g_free(bios);
+    }
+}
+
 static void uwp_save_for_background(void)
 {
     if (!uwp_machine_running) {
@@ -2170,7 +2188,7 @@ static void uwp_save_for_background(void)
     xemu_main_loop_lock();
     int ret = bdrv_flush_all();
     xemu_main_loop_unlock();
-    xemu_settings_save();
+    uwp_save_settings();
     uwp_log("going to the background: disks flushed (%d), settings saved", ret);
 }
 
@@ -2343,6 +2361,50 @@ static void uwp_fill_one(const char **setting, const char *what,
     uwp_log("%s: not found (run the Xbox setup in Game Vault)", what);
 }
 
+/*
+ * No BIOS of the user's own anywhere: use the free SpiritBoot BIOS shipped in
+ * the package (GPL-2.0, github.com/Mainkill1/SpiritBoot, release v1.0.0, see
+ * spiritboot\README.txt next to xemu.exe). It boots without the MCPX boot ROM
+ * as well. Saves made with it do not work with a Microsoft BIOS and the other
+ * way round, so it is never used when the user has a BIOS of their own.
+ */
+static bool uwp_free_bios_asked(void)
+{
+    const char *bios = g_config.sys.files.flashrom_path;
+    return bios && !g_ascii_strcasecmp(bios, "spiritboot");
+}
+
+static void uwp_free_bios_fallback(void)
+{
+    /* flashrom_path = 'spiritboot' in xemu.toml chooses it on purpose */
+    if (!uwp_free_bios_asked() &&
+        uwp_file_exists(g_config.sys.files.flashrom_path)) {
+        return;
+    }
+    const char *base = SDL_GetBasePath();
+    bool big = g_config.sys.mem_limit == CONFIG_SYS_MEM_LIMIT_128;
+    char *path = g_strdup_printf("%sspiritboot\\SpiritBoot-v1.0.0-%s.bin",
+                                 base ? base : "", big ? "128MB" : "64MB");
+    if (uwp_file_exists(path)) {
+        for (char *c = path; *c; c++) {
+            if (*c == '\\') {
+                *c = '/';
+            }
+        }
+        uwp_free_bios_word = uwp_free_bios_asked();
+        uwp_log("BIOS: %s, using the free SpiritBoot: %s",
+                uwp_free_bios_word ? "chosen in xemu.toml" : "none of the user's own", path);
+        xemu_settings_set_string(&g_config.sys.files.flashrom_path, path);
+        if (!uwp_file_exists(g_config.sys.files.bootrom_path)) {
+            /* SpiritBoot starts straight from the flash image */
+            xemu_settings_set_string(&g_config.sys.files.bootrom_path, "");
+        }
+    } else {
+        uwp_log("BIOS: the free SpiritBoot is not in this package either (%s)", path);
+    }
+    g_free(path);
+}
+
 static void uwp_fill_system_files(void)
 {
     static const char *const mcpx[] = { "mcpx_1.0.bin", "mcpx.bin", NULL };
@@ -2352,10 +2414,13 @@ static void uwp_fill_system_files(void)
     char *own = SDL_GetPrefPath("xemu", "xemu");
 
     uwp_fill_one(&g_config.sys.files.bootrom_path, "boot ROM", folder, own, mcpx);
-    uwp_fill_one(&g_config.sys.files.flashrom_path, "BIOS", folder, own, bios);
+    if (!uwp_free_bios_asked()) {
+        uwp_fill_one(&g_config.sys.files.flashrom_path, "BIOS", folder, own, bios);
+    }
     uwp_fill_one(&g_config.sys.files.hdd_path, "hard disk", folder, own, hdd);
     g_free(folder);
     SDL_free(own);
+    uwp_free_bios_fallback();
 
     /* what a console needs, whatever the settings file says (or if there is none) */
     g_config.general.show_welcome = false;
