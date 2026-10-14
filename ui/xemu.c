@@ -1319,6 +1319,9 @@ char **gArgv;
 /* Progress log for the Xbox port, in its own file (uwp_debug.log in LocalState\xemu\xemu). */
 SDL_AudioStream *xemu_uwp_audio_stream; /* opened on the UI thread, used by the APU */
 void uwp_log(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+/* a second copy, named after the game, in the folder Game Vault shares (see uwp_log_share) */
+static FILE *uwp_log_copy;
+static FILE *uwp_log_file;
 void uwp_log(const char *fmt, ...)
 {
     static FILE *f;
@@ -1331,14 +1334,22 @@ void uwp_log(const char *fmt, ...)
         if (!f) {
             return;
         }
+        uwp_log_file = f;
     }
+    char line[2048];
     va_list ap;
     va_start(ap, fmt);
-    fprintf(f, "[%8.3f] ", SDL_GetTicks() / 1000.0);
-    vfprintf(f, fmt, ap);
+    int n = snprintf(line, sizeof(line), "[%8.3f] ", SDL_GetTicks() / 1000.0);
+    vsnprintf(line + n, sizeof(line) - n, fmt, ap);
+    va_end(ap);
+    fputs(line, f);
     fputc('\n', f);
     fflush(f);
-    va_end(ap);
+    if (uwp_log_copy) {
+        fputs(line, uwp_log_copy);
+        fputc('\n', uwp_log_copy);
+        fflush(uwp_log_copy);
+    }
 }
 
 /* Profiler state, see include/qemu/xemu-uwp.h. */
@@ -2418,6 +2429,58 @@ static char *uwp_system_folder(void)
     return result;
 }
 
+/*
+ * The log also goes to the publisher's shared folder as games\logs\<disc name>.log, written as it
+ * goes (so a crash leaves it complete). Game Vault copies these to "Game Vault logs" on the USB drive,
+ * where a player can pick one up to send with a report.
+ */
+static void uwp_log_share(const char *disc)
+{
+    char *sys = uwp_system_folder();
+    if (!sys || uwp_log_copy || !uwp_log_file) {
+        g_free(sys);
+        return;
+    }
+    char *cut = strstr(sys, "xbox-system\\");
+    if (cut) {
+        *cut = '\0';
+    }
+    char *dir = g_strdup_printf("%slogs", sys);
+    g_mkdir_with_parents(dir, 0755);
+    const char *base = disc;
+    for (const char *c = disc; *c; c++) {
+        if (*c == '/' || *c == '\\') {
+            base = c + 1;
+        }
+    }
+    char *name = g_strdup(base);
+    char *dot = strrchr(name, '.');
+    if (dot) {
+        *dot = '\0';
+    }
+    char *path = g_strdup_printf("%s\\%s.log", dir, name);
+    FILE *copy = fopen(path, "w");
+    if (copy) {
+        /* what was logged before the disc was known */
+        char *own = SDL_GetPrefPath("xemu", "xemu");
+        char *log = g_strdup_printf("%suwp_debug.log", own ? own : "");
+        gchar *text = NULL;
+        gsize len = 0;
+        fflush(uwp_log_file);
+        if (g_file_get_contents(log, &text, &len, NULL)) {
+            fwrite(text, 1, len, copy);
+        }
+        g_free(text);
+        g_free(log);
+        SDL_free(own);
+        uwp_log_copy = copy;
+    }
+    g_free(path);
+    g_free(name);
+    g_free(dir);
+    g_free(sys);
+}
+
 static void uwp_set_path(const char **setting, const char *what, char *path)
 {
     for (char *c = path; *c; c++) {
@@ -2585,6 +2648,7 @@ static void uwp_startup_disc(void)
     char *disc = uwp_take_activation_disc();
     if (disc) {
         uwp_log("disc from launcher: %s", disc);
+        uwp_log_share(disc);
         xemu_settings_set_string(&g_config.sys.files.dvd_path, disc);
         g_free(disc);
     }
