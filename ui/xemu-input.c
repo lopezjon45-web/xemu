@@ -506,6 +506,8 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
 
 #ifdef XEMU_UWP
 uint16_t xemu_uwp_injected_buttons;
+/* right / left trigger held from outside until this SDL tick (see uwp_press in ui/xemu.c) */
+uint64_t xemu_uwp_injected_rt_until, xemu_uwp_injected_lt_until;
 #endif
 
 void xemu_input_update_controller(ControllerState *state)
@@ -524,6 +526,12 @@ void xemu_input_update_controller(ControllerState *state)
 #ifdef XEMU_UWP
     /* buttons pressed from outside, through a launch link (see uwp_press in ui/xemu.c) */
     state->buttons |= xemu_uwp_injected_buttons;
+    if (SDL_GetTicks() < xemu_uwp_injected_rt_until) {
+        state->axis[CONTROLLER_AXIS_RTRIG] = INT16_MAX;
+    }
+    if (SDL_GetTicks() < xemu_uwp_injected_lt_until) {
+        state->axis[CONTROLLER_AXIS_LTRIG] = INT16_MAX;
+    }
 #endif
 
     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);

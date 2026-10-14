@@ -984,7 +984,16 @@ void pgraph_gl_init_textures(NV2AState *d)
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
 
+#ifdef XEMU_UWP
+    /*
+     * 512 is too few for scenes with many detailed objects at once (a grid of race cars):
+     * textures were evicted and rebuilt hundreds of times a frame, DXT ones unpacked on the
+     * CPU each time. The guest's 64/128 MB bound what the entries can hold.
+     */
+    const size_t texture_cache_size = 4096;
+#else
     const size_t texture_cache_size = 512;
+#endif
     lru_init(&r->texture_cache);
     r->texture_cache_entries = malloc(texture_cache_size * sizeof(TextureLruNode));
     assert(r->texture_cache_entries != NULL);

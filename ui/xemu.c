@@ -1651,7 +1651,20 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
     uint64_t exe_size = nt->OptionalHeader.SizeOfImage;
     int num = 0;
     HANDLE vcpu = NULL;
-    DWORD next_dump = GetTickCount() + 30000;
+    /* report interval: 30 s, or the seconds in sampler_seconds.txt next to the log (testing) */
+    DWORD every = 30000;
+    {
+        char *own = SDL_GetPrefPath("xemu", "xemu");
+        char *file = g_strdup_printf("%ssampler_seconds.txt", own ? own : "");
+        gchar *text = NULL;
+        if (g_file_get_contents(file, &text, NULL, NULL) && atoi(text) > 0) {
+            every = atoi(text) * 1000;
+        }
+        g_free(text);
+        g_free(file);
+        SDL_free(own);
+    }
+    DWORD next_dump = GetTickCount() + every;
     /* for the renderer thread: who called, to tell what the graphics library asks the kernel for */
     bool want_stacks = !strcmp(target, "pfifo");
     uint64_t (*stacks)[UWP_STACK_FRAMES] =
@@ -1687,7 +1700,7 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
         if ((int)(GetTickCount() - next_dump) < 0) {
             continue;
         }
-        next_dump = GetTickCount() + 30000;
+        next_dump = GetTickCount() + every;
 
         /* group: xemu.exe in 64-byte pieces, anything else per module */
         int groups = 0, jit = 0;
@@ -1963,6 +1976,7 @@ static void uwp_state(bool save)
 extern uint16_t xemu_uwp_injected_buttons;
 static uint16_t uwp_press_queue[64];
 static uint16_t uwp_press_pause[64];
+static int16_t uwp_press_trigger[64]; /* > 0: right trigger seconds, < 0: left */
 static int uwp_press_count, uwp_press_next;
 static uint64_t uwp_press_until, uwp_press_release_at;
 
@@ -1991,6 +2005,15 @@ static void uwp_press(const char *list)
                 mask = names[n].mask;
             }
         }
+        /* "rt=<seconds>" / "lt=<seconds>": hold a trigger fully down (racing games) */
+        if (!g_ascii_strncasecmp(parts[i], "rt=", 3) || !g_ascii_strncasecmp(parts[i], "lt=", 3)) {
+            int secs = atoi(parts[i] + 3);
+            uwp_press_queue[uwp_press_count] = 0;
+            uwp_press_pause[uwp_press_count] = 0;
+            uwp_press_trigger[uwp_press_count++] =
+                g_ascii_tolower(parts[i][0]) == 'r' ? secs : -secs;
+            continue;
+        }
         if (!mask) {
             pause = !g_ascii_strcasecmp(parts[i], "wait") ? 500 : (uint16_t)atoi(parts[i]);
             if (!pause) {
@@ -1998,6 +2021,7 @@ static void uwp_press(const char *list)
             }
         }
         uwp_press_queue[uwp_press_count] = mask;
+        uwp_press_trigger[uwp_press_count] = 0;
         uwp_press_pause[uwp_press_count++] = pause;
     }
     g_strfreev(parts);
@@ -2013,9 +2037,23 @@ static void uwp_press_poll(void)
     if (uwp_press_next >= uwp_press_count || now < uwp_press_until) {
         return;
     }
+    if (uwp_load_state_wanted) {
+        return;     /* a link with "state=1": buttons go to the loaded game */
+    }
     uint16_t mask = uwp_press_queue[uwp_press_next];
+    int16_t trigger = uwp_press_trigger[uwp_press_next];
     uint16_t pause = uwp_press_pause[uwp_press_next++];
-    if (mask) {
+    if (trigger) {
+        extern uint64_t xemu_uwp_injected_rt_until, xemu_uwp_injected_lt_until;
+        uint64_t until = now + (uint64_t)ABS(trigger) * 1000;
+        if (trigger > 0) {
+            xemu_uwp_injected_rt_until = until;
+        } else {
+            xemu_uwp_injected_lt_until = until;
+        }
+        uwp_log("remote buttons: %s trigger held for %d s", trigger > 0 ? "right" : "left",
+                ABS(trigger));
+    } else if (mask) {
         xemu_uwp_injected_buttons = mask;
         uwp_press_release_at = now + 150;
         uwp_press_until = now + 500;
