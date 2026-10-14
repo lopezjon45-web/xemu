@@ -1393,6 +1393,40 @@ void uwp_prof_register_thread(const char *name)
     ReleaseSRWLockExclusive(&lock);
 }
 
+/*
+ * How busy a registered thread (by name, e.g. "vcpu", "pfifo") was since the previous call
+ * for that slot, in percent of one core; -1 when there is no such thread. `slot` keeps
+ * separate callers apart (0..7).
+ */
+int xemu_uwp_thread_busy(const char *name, int slot)
+{
+    static uint64_t last_cpu[8][UWP_PROF_MAX_THREADS], last_wall[8][UWP_PROF_MAX_THREADS];
+    if (slot < 0 || slot >= 8) {
+        return -1;
+    }
+    for (int i = 0; i < uwp_prof_num_threads; i++) {
+        if (strncmp(uwp_prof_threads[i].name, name, strlen(name))) {
+            continue;
+        }
+        FILETIME c, e, k, u, now;
+        if (!GetThreadTimes(uwp_prof_threads[i].handle, &c, &e, &k, &u)) {
+            return -1;
+        }
+        GetSystemTimeAsFileTime(&now);
+        uint64_t cpu = (((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) +
+                       (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime);
+        uint64_t wall = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime;
+        int pct = -1;
+        if (last_wall[slot][i] && wall > last_wall[slot][i]) {
+            pct = (int)((cpu - last_cpu[slot][i]) * 100 / (wall - last_wall[slot][i]));
+        }
+        last_cpu[slot][i] = cpu;
+        last_wall[slot][i] = wall;
+        return pct;
+    }
+    return -1;
+}
+
 /* One log line: CPU use per thread, time per probe, nv2a counters per frame. */
 static void uwp_prof_report(double seconds)
 {

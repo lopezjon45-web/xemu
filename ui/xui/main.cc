@@ -49,6 +49,12 @@
 #include "debug.hh"
 #include "welcome.hh"
 #include "menubar.hh"
+
+#if defined(XEMU_UWP) && __has_include("xemu-uwp-testhud.inc")
+/* local test builds only (an on-screen counter); the file is not part of the source */
+#include "xemu-uwp-testhud.inc"
+#define UWP_TEST_HUD 1
+#endif
 #include "compat.hh"
 #if defined(_WIN32)
 #include "update.hh"
@@ -218,6 +224,10 @@ void xemu_hud_update(void)
 
     ImGui::NewFrame();
     ProcessKeyboardShortcuts();
+
+#ifdef UWP_TEST_HUD
+    uwp_test_hud();
+#endif
 
 #if defined(CONFIG_RENDERDOC)
     if (g_capture_renderdoc_frame) {

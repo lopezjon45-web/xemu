@@ -210,30 +210,53 @@ static void apply_texture_parameters(PGRAPHGLState *r,
  * can be copied on the GPU instead of being read back and uploaded again.
  * Returns false when any face is not a matching surface.
  */
-static bool find_cube_face_surfaces(NV2AState *d, const TextureShape *shape,
-                                    hwaddr addr, size_t length,
-                                    SurfaceBinding **faces, int *newest)
+/*
+ * The faces of a cube map texture that are render targets (surfaces) of the same size and
+ * format. Returns how many faces have one (0 = the cube cannot take this path). A face
+ * without a surface is fine as long as no surface with unsaved drawing covers it: its
+ * pixels in memory are then current. Games often redraw only some faces of an environment
+ * cube each frame; before, one face without a surface sent all six through memory, and
+ * each read-back stalls on the GPU here (GL on D3D12).
+ */
+static int find_cube_face_surfaces(NV2AState *d, const TextureShape *shape,
+                                   hwaddr addr, size_t length,
+                                   SurfaceBinding **faces, int *newest)
 {
     PGRAPHState *pg = &d->pgraph;
+    PGRAPHGLState *r = pg->gl_renderer_state;
     const ColorFormatInfo *f = &kelvin_color_format_gl_map[shape->color_format];
     TextureShape face_shape = *shape;
     face_shape.cubemap = false;
+    hwaddr face_len = length / 6;
+    int count = 0;
 
     if (pg->surface_scale_factor != 1 || shape->border) {
-        return false;
+        return 0;
     }
     *newest = 0;
     for (int face = 0; face < 6; face++) {
-        SurfaceBinding *s = pgraph_gl_surface_get(d, addr + face * (length / 6));
-        if (s == NULL ||
-            s->fmt.gl_internal_format != f->gl_internal_format ||
+        hwaddr face_addr = addr + face * face_len;
+        SurfaceBinding *s = pgraph_gl_surface_get(d, face_addr);
+        faces[face] = NULL;
+        if (s == NULL) {
+            SurfaceBinding *o;
+            QTAILQ_FOREACH(o, &r->surfaces, entry) {
+                if (o->draw_dirty && o->vram_addr < face_addr + face_len &&
+                    face_addr < o->vram_addr + o->size) {
+                    return 0;
+                }
+            }
+            continue;
+        }
+        if (s->fmt.gl_internal_format != f->gl_internal_format ||
             !pgraph_gl_check_surface_to_texture_compatibility(s, &face_shape)) {
-            return false;
+            return 0;
         }
         faces[face] = s;
         *newest = MAX(*newest, s->draw_time);
+        count++;
     }
-    return true;
+    return count;
 }
 #endif
 
@@ -292,14 +315,28 @@ void pgraph_gl_bind_textures(NV2AState *d)
         int surface_time = surface ? surface->draw_time : 0;
 #ifdef XEMU_UWP
         SurfaceBinding *cube_faces[6];
-        bool cube_s2t = surface && state.cubemap &&
-                        find_cube_face_surfaces(d, &state, texture_vram_offset,
-                                                length, cube_faces,
-                                                &surface_time);
+        int cube_count = state.cubemap ?
+            find_cube_face_surfaces(d, &state, texture_vram_offset, length,
+                                    cube_faces, &surface_time) : 0;
+        /* all six faces drawn on the GPU: copied from there */
+        bool cube_s2t = surface && cube_count == 6;
+        /* some: those copied from the GPU, the others uploaded from memory */
+        bool cube_mixed = cube_count > 0 && cube_count < 6 && state.levels == 1;
+        if (cube_count == 0 && state.cubemap) {
+            surface_time = surface ? surface->draw_time : 0;
+        }
+#else
+        const bool cube_mixed = false;
 #endif
         if (!pg->texture_dirty[i] && tbind) {
             bool reusable = false;
-            if (surface && tbind->draw_time == surface_time) {
+            if (cube_mixed) {
+                possibly_dirty = check_texture_possibly_dirty(
+                        d, texture_vram_offset, length, palette_vram_offset,
+                        is_indexed ? palette_length : 0);
+                possibly_dirty_checked = true;
+                reusable = tbind->draw_time == surface_time && !possibly_dirty;
+            } else if (surface && tbind->draw_time == surface_time) {
                 reusable = true;
             } else if (!surface) {
                 possibly_dirty = check_texture_possibly_dirty(
@@ -361,6 +398,15 @@ void pgraph_gl_bind_textures(NV2AState *d)
                 hwaddr surf_vram_end = surface->vram_addr + surface->size - 1;
                 bool overlapping = !(surface->vram_addr >= tex_vram_end
                                      || texture_vram_offset >= surf_vram_end);
+#ifdef XEMU_UWP
+                if (overlapping && cube_mixed) {
+                    for (int face = 0; face < 6; face++) {
+                        if (cube_faces[face] == surface) {
+                            overlapping = false;
+                        }
+                    }
+                }
+#endif
                 if (overlapping) {
 #ifdef XEMU_UWP
                     if (surface->draw_dirty) {
@@ -464,6 +510,29 @@ void pgraph_gl_bind_textures(NV2AState *d)
                     binding->s2t_height = state.height;
                 }
                 for (int face = 0; face < 6; face++) {
+                    glCopyImageSubData(cube_faces[face]->gl_buffer,
+                                       GL_TEXTURE_2D, 0, 0, 0, 0,
+                                       binding->gl_texture, GL_TEXTURE_CUBE_MAP,
+                                       0, 0, 0, face, state.width,
+                                       state.height, 1);
+                }
+                binding->draw_time = surface_time;
+                binding->scale = 1;
+                UWP_PROF_END(PF_S2T, t_s2t);
+            }
+        } else if (cube_mixed) {
+            if (binding->draw_time < surface_time) {
+                UWP_TRACE("  cube mixed unit %d: %d of 6 faces from the GPU, addr %x",
+                          i, cube_count, (unsigned)texture_vram_offset);
+                UWP_PROF_BEGIN(t_s2t);
+                for (int face = 0; face < 6; face++) {
+                    if (!cube_faces[face]) {
+                        continue;
+                    }
+                    if (cube_faces[face]->upload_pending) {
+                        pgraph_gl_upload_surface_data(d, cube_faces[face], false);
+                        glBindTexture(binding->gl_target, binding->gl_texture);
+                    }
                     glCopyImageSubData(cube_faces[face]->gl_buffer,
                                        GL_TEXTURE_2D, 0, 0, 0, 0,
                                        binding->gl_texture, GL_TEXTURE_CUBE_MAP,
