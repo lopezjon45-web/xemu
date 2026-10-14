@@ -7,7 +7,7 @@ app on an Xbox Series X in Dev Mode. It is based on upstream master `478b4f4`. T
 inside `#ifdef XEMU_UWP`; on top of that the branch carries a few fixes taken from open xemu pull requests
 (listed under "Taken from others") and one generic fix in `block/file-win32.c`.
 
-**Current build: 0.8.9.0** ([releases](https://github.com/skitzellez/xemu-uwp/releases)).
+**Current build: 0.9.20.0** ([releases](https://github.com/skitzellez/xemu-uwp/releases)).
 
 ## Controls added for the console
 
@@ -17,17 +17,10 @@ inside `#ifdef XEMU_UWP`; on top of that the branch carries a few fixes taken fr
 | **View + LB** | Load it. Not in the first seconds after starting a game: wait for the title screen |
 | **View + Menu**, held two seconds | Quit and return to the launcher |
 
-## Games tried so far (one Xbox Series X, 1080p, 1x internal resolution)
+## Game compatibility
 
-| Game | Result |
-| --- | --- |
-| Crash Bandicoot: The Wrath of Cortex | 59-60 fps in its attract demo |
-| Panzer Dragoon Orta | 59-60 fps in its demo; real play not checked |
-| OutRun 2 | menus full speed, about 30 fps in a race (target 60) |
-| Halo 2 | menus a steady 30 (its target); gameplay 26-30 in light scenes, 17-30 in a heavy combat room (the emulated CPU is the limit there since 0.8.1.0; it was 17-21 with the renderer as the limit) |
-| A racing game with software-decoded intro movies | movies at 3-5 fps (the emulated CPU; same on desktop xemu), races 21-38 |
-
-That is the whole list. Expect breakage elsewhere, and please report what you find.
+Retail games boot, play with sound and the controller, and many run at full speed; heavy scenes can still
+fall below it (see "What does not work"). Results are not listed per game here. Please report what you find.
 
 **This code was written by an AI assistant (Claude) working with the repository owner.** It is published as a
 fork so that others can read it, test it, and take ideas from it. xemu's own rules (`CONTRIBUTING.md`, "Use of
@@ -104,6 +97,13 @@ repository. Keep changes inside `#ifdef XEMU_UWP`.
 - When the console sends the app to the background, the virtual hard disk is flushed and the settings are
   saved, so a suspended app that is ended later does not lose saves (0.4.3.0).
 - With `[net] enable = true` (NAT) in `xemu.toml` the emulator starts and runs; no game was tried online.
+- Free BIOS (0.9.1.0): without a BIOS of your own, games start with the bundled
+  [SpiritBoot](https://github.com/Mainkill1/SpiritBoot) BIOS (offline only), on a hard disk of its own.
+- Sets itself up (0.9.2.0): your own boot ROM and BIOS are used when found; otherwise the free BIOS. A
+  missing hard disk is made from the copyright-free blank image in the package. Paths picked this way are
+  not written into `xemu.toml`.
+- Smooth start (0.9.20.0): the Xbox logo animation and a game's first scenes no longer freeze while
+  graphics are prepared; see "Shader warm-up" below. The first start of each game records what it needs.
 
 ## What does not work, or is unfinished
 
@@ -114,14 +114,15 @@ repository. Keep changes inside `#ifdef XEMU_UWP`.
   it in block lookup and dispatch). See "Open leads".
 - A state loaded while the emulated console is still booting can trip an assert in the DSP interpreter
   (`read_memory_p`); loaded later it works. Cause not understood.
-- The pause with broken-up sound when a new scene appears (Halo 2: intro to title) is textures being
-  uploaded and shaders compiled for the first time; see the shader cache point below.
+- A new scene seen for the first time in a run can still pause briefly while its textures are uploaded
+  and its graphics are compiled; scenes from a game's first 30 seconds are prepared ahead (shader warm-up).
 - Disc swap while xemu is running is written but untested.
 - Disc images are opened with `CreateFileFromAppW` since 0.4.0.0, which should make FAT32 / exFAT USB drives
   work without the NTFS + permissions step. **Not yet tried on a FAT32 drive**; NTFS still works.
-- No shader cache between runs: the Mesa UWP build has no disk cache and reports no program binary formats,
-  so xemu's own shader cache stays empty and every start compiles shaders again (the first seconds of a new
-  scene stutter). `MESA_SHADER_CACHE_DIR` is set, ready for a Mesa build that has the cache.
+- No real shader cache between runs: the Mesa UWP build has no disk cache and reports no program binary
+  formats, so xemu's own shader cache stays empty. The shader warm-up (below) covers each game's first
+  30 seconds; later scenes still compile on first use. `MESA_SHADER_CACHE_DIR` is set, ready for a Mesa build
+  that has the cache.
 - Debug leftovers are still in: `UWP_MARK` markers (`system/vl.c`, `hw/xbox/xbox.c`,
   `hw/xbox/mcpx/apu/monitor.c`), a listing of `*.iso` files on all drives at start-up (`ui/xemu.c`, it runs
   before the main loop and can delay start-up on a slow drive), `pgraph read/write` trace lines and two lock
@@ -197,6 +198,22 @@ The changes keep data on the GPU:
 - Fixed in 0.5.4.0: the shortcut that skips a depth surface over a recent colour image left a depth-only
   pass with nothing bound (`assert(r->color_binding || r->zeta_binding)`, Halo 2 while loading a level). It
   now applies only while a colour target is bound.
+
+- Texture cache of 4096 entries instead of 512 (0.9.9.0, `gl/texture.c`): busy scenes with many
+  compressed textures were rebuilding the same textures every frame.
+- Cube maps with only some faces drawn on the GPU are no longer copied through memory (0.9.9.0).
+
+### Shader warm-up (0.9.20.0)
+
+The console's D3D12 driver compiles each shader for the complete pipeline (target formats, vertex layout,
+texture kinds, blend, depth, stencil and raster state) at the first draw that uses it, and nothing survives
+between runs. Every start therefore froze the Xbox logo animation for 0.1 to 1.4 s several times.
+
+`gl/shaders.c` now records the first draw of each shader in the first 30 s of a run, per disc, in
+`uwp_warm_<hash>.bin` next to the log (shader state plus that pipeline setup). The next start replays those
+draws off screen, with zero-area triangles, on three threads with GL contexts of their own; the game's first
+draw waits for them. The screen stays black about a second and a half longer, the logo animation then runs
+without the freezes, and the game is reached as fast as before. A list from another build is discarded.
 
 Measured on the console: one platformer's attract demo went from 20-28 fps to 59-60; another game's demo from
 29-30 to 59-60 with read-backs at zero.
