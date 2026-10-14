@@ -520,6 +520,9 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
     binding->cached = false;
     binding->program = NULL;
     binding->save_thread = NULL;
+#ifdef XEMU_UWP
+    binding->uwp_warm_noted = false;
+#endif
 }
 
 static void shader_cache_entry_post_evict(Lru *lru, LruNode *node)
@@ -547,6 +550,10 @@ static bool shader_cache_entry_compare(Lru *lru, LruNode *node, const void *key)
     ShaderBinding *binding = container_of(node, ShaderBinding, node);
     return memcmp(&binding->state, key, sizeof(ShaderState));
 }
+
+#ifdef XEMU_UWP
+static void uwp_warm_start(PGRAPHGLState *r);
+#endif
 
 void pgraph_gl_init_shaders(PGRAPHState *pg)
 {
@@ -593,6 +600,9 @@ void pgraph_gl_init_shaders(PGRAPHState *pg)
     r->shader_module_cache.init_node = shader_module_cache_entry_init;
     r->shader_module_cache.compare_nodes = shader_module_cache_entry_compare;
     r->shader_module_cache.post_node_evict = shader_module_cache_entry_post_evict;
+#ifdef XEMU_UWP
+    uwp_warm_start(r);
+#endif
 }
 
 void pgraph_gl_finalize_shaders(PGRAPHState *pg)
@@ -807,9 +817,512 @@ static void update_shader_uniforms(PGRAPHState *pg, ShaderBinding *binding)
                           &psh_values, PshUniform__COUNT);
 }
 
+#ifdef XEMU_UWP
+/*
+ * Shader warm-up. Mesa on the Xbox cannot keep compiled shaders between runs (no program
+ * binaries, no disk cache), and the console's driver compiles each shader at the first draw
+ * that uses it, for that draw's setup (target formats, vertex layout, texture types). Every
+ * start therefore compiled the Xbox logo animation's shaders while it was on screen: frames
+ * of 0.1 to 1.4 s. The first draw of every shader in the first 30 s of a run is recorded per
+ * disc in uwp_warm_<disc>.bin (shader state + draw setup); the next start replays those draws
+ * off screen, with no pixels covered, before its first frame.
+ */
+#define UWP_WARM_MAGIC 0x344d5257u /* "WRM4" */
+#define UWP_WARM_MAX 1024
+#define UWP_WARM_RECORD_MS 30000
+#define UWP_WARM_UNITS 4
+
+typedef struct UwpWarmPipe {
+    uint32_t color_fmt, depth_fmt; /* GL internal formats, 0 = none */
+    uint32_t prim;
+    uint32_t blend_src_rgb, blend_dst_rgb, blend_src_a, blend_dst_a, blend_eq_rgb, blend_eq_a;
+    uint32_t depth_func;
+    uint8_t blend, depth_test, depth_mask, stencil, cull, color_mask, pad[2];
+    /* the rest of what the console's driver builds into a pipeline */
+    uint32_t front_face, cull_mode, provoking;
+    uint8_t depth_clamp, poly_smooth, line_smooth, point_size, offset_fill, offset_line,
+        offset_point, pad2;
+    float line_width, offset_factor, offset_units;
+    uint32_t stencil_func, stencil_mask, stencil_fail, stencil_zfail, stencil_zpass,
+        stencil_write;
+    struct {
+        uint32_t type;
+        uint8_t enabled, size, normalized, integer;
+    } attr[16];
+    struct {
+        uint32_t target, fmt;
+    } tex[UWP_WARM_UNITS];
+} UwpWarmPipe;
+
+typedef struct UwpWarmRecord {
+    uint64_t check;
+    ShaderState state;
+    UwpWarmPipe pipe;
+} UwpWarmRecord;
+
+static int64_t uwp_warm_start_ms = -1;
+static int uwp_warm_count;
+
+static char *uwp_warm_path(void)
+{
+    const char *disc = g_config.sys.files.dvd_path ? g_config.sys.files.dvd_path : "";
+    const char *base = strrchr(disc, '/');
+    const char *base2 = strrchr(disc, '\\');
+    base = base2 > base ? base2 : base;
+    base = base ? base + 1 : disc;
+    return g_strdup_printf("%suwp_warm_%016llx.bin", xemu_settings_get_base_path(),
+                           (unsigned long long)fast_hash((const uint8_t *)base, strlen(base)));
+}
+
+static void uwp_warm_header(uint32_t head[3])
+{
+    head[0] = UWP_WARM_MAGIC;
+    head[1] = sizeof(UwpWarmRecord);
+    head[2] = (uint32_t)fast_hash((const uint8_t *)xemu_version, strlen(xemu_version));
+}
+
+static uint64_t uwp_warm_check(const UwpWarmRecord *rec)
+{
+    return fast_hash((const uint8_t *)&rec->state, sizeof(*rec) - sizeof(rec->check));
+}
+
+/* a small texture of this kind and format, made once */
+static GLuint uwp_warm_texture(GLenum target, GLenum fmt)
+{
+    /* per thread: each warm-up thread has its own context */
+    static __thread struct {
+        GLenum target, fmt;
+        GLuint tex;
+    } made[64];
+    static __thread int num;
+    for (int i = 0; i < num; i++) {
+        if (made[i].target == target && made[i].fmt == fmt) {
+            return made[i].tex;
+        }
+    }
+    if (num == ARRAY_SIZE(made)) {
+        return 0;
+    }
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(target, tex);
+    switch (target) {
+    case GL_TEXTURE_1D:
+        glTexStorage1D(target, 1, fmt, 4);
+        break;
+    case GL_TEXTURE_3D:
+        glTexStorage3D(target, 1, fmt, 4, 4, 4);
+        break;
+    default: /* 2D, rectangle, cube map */
+        glTexStorage2D(target, 1, fmt, target == GL_TEXTURE_CUBE_MAP ? 4 : 64,
+                       target == GL_TEXTURE_CUBE_MAP ? 4 : 64);
+        break;
+    }
+    if (target != GL_TEXTURE_RECTANGLE) {
+        glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, 0);
+    }
+    glBindTexture(target, 0);
+    if (glGetError() != GL_NO_ERROR) {
+        glDeleteTextures(1, &tex);
+        tex = 0;
+    }
+    made[num].target = target;
+    made[num].fmt = fmt;
+    made[num].tex = tex;
+    num++;
+    return tex;
+}
+
+static void uwp_warm_enable(GLenum cap, bool on)
+{
+    if (on) {
+        glEnable(cap);
+    } else {
+        glDisable(cap);
+    }
+}
+
+static bool uwp_warm_replay(const UwpWarmPipe *p, GLuint fbo, GLuint vao)
+{
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    GLuint color = p->color_fmt ? uwp_warm_texture(GL_TEXTURE_2D, p->color_fmt) : 0;
+    GLuint depth = p->depth_fmt ? uwp_warm_texture(GL_TEXTURE_2D, p->depth_fmt) : 0;
+    if ((p->color_fmt && !color) || (p->depth_fmt && !depth)) {
+        return false;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
+    bool ds = p->depth_fmt == GL_DEPTH24_STENCIL8 || p->depth_fmt == GL_DEPTH32F_STENCIL8;
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, ds ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,
+                           GL_TEXTURE_2D, depth, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        return false;
+    }
+    for (int u = 0; u < UWP_WARM_UNITS; u++) {
+        glActiveTexture(GL_TEXTURE0 + u);
+        if (p->tex[u].target) {
+            glBindTexture(p->tex[u].target, uwp_warm_texture(p->tex[u].target, p->tex[u].fmt));
+        }
+    }
+    glViewport(0, 0, 64, 64);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(p->color_mask & 1, p->color_mask & 2, p->color_mask & 4, p->color_mask & 8);
+    if (p->blend) {
+        glEnable(GL_BLEND);
+        glBlendFuncSeparate(p->blend_src_rgb, p->blend_dst_rgb, p->blend_src_a, p->blend_dst_a);
+        glBlendEquationSeparate(p->blend_eq_rgb, p->blend_eq_a);
+    } else {
+        glDisable(GL_BLEND);
+    }
+    if (p->depth_test) {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(p->depth_func);
+    } else {
+        glDisable(GL_DEPTH_TEST);
+    }
+    glDepthMask(p->depth_mask);
+    if (p->stencil) {
+        glEnable(GL_STENCIL_TEST);
+    } else {
+        glDisable(GL_STENCIL_TEST);
+    }
+    if (p->cull) {
+        glEnable(GL_CULL_FACE);
+    } else {
+        glDisable(GL_CULL_FACE);
+    }
+    glFrontFace(p->front_face);
+    glCullFace(p->cull_mode);
+    glProvokingVertex(p->provoking);
+    uwp_warm_enable(GL_DEPTH_CLAMP, p->depth_clamp);
+    uwp_warm_enable(GL_POLYGON_SMOOTH, p->poly_smooth);
+    uwp_warm_enable(GL_LINE_SMOOTH, p->line_smooth);
+    uwp_warm_enable(GL_PROGRAM_POINT_SIZE, p->point_size);
+    uwp_warm_enable(GL_POLYGON_OFFSET_FILL, p->offset_fill);
+    uwp_warm_enable(GL_POLYGON_OFFSET_LINE, p->offset_line);
+    uwp_warm_enable(GL_POLYGON_OFFSET_POINT, p->offset_point);
+    glPolygonOffset(p->offset_factor, p->offset_units);
+    glLineWidth(p->line_width > 0 ? p->line_width : 1);
+    glStencilFunc(p->stencil_func, 0, p->stencil_mask);
+    glStencilOp(p->stencil_fail, p->stencil_zfail, p->stencil_zpass);
+    glStencilMask(p->stencil_write);
+    glBindVertexArray(vao);
+    for (int i = 0; i < 16; i++) {
+        if (!p->attr[i].enabled) {
+            glDisableVertexAttribArray(i);
+            continue;
+        }
+        if (p->attr[i].integer) {
+            glVertexAttribIPointer(i, p->attr[i].size, p->attr[i].type, 0, NULL);
+        } else {
+            glVertexAttribPointer(i, p->attr[i].size, p->attr[i].type, p->attr[i].normalized, 0,
+                                  NULL);
+        }
+        glEnableVertexAttribArray(i);
+    }
+    /* all vertices are zeros: the triangles cover no pixels */
+    glDrawArrays(p->prim, 0, 6);
+    return glGetError() == GL_NO_ERROR;
+}
+
+/* the list read at start, replayed by the warm-up thread */
+static UwpWarmRecord *uwp_warm_list;
+static int uwp_warm_list_len;
+#define UWP_WARM_THREADS 3
+extern GloContext *g_uwp_warm_context[UWP_WARM_THREADS]; /* renderer.c: one per warm-up thread */
+static int uwp_warm_threads_left;
+
+typedef struct UwpWarmJob {
+    PGRAPHGLState *r;
+    int index; /* this thread replays entries index, index + UWP_WARM_THREADS, ... */
+} UwpWarmJob;
+
+static void *uwp_warm_thread(void *arg)
+{
+    UwpWarmJob *job = arg;
+    PGRAPHGLState *r = job->r;
+    glo_set_current(g_uwp_warm_context[job->index]);
+
+    GLuint fbo, vao, buf;
+    glGenFramebuffers(1, &fbo);
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &buf);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, buf);
+    void *zeros = g_malloc0(4096);
+    glBufferData(GL_ARRAY_BUFFER, 4096, zeros, GL_STATIC_DRAW);
+    g_free(zeros);
+
+    int built = 0, drawn = 0, failed = 0;
+    for (int i = job->index; i < uwp_warm_list_len; i += UWP_WARM_THREADS) {
+        UwpWarmRecord *rec = &uwp_warm_list[i];
+        uint64_t hash = fast_hash((uint8_t *)&rec->state, sizeof(ShaderState));
+        qemu_mutex_lock(&r->shader_cache_lock);
+        LruNode *node = lru_lookup(&r->shader_cache, hash, &rec->state);
+        ShaderBinding *binding = container_of(node, ShaderBinding, node);
+        if (!binding->initialized) {
+            generate_shaders(r, binding);
+            built++;
+        }
+        GLuint program = binding->gl_program;
+        qemu_mutex_unlock(&r->shader_cache_lock);
+        glUseProgram(program);
+        if (uwp_warm_replay(&rec->pipe, fbo, vao)) {
+            drawn++;
+        } else {
+            failed++;
+        }
+        glFlush(); /* hand each draw to the driver now, so its compiles start in order */
+    }
+    glFinish();
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &buf);
+    glo_set_current(NULL);
+    uwp_log("shader warm-up thread %d: %d shaders built, %d draws replayed, %d skipped, "
+            "done at %lld ms", job->index, built, drawn, failed,
+            (long long)(qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - uwp_warm_start_ms));
+    if (qatomic_fetch_dec(&uwp_warm_threads_left) == 1) {
+        g_free(uwp_warm_list);
+        uwp_warm_list = NULL;
+    }
+    g_free(job);
+    return NULL;
+}
+
+/* at renderer start: read this disc's list and replay it on a thread of its own */
+static void uwp_warm_start(PGRAPHGLState *r)
+{
+    uwp_warm_start_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    char *path = uwp_warm_path();
+    gchar *data = NULL;
+    gsize len = 0;
+    uint32_t want[3];
+    uwp_warm_header(want);
+    if (!g_file_get_contents(path, &data, &len, NULL)) {
+        uwp_log("shader warm-up: no list yet");
+        g_free(path);
+        return;
+    }
+    if (len < sizeof(want) || memcmp(data, want, sizeof(want))) {
+        /* another xemu build: shader states may differ, start a new list */
+        qemu_unlink(path);
+        uwp_log("shader warm-up: list from another build, starting a new one");
+        g_free(data);
+        g_free(path);
+        return;
+    }
+    int n = (len - sizeof(want)) / sizeof(UwpWarmRecord);
+    uwp_warm_list = g_new(UwpWarmRecord, n > 0 ? n : 1);
+    memcpy(uwp_warm_list, data + sizeof(want), n * sizeof(UwpWarmRecord));
+    g_free(data);
+    for (int i = 0; i < n; i++) {
+        if (uwp_warm_list[i].check != uwp_warm_check(&uwp_warm_list[i])) {
+            /* damaged from here on: keep the good part, start a new list */
+            qemu_unlink(path);
+            uwp_log("shader warm-up: damaged list after %d entries, starting a new one", i);
+            n = i;
+            break;
+        }
+    }
+    g_free(path);
+    uwp_warm_list_len = n;
+    uwp_warm_count = n;
+
+    /* mark them as listed, so the game's own first draws do not list them again */
+    qemu_mutex_lock(&r->shader_cache_lock);
+    for (int i = 0; i < n; i++) {
+        uint64_t hash = fast_hash((uint8_t *)&uwp_warm_list[i].state, sizeof(ShaderState));
+        LruNode *node = lru_lookup(&r->shader_cache, hash, &uwp_warm_list[i].state);
+        container_of(node, ShaderBinding, node)->uwp_warm_noted = true;
+    }
+    qemu_mutex_unlock(&r->shader_cache_lock);
+
+    if (n > 0 && g_uwp_warm_context[0]) {
+        /* the driver compiles in parallel: several threads finish before the logo needs them */
+        uwp_warm_threads_left = UWP_WARM_THREADS;
+        for (int t = 0; t < UWP_WARM_THREADS; t++) {
+            UwpWarmJob *job = g_new(UwpWarmJob, 1);
+            job->r = r;
+            job->index = t;
+            QemuThread thread;
+            qemu_thread_create(&thread, "uwp.shader_warm", uwp_warm_thread, job,
+                               QEMU_THREAD_DETACHED);
+        }
+        uwp_log("shader warm-up: replaying %d draws on %d threads", n, UWP_WARM_THREADS);
+    }
+}
+
+/*
+ * At the game's first draw: wait for the warm-up threads (at most 8 s), so the logo animation
+ * starts once its shaders are compiled instead of freezing on its first frames. The screen
+ * stays black a little longer; the time to the game stays about the same.
+ */
+static bool uwp_warm_waited;
+
+static void uwp_warm_wait(void)
+{
+    uwp_warm_waited = true;
+    int64_t t0 = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (!qatomic_read(&uwp_warm_threads_left)) {
+        return;
+    }
+    while (qatomic_read(&uwp_warm_threads_left) &&
+           qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - t0 < 8000) {
+        g_usleep(2000);
+    }
+    uwp_log("shader warm-up: first draw waited %lld ms for it",
+            (long long)(qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - t0));
+}
+
+/* called just before each game draw: note the first draw of a shader for the next start */
+void uwp_warm_draw(PGRAPHGLState *r)
+{
+    ShaderBinding *b = r->shader_binding;
+    if (!b || b->uwp_warm_noted) {
+        return;
+    }
+    b->uwp_warm_noted = true;
+    if (uwp_warm_start_ms < 0 ||
+        qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - uwp_warm_start_ms > UWP_WARM_RECORD_MS ||
+        uwp_warm_count >= UWP_WARM_MAX) {
+        return;
+    }
+
+    UwpWarmRecord *rec = g_malloc0(sizeof(UwpWarmRecord));
+    UwpWarmPipe *p = &rec->pipe;
+    memcpy(&rec->state, &b->state, sizeof(ShaderState));
+    p->prim = b->gl_primitive_mode;
+
+    GLint v, type;
+    glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+    if (type == GL_TEXTURE) {
+        glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                              GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &v);
+        glGetTextureLevelParameteriv(v, 0, GL_TEXTURE_INTERNAL_FORMAT, &v);
+        p->color_fmt = v;
+    }
+    glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+    if (type == GL_TEXTURE) {
+        glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                              GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &v);
+        glGetTextureLevelParameteriv(v, 0, GL_TEXTURE_INTERNAL_FORMAT, &v);
+        p->depth_fmt = v;
+    }
+    p->blend = glIsEnabled(GL_BLEND);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &v);
+    p->blend_src_rgb = v;
+    glGetIntegerv(GL_BLEND_DST_RGB, &v);
+    p->blend_dst_rgb = v;
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &v);
+    p->blend_src_a = v;
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &v);
+    p->blend_dst_a = v;
+    glGetIntegerv(GL_BLEND_EQUATION_RGB, &v);
+    p->blend_eq_rgb = v;
+    glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &v);
+    p->blend_eq_a = v;
+    p->depth_test = glIsEnabled(GL_DEPTH_TEST);
+    glGetIntegerv(GL_DEPTH_FUNC, &v);
+    p->depth_func = v;
+    GLboolean bv[4];
+    glGetBooleanv(GL_DEPTH_WRITEMASK, bv);
+    p->depth_mask = bv[0];
+    glGetBooleanv(GL_COLOR_WRITEMASK, bv);
+    p->color_mask = (bv[0] ? 1 : 0) | (bv[1] ? 2 : 0) | (bv[2] ? 4 : 0) | (bv[3] ? 8 : 0);
+    p->stencil = glIsEnabled(GL_STENCIL_TEST);
+    p->cull = glIsEnabled(GL_CULL_FACE);
+    glGetIntegerv(GL_FRONT_FACE, &v);
+    p->front_face = v;
+    glGetIntegerv(GL_CULL_FACE_MODE, &v);
+    p->cull_mode = v;
+    glGetIntegerv(GL_PROVOKING_VERTEX, &v);
+    p->provoking = v;
+    p->depth_clamp = glIsEnabled(GL_DEPTH_CLAMP);
+    p->poly_smooth = glIsEnabled(GL_POLYGON_SMOOTH);
+    p->line_smooth = glIsEnabled(GL_LINE_SMOOTH);
+    p->point_size = glIsEnabled(GL_PROGRAM_POINT_SIZE);
+    p->offset_fill = glIsEnabled(GL_POLYGON_OFFSET_FILL);
+    p->offset_line = glIsEnabled(GL_POLYGON_OFFSET_LINE);
+    p->offset_point = glIsEnabled(GL_POLYGON_OFFSET_POINT);
+    glGetFloatv(GL_LINE_WIDTH, &p->line_width);
+    glGetFloatv(GL_POLYGON_OFFSET_FACTOR, &p->offset_factor);
+    glGetFloatv(GL_POLYGON_OFFSET_UNITS, &p->offset_units);
+    glGetIntegerv(GL_STENCIL_FUNC, &v);
+    p->stencil_func = v;
+    glGetIntegerv(GL_STENCIL_VALUE_MASK, &v);
+    p->stencil_mask = v;
+    glGetIntegerv(GL_STENCIL_FAIL, &v);
+    p->stencil_fail = v;
+    glGetIntegerv(GL_STENCIL_PASS_DEPTH_FAIL, &v);
+    p->stencil_zfail = v;
+    glGetIntegerv(GL_STENCIL_PASS_DEPTH_PASS, &v);
+    p->stencil_zpass = v;
+    glGetIntegerv(GL_STENCIL_WRITEMASK, &v);
+    p->stencil_write = v;
+    for (int i = 0; i < 16; i++) {
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &v);
+        if (!v) {
+            continue;
+        }
+        p->attr[i].enabled = 1;
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_SIZE, &v);
+        p->attr[i].size = v;
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_TYPE, &v);
+        p->attr[i].type = v;
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &v);
+        p->attr[i].normalized = v;
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_INTEGER, &v);
+        p->attr[i].integer = v;
+    }
+    for (int u = 0; u < UWP_WARM_UNITS; u++) {
+        TextureBinding *t = r->texture_binding[u];
+        if (t && t->gl_texture) {
+            glGetTextureLevelParameteriv(t->gl_texture, 0, GL_TEXTURE_INTERNAL_FORMAT, &v);
+            p->tex[u].target = t->gl_target;
+            p->tex[u].fmt = v;
+        }
+    }
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    rec->check = uwp_warm_check(rec);
+
+    char *path = uwp_warm_path();
+    FILE *f = qemu_fopen(path, "ab");
+    g_free(path);
+    if (f) {
+        /* in append mode the position reads 0 until the first write: go to the end first */
+        fseek(f, 0, SEEK_END);
+        if (ftell(f) == 0) {
+            uint32_t head[3];
+            uwp_warm_header(head);
+            fwrite(head, sizeof(head), 1, f);
+        }
+        if (fwrite(rec, sizeof(*rec), 1, f) == 1) {
+            uwp_warm_count++;
+        }
+        fclose(f);
+    }
+    g_free(rec);
+}
+#endif
+
 void pgraph_gl_bind_shaders(PGRAPHState *pg)
 {
     PGRAPHGLState *r = pg->gl_renderer_state;
+
+#ifdef XEMU_UWP
+    if (!uwp_warm_waited) {
+        uwp_warm_wait();
+    }
+#endif
 
     bool binding_changed = false;
     if (r->shader_binding &&

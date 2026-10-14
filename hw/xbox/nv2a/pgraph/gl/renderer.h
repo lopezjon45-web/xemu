@@ -124,12 +124,20 @@ typedef struct ShaderBinding {
 
     GLuint gl_program;
     GLenum gl_primitive_mode;
+#ifdef XEMU_UWP
+    bool uwp_warm_noted; /* its first draw is in the warm-up list (shaders.c) */
+#endif
 
     struct {
         PshUniformLocs psh;
         VshUniformLocs vsh;
     } uniform_locs;
 } ShaderBinding;
+
+#ifdef XEMU_UWP
+struct PGRAPHGLState;
+void uwp_warm_draw(struct PGRAPHGLState *r); /* shaders.c: shader warm-up list */
+#endif
 
 typedef struct VertexKey {
     size_t count;

@@ -136,6 +136,12 @@ void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
     pg->clearing = false;
 }
 
+#ifdef XEMU_UWP
+#define UWP_WARM_DRAW(r) uwp_warm_draw(r)
+#else
+#define UWP_WARM_DRAW(r)
+#endif
+
 void pgraph_gl_draw_begin(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -495,6 +501,7 @@ static void pgraph_gl_flush_draw_inner(NV2AState *d)
         } else {
             nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_4_NOTDIRTY);
         }
+        UWP_WARM_DRAW(r);
         { UWP_PROF_BEGIN(t_gld);
         glDrawElements(r->shader_binding->gl_primitive_mode,
                        pg->inline_elements_length, GL_UNSIGNED_INT,
@@ -538,6 +545,7 @@ static void pgraph_gl_flush_draw_inner(NV2AState *d)
             }
         }
 
+        UWP_WARM_DRAW(r);
         { UWP_PROF_BEGIN(t_gld);
         glDrawArrays(r->shader_binding->gl_primitive_mode,
                      0, pg->inline_buffer_length);
@@ -547,6 +555,7 @@ static void pgraph_gl_flush_draw_inner(NV2AState *d)
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ARRAYS);
 
         unsigned int index_count = pgraph_gl_bind_inline_array(d);
+        UWP_WARM_DRAW(r);
         { UWP_PROF_BEGIN(t_gld);
         glDrawArrays(r->shader_binding->gl_primitive_mode,
                      0, index_count);

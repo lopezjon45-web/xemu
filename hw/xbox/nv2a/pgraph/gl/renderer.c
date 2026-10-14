@@ -27,11 +27,19 @@
 
 GloContext *g_nv2a_context_render;
 GloContext *g_nv2a_context_display;
+#ifdef XEMU_UWP
+GloContext *g_uwp_warm_context[3]; /* shaders.c: UWP_WARM_THREADS */
+#endif
 
 static void early_context_init(void)
 {
     g_nv2a_context_render = glo_context_create();
     g_nv2a_context_display = glo_context_create();
+#ifdef XEMU_UWP
+    for (int i = 0; i < 3; i++) { /* shaders.c: one per shader warm-up thread */
+        g_uwp_warm_context[i] = glo_context_create();
+    }
+#endif
 
     // Note: Due to use of shared contexts, this must happen after some other
     // context is created so the temporary context will not become the thread
