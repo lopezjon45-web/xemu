@@ -51,9 +51,11 @@
 #include "menubar.hh"
 
 #if defined(XEMU_UWP) && __has_include("xemu-uwp-testhud.inc")
-/* local test builds only (an on-screen counter); the file is not part of the source */
+/* the frame-rate display */
 #include "xemu-uwp-testhud.inc"
 #define UWP_TEST_HUD 1
+/* shown while Game Vault asks for it (ui/xemu.c) */
+extern "C" bool xemu_uwp_fps_on;
 #endif
 #include "compat.hh"
 #if defined(_WIN32)
@@ -226,7 +228,9 @@ void xemu_hud_update(void)
     ProcessKeyboardShortcuts();
 
 #ifdef UWP_TEST_HUD
-    uwp_test_hud();
+    if (xemu_uwp_fps_on) {
+        uwp_test_hud();
+    }
 #endif
 
 #if defined(CONFIG_RENDERDOC)

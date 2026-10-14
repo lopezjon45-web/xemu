@@ -1912,9 +1912,14 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
  * returns, SDL opens the launcher's "launchOnExit" link, so this is also the
  * way back to Game Vault.
  */
+static void uwp_session_summary(const char *how);
+
 static void uwp_quit(const char *why)
 {
     uwp_log("quitting: %s", why);
+    char *how = g_strdup_printf("quit normally (%s)", why);
+    uwp_session_summary(how);
+    g_free(how);
     shutdown_action = SHUTDOWN_ACTION_POWEROFF;
     qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
 }
@@ -2148,6 +2153,97 @@ static bool uwp_machine_running;
  * or a plain exit() leaves no crash dump on the console, and the last lines
  * of a buffered stderr are lost with it.
  */
+/*
+ * A plain summary at the end of every log, for whoever reads it (Game Vault puts it at the top of
+ * the copy on the USB drive): how long the game ran, how fast, where it was slow, and how it
+ * ended. Speed is sampled every 3 seconds from the game's own frame rate once frames are drawn.
+ */
+static struct {
+    unsigned samples, slow, very_slow;   /* 3-second samples; below 25 fps; below 15 fps */
+    double sum;
+    int lowest, lowest_at;               /* fps and seconds into the session */
+    int slow_from, worst_stretch_from, worst_stretch_len, stretch_len;
+    bool written;
+} uwp_session = { .lowest = 1000, .slow_from = -1 };
+static uint64_t uwp_session_start_ms;
+
+static void uwp_session_sample(int fps)
+{
+    int at = (int)((SDL_GetTicks() - uwp_session_start_ms) / 1000);
+    if (fps <= 0) {
+        return;   /* nothing drawn: loading, a menu that waits, or paused */
+    }
+    uwp_session.samples++;
+    uwp_session.sum += fps;
+    if (fps < uwp_session.lowest) {
+        uwp_session.lowest = fps;
+        uwp_session.lowest_at = at;
+    }
+    if (fps < 25) {
+        uwp_session.slow++;
+        if (uwp_session.slow_from < 0) {
+            uwp_session.slow_from = at;
+            uwp_session.stretch_len = 0;
+        }
+        uwp_session.stretch_len += 3;
+        if (uwp_session.stretch_len > uwp_session.worst_stretch_len) {
+            uwp_session.worst_stretch_len = uwp_session.stretch_len;
+            uwp_session.worst_stretch_from = uwp_session.slow_from;
+        }
+    } else {
+        uwp_session.slow_from = -1;
+    }
+    if (fps < 15) {
+        uwp_session.very_slow++;
+    }
+}
+
+static void uwp_session_summary(const char *how)
+{
+    if (uwp_session.written) {
+        return;
+    }
+    uwp_session.written = true;
+    int secs = (int)((SDL_GetTicks() - uwp_session_start_ms) / 1000);
+    const char *disc = g_config.sys.files.dvd_path && g_config.sys.files.dvd_path[0]
+                           ? g_config.sys.files.dvd_path : "(no disc)";
+    uwp_log("===== SUMMARY =====");
+    uwp_log("Game: %s", disc);
+    uwp_log("Emulator: xemu for Dev Mode %s", xemu_version);
+    uwp_log("Played: %d min %d s", secs / 60, secs % 60);
+    if (uwp_session.samples) {
+        uwp_log("Speed: average %.0f fps, lowest %d fps (at %d:%02d into the session)",
+                uwp_session.sum / uwp_session.samples, uwp_session.lowest,
+                uwp_session.lowest_at / 60, uwp_session.lowest_at % 60);
+        uwp_log("Slow: %u s below 25 fps, %u s below 15 fps; longest slow stretch %d s (from %d:%02d)",
+                uwp_session.slow * 3, uwp_session.very_slow * 3, uwp_session.worst_stretch_len,
+                uwp_session.worst_stretch_from / 60, uwp_session.worst_stretch_from % 60);
+    } else {
+        uwp_log("Speed: the game never drew a frame");
+    }
+    uwp_log("Ended: %s", how);
+    uwp_log("===== END OF SUMMARY =====");
+    fflush(NULL);
+}
+
+static LONG WINAPI uwp_on_crash(EXCEPTION_POINTERS *e)
+{
+    char how[160];
+    DWORD code = e && e->ExceptionRecord ? e->ExceptionRecord->ExceptionCode : 0;
+    HMODULE mod = NULL;
+    char name[MAX_PATH] = "?";
+    void *where = e && e->ExceptionRecord ? e->ExceptionRecord->ExceptionAddress : NULL;
+    if (where && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)where, &mod) && mod) {
+        GetModuleFileNameA(mod, name, sizeof(name));
+    }
+    const char *base = strrchr(name, '\\');
+    snprintf(how, sizeof(how), "CRASHED (exception 0x%08lx in %s+0x%llx)", code, base ? base + 1 : name,
+             (unsigned long long)((uintptr_t)where - (uintptr_t)mod));
+    uwp_session_summary(how);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static void uwp_on_abort(int sig)
 {
     /*
@@ -2171,11 +2267,13 @@ static void uwp_on_abort(int sig)
         uwp_log("  #%u %s+0x%llx", i, base ? base + 1 : name,
                 (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)mod));
     }
+    uwp_session_summary("STOPPED on an internal error (the ABORT lines above say where)");
     fflush(NULL);
 }
 
 static void uwp_on_exit(void)
 {
+    uwp_session_summary("closed (quit, or the console closed the app)");
     uwp_log("exit() reached");
     fflush(NULL);
 }
@@ -2277,7 +2375,7 @@ static void uwp_log_memory(void)
  * written back: otherwise a path chosen once would stick, and a BIOS found later on the
  * player's USB drive, or a new package version with another install path, would be ignored.
  */
-static char *uwp_toml_bootrom, *uwp_toml_bios, *uwp_toml_hdd;
+static char *uwp_toml_bootrom, *uwp_toml_bios, *uwp_toml_hdd, *uwp_toml_eeprom;
 static bool uwp_toml_remembered;
 
 static void uwp_save_settings(void)
@@ -2288,15 +2386,16 @@ static void uwp_save_settings(void)
     }
     const char **slot[] = { &g_config.sys.files.bootrom_path,
                             &g_config.sys.files.flashrom_path,
-                            &g_config.sys.files.hdd_path };
-    char *toml[] = { uwp_toml_bootrom, uwp_toml_bios, uwp_toml_hdd };
-    char *now[3];
-    for (int i = 0; i < 3; i++) {
+                            &g_config.sys.files.hdd_path,
+                            &g_config.sys.files.eeprom_path };
+    char *toml[] = { uwp_toml_bootrom, uwp_toml_bios, uwp_toml_hdd, uwp_toml_eeprom };
+    char *now[4];
+    for (int i = 0; i < 4; i++) {
         now[i] = g_strdup(*slot[i] ? *slot[i] : "");
         xemu_settings_set_string(slot[i], toml[i]);
     }
     xemu_settings_save();
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         xemu_settings_set_string(slot[i], now[i]);
         g_free(now[i]);
     }
@@ -2327,6 +2426,37 @@ static bool uwp_event_watch(void *userdata, SDL_Event *event)
     return true;
 }
 
+/* Game Vault's folder on the games drive, from "home=" in the link (see uwp_home_disk) */
+static char *uwp_home;
+
+/* the frame-rate display: Game Vault sends "fps=1" with each game while it is on */
+bool xemu_uwp_fps_on;
+
+/* A link value with the %XX escaping undone and forward slashes (as xemu.toml uses). */
+static char *uwp_unescape(const char *in)
+{
+    char *result = g_malloc(strlen(in) + 1);
+    char *out = result;
+    for (; *in; in++) {
+        if (in[0] == '%' && g_ascii_isxdigit(in[1]) && g_ascii_isxdigit(in[2])) {
+            *out = (char)(g_ascii_xdigit_value(in[1]) * 16 + g_ascii_xdigit_value(in[2]));
+            in += 2;
+        } else {
+            *out = *in;
+        }
+        if (*out == '\\') {
+            *out = '/';
+        }
+        out++;
+    }
+    *out = '\0';
+    if (!result[0]) {
+        g_free(result);
+        return NULL;
+    }
+    return result;
+}
+
 static char *uwp_take_activation_disc(void)
 {
     const char *hint = SDL_GetHint(UWP_ACTIVATION_HINT);
@@ -2337,6 +2467,7 @@ static char *uwp_take_activation_disc(void)
     SDL_SetHint(UWP_ACTIVATION_HINT, "");
 
     char *disc = NULL;
+    bool fps = false;
     char *query = strchr(uri, '?');
     for (char *p = query ? query + 1 : NULL; p && *p;) {
         char *end = strchr(p, '&');
@@ -2368,6 +2499,13 @@ static char *uwp_take_activation_disc(void)
         if (!strcmp(p, "state=save")) {
             uwp_save_state_wanted = true;
         }
+        if (!strcmp(p, "fps=1")) {
+            fps = true;
+        }
+        if (!strncmp(p, "home=", 5)) {
+            g_free(uwp_home);
+            uwp_home = uwp_unescape(p + 5);
+        }
         if (!strncmp(p, "disc=", 5)) {
             /* undo the %XX escaping; xemu.toml uses forward slashes */
             disc = g_malloc(strlen(p) + 1);
@@ -2391,6 +2529,9 @@ static char *uwp_take_activation_disc(void)
         p = end ? end + 1 : NULL;
     }
     g_free(uri);
+    if (disc) {
+        xemu_uwp_fps_on = fps;
+    }
     if (disc && !disc[0]) {
         g_free(disc);
         disc = NULL;
@@ -2457,7 +2598,7 @@ static char *uwp_system_folder(void)
 
 /*
  * The log also goes to the publisher's shared folder as games\logs\<disc name>.log, written as it
- * goes (so a crash leaves it complete). Game Vault copies these to "Game Vault logs" on the USB drive,
+ * goes (so a crash leaves it complete). Game Vault copies these to "Game Vault\logs" on the USB drive,
  * where a player can pick one up to send with a report.
  */
 static void uwp_log_share(const char *disc)
@@ -2605,6 +2746,198 @@ static bool uwp_use_free_bios(void)
 }
 
 /*
+ * The hard disk and the games USB drive. Game Vault sends its folder on that drive as "home" with
+ * every game and keeps a copy of the console's hard disk in <home>\xbox (exFAT / NTFS drives),
+ * brought up to date after playing. xemu always plays from the console's disk, which is fast; only
+ * a console with no disk at all (new, or reset) plays from the stick's copy until Game Vault has
+ * put it back on the console. Each console disk has an ID (a random one in "<disk>.id" next to
+ * it), which Game Vault copies along, so the stick's copy is always matched to the right disk.
+ * The EEPROM (the Xbox's own keys) stays on the console: xemu opens it with calls a FAT32 / exFAT
+ * stick refuses. Game Vault can only reach the publisher's folder, not xemu's own storage, so a
+ * disk set up by hand in xemu's own folder (xemu.toml) is first moved over there (same drive, so a
+ * rename), and the EEPROM with it, so Game Vault can keep a copy of it on the stick.
+ */
+static bool uwp_under(const char *path, const char *dir)
+{
+    if (!path || !dir) {
+        return false;
+    }
+    for (; *dir; path++, dir++) {
+        char a = *path == '/' ? '\\' : g_ascii_tolower(*path);
+        char b = *dir == '/' ? '\\' : g_ascii_tolower(*dir);
+        if (a != b) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* the file name of a path with either kind of slash */
+static const char *uwp_base_name(const char *path)
+{
+    const char *base = path;
+    for (const char *c = path; *c; c++) {
+        if (*c == '/' || *c == '\\') {
+            base = c + 1;
+        }
+    }
+    return base;
+}
+
+static wchar_t *uwp_wide_path(const char *path)
+{
+    wchar_t *w = g_utf8_to_utf16(path, -1, NULL, NULL, NULL);
+    for (wchar_t *c = w; c && *c; c++) {
+        if (*c == L'/') {
+            *c = L'\\';
+        }
+    }
+    return w;
+}
+
+static bool uwp_move_file(const char *from, const char *to)
+{
+    typedef BOOL (WINAPI *move_fn)(LPCWSTR, LPCWSTR);
+    move_fn move = (move_fn)xemu_uwp_kernelbase_proc("MoveFileFromAppW");
+    wchar_t *wf = uwp_wide_path(from), *wt = uwp_wide_path(to);
+    bool ok = wf && wt && move && move(wf, wt);
+    g_free(wf);
+    g_free(wt);
+    return ok;
+}
+
+/* A small file read through the file broker (on a FAT32 / exFAT stick the C library is refused). */
+static char *uwp_read_small(const char *path)
+{
+    wchar_t *w = uwp_wide_path(path);
+    HANDLE h = w ? xemu_uwp_create_file_w(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                          OPEN_EXISTING, 0)
+                 : INVALID_HANDLE_VALUE;
+    g_free(w);
+    if (h == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+    char buf[128];
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, buf, sizeof(buf) - 1, &got, NULL);
+    CloseHandle(h);
+    if (!ok || !got) {
+        return NULL;
+    }
+    buf[got] = '\0';
+    return g_strstrip(g_strdup(buf));
+}
+
+/* The ID of a console disk, made the first time. */
+static char *uwp_disk_id(const char *disk)
+{
+    char *file = g_strdup_printf("%s.id", disk);
+    char *id = uwp_read_small(file);
+    if (!id) {
+        id = g_uuid_string_random();
+        if (!g_file_set_contents(file, id, -1, NULL)) {
+            uwp_log("hard disk: could not write its ID (%s)", file);
+        }
+    }
+    g_free(file);
+    return id;
+}
+
+/* Into the publisher's folder; a file of that name already there (a spare disk the setup made but
+ * xemu.toml did not use) is kept as "<name>.unused". */
+static void uwp_move_to_folder(const char **setting, const char *what, const char *folder,
+                               const char *own, const char *name)
+{
+    if (!uwp_under(*setting, own) || !uwp_file_exists(*setting)) {
+        return;
+    }
+    g_mkdir_with_parents(folder, 0755);
+    char *to = g_strdup_printf("%s%s", folder, name);
+    if (uwp_file_exists(to)) {
+        char *spare = g_strdup_printf("%s.unused", to);
+        for (int n = 2; uwp_file_exists(spare); n++) {
+            g_free(spare);
+            spare = g_strdup_printf("%s.unused%d", to, n);
+        }
+        char *id = g_strdup_printf("%s.id", to), *spare_id = g_strdup_printf("%s.id", spare);
+        uwp_move_file(to, spare);
+        uwp_move_file(id, spare_id);
+        uwp_log("%s: the one in the publisher's folder was not in use, kept as %s", what, spare);
+        g_free(id);
+        g_free(spare_id);
+        g_free(spare);
+    }
+    char *from = g_strdup(*setting);
+    if (uwp_move_file(from, to)) {
+        uwp_log("%s moved to the publisher's folder, where Game Vault can copy it to the USB drive", what);
+        uwp_set_path(setting, what, to);
+    } else {
+        uwp_log("%s: could not move it to %s (error %lu)", what, to, GetLastError());
+    }
+    g_free(from);
+    g_free(to);
+}
+
+/*
+ * A file moved over from xemu's own storage keeps permissions only xemu has, so Game Vault cannot
+ * read it. A fresh copy gets the publisher's folder's own permissions, which both apps share; done
+ * once per file ("<file>.shared" marks it).
+ */
+static void uwp_share_file(const char *path)
+{
+    char *mark = g_strdup_printf("%s.shared", path);
+    if (!uwp_file_exists(path) || uwp_file_exists(mark)) {
+        g_free(mark);
+        return;
+    }
+    typedef BOOL (WINAPI *copy_fn)(LPCWSTR, LPCWSTR, BOOL);
+    typedef BOOL (WINAPI *delete_fn)(LPCWSTR);
+    copy_fn copy = (copy_fn)xemu_uwp_kernelbase_proc("CopyFileFromAppW");
+    delete_fn del = (delete_fn)xemu_uwp_kernelbase_proc("DeleteFileFromAppW");
+    char *tmp = g_strdup_printf("%s.copy", path);
+    wchar_t *wp = uwp_wide_path(path), *wt = uwp_wide_path(tmp);
+    if (copy && del && copy(wp, wt, FALSE)) {
+        if (del(wp) && uwp_move_file(tmp, path)) {
+            g_file_set_contents(mark, "", 0, NULL);
+            uwp_log("%s: copied once so that Game Vault may read it", path);
+        } else {
+            uwp_log("%s: could not replace it with its copy (error %lu)", path, GetLastError());
+        }
+    } else {
+        uwp_log("%s: could not copy it (error %lu)", path, GetLastError());
+    }
+    g_free(wp);
+    g_free(wt);
+    g_free(tmp);
+    g_free(mark);
+}
+
+static void uwp_home_disk(const char *folder, const char *own)
+{
+    if (uwp_under(g_config.sys.files.hdd_path, uwp_home)) {
+        return;   /* no disk on the console at all: the stick's is in use already */
+    }
+    if (folder && own) {
+        char *base = g_strdup(uwp_base_name(g_config.sys.files.hdd_path));
+        uwp_move_to_folder(&g_config.sys.files.hdd_path, "hard disk", folder, own, base);
+        uwp_move_to_folder(&g_config.sys.files.eeprom_path, "EEPROM", folder, own, "eeprom.bin");
+        g_free(base);
+    }
+    if (!folder || !uwp_under(g_config.sys.files.hdd_path, folder)) {
+        uwp_log("hard disk: set up by hand outside xemu's folders, so it stays where it is");
+        return;
+    }
+    uwp_share_file(g_config.sys.files.hdd_path);
+    if (uwp_under(g_config.sys.files.eeprom_path, folder)) {
+        uwp_share_file(g_config.sys.files.eeprom_path);
+    }
+    /* played from the console; Game Vault keeps the stick's copy matched to it by this ID */
+    char *id = uwp_disk_id(g_config.sys.files.hdd_path);
+    uwp_log("hard disk ID: %s", id);
+    g_free(id);
+}
+
+/*
  * Which BIOS and hard disk to use, with nothing for the player to do:
  *  - the player's own files (from xemu.toml, or what Game Vault found on their USB drive and
  *    put in the publisher's folder): their BIOS with the boot ROM, their hard disk;
@@ -2624,6 +2957,7 @@ static void uwp_fill_system_files(void)
     uwp_toml_bootrom = g_strdup(g_config.sys.files.bootrom_path ? g_config.sys.files.bootrom_path : "");
     uwp_toml_bios = g_strdup(g_config.sys.files.flashrom_path ? g_config.sys.files.flashrom_path : "");
     uwp_toml_hdd = g_strdup(g_config.sys.files.hdd_path ? g_config.sys.files.hdd_path : "");
+    uwp_toml_eeprom = g_strdup(g_config.sys.files.eeprom_path ? g_config.sys.files.eeprom_path : "");
     uwp_toml_remembered = true;
 
     bool asked_free = !g_ascii_strcasecmp(uwp_toml_bios, "spiritboot");
@@ -2645,9 +2979,24 @@ static void uwp_fill_system_files(void)
     if (!uwp_file_exists(uwp_toml_hdd)) {
         const char *const *names = free_bios ? free_hdd : own_hdd;
         xemu_settings_set_string(&g_config.sys.files.hdd_path, "");
-        if (!uwp_fill_one(&g_config.sys.files.hdd_path, "hard disk", folder, own, names)) {
+        char *usb = uwp_home ? g_strdup_printf("%s/xbox/%s", uwp_home, names[0]) : NULL;
+        if (uwp_fill_one(&g_config.sys.files.hdd_path, "hard disk", folder, own, names)) {
+            /* the console's own */
+        } else if (usb && uwp_file_exists(usb)) {
+            /* a console without a disk (new, or reset) and the player's stick: the stick's disk */
+            uwp_set_path(&g_config.sys.files.hdd_path, "hard disk (on the USB drive, none on the console)", usb);
+        } else {
             uwp_new_hdd(folder, own, names[0]);
         }
+        g_free(usb);
+    }
+    if (!uwp_file_exists(g_config.sys.files.eeprom_path)) {
+        static const char *const eeprom[] = { "eeprom.bin", NULL };
+        xemu_settings_set_string(&g_config.sys.files.eeprom_path, "");
+        uwp_fill_one(&g_config.sys.files.eeprom_path, "EEPROM", folder, own, eeprom);
+    }
+    if (uwp_home) {
+        uwp_home_disk(folder, own);
     }
     g_free(folder);
     SDL_free(own);
@@ -3005,6 +3354,8 @@ int main(int argc, char **argv)
     uwp_machine_running = true;
     setvbuf(stderr, NULL, _IONBF, 0);
     signal(SIGABRT, uwp_on_abort);
+    SetUnhandledExceptionFilter(uwp_on_crash);
+    uwp_session_start_ms = SDL_GetTicks();
     atexit(uwp_on_exit);
     g_set_printerr_handler(uwp_glib_print);
     uwp_log_memory();
@@ -3053,6 +3404,7 @@ int main(int argc, char **argv)
                     RunState_str(runstate_get()), g_nv2a_stats.increment_fps,
                     pads, p1 ? p1->name : "(none)");
             uwp_prof_report((SDL_GetTicks() - (uwp_next_report - 3000)) / 1000.0);
+            uwp_session_sample(g_nv2a_stats.increment_fps);
             if ((uwp_frames / 180) % 3 == 0) {
                 uwp_log_memory();
             }
