@@ -1,0 +1,140 @@
+/*
+ * Copyright (c) 2026 Skitzelles - part of xemu for Xbox Dev Mode (github.com/skitzellez/xemu-uwp). GPL-2.0-or-later.
+ *
+ * Where the emulated CPU spends its time (testing only). With eip-sampler.txt next to the log
+ * (LocalState/xemu/xemu, put there through the Device Portal) a thread asks the emulated CPU about
+ * 1000 times a second, at a point where its registers are up to date, which address it is about to run.
+ * Every 2 seconds the log gets the hottest addresses and their share, and the first time an address is
+ * among them, the 96 bytes of code there (to disassemble on a PC). Busy-wait loops show up as a few
+ * addresses holding most of the time while the game draws little.
+ */
+#include "qemu/osdep.h"
+#include "qemu/thread.h"
+#include "qemu/atomic.h"
+#include "qemu/timer.h"
+#include "hw/core/cpu.h"
+#include "system/runstate.h"
+#include "cpu.h"
+
+#ifdef XEMU_UWP
+
+void uwp_log(const char *fmt, ...);
+bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+
+#define REPORT_SAMPLES 2000
+#define TOP 12
+
+static GHashTable *counts;      /* linear address -> samples, vCPU thread only */
+static GHashTable *dumped;      /* addresses whose code is already in the log */
+static unsigned total, halted;
+static int pending;
+
+typedef struct { guint pc, count; } Place;
+
+static int by_count(const void *a, const void *b)
+{
+    const Place *pa = a, *pb = b;
+    return pa->count < pb->count ? 1 : pa->count > pb->count ? -1 : 0;
+}
+
+static void report(CPUState *cs)
+{
+    guint n_places = g_hash_table_size(counts);
+    Place *places = g_new(Place, n_places ? n_places : 1);
+    GHashTableIter it;
+    gpointer key, value;
+    guint n = 0;
+    g_hash_table_iter_init(&it, counts);
+    while (g_hash_table_iter_next(&it, &key, &value)) {
+        places[n].pc = GPOINTER_TO_UINT(key);
+        places[n++].count = GPOINTER_TO_UINT(value);
+    }
+    qsort(places, n, sizeof(Place), by_count);
+    GString *line = g_string_new(NULL);
+    g_string_printf(line, "eip: %u samples, halted %u%%, %u places |", total, halted * 100 / total, n);
+    for (guint i = 0; i < n && i < TOP; i++) {
+        g_string_append_printf(line, " %08x %u%%", places[i].pc, places[i].count * 100 / total);
+    }
+    uwp_log("%s", line->str);
+    {
+        extern unsigned xemu_uwp_vblank_count, xemu_uwp_ctxsw_count, xemu_uwp_error_count;
+        extern uint64_t xemu_uwp_ctxsw_wait_ns, xemu_uwp_error_wait_ns, xemu_uwp_error_bh_ns;
+        static int64_t last;
+        int64_t now = get_clock_realtime();
+        double secs = last ? (now - last) / 1e9 : 0;
+        unsigned v = qatomic_xchg(&xemu_uwp_vblank_count, 0), c = qatomic_xchg(&xemu_uwp_ctxsw_count, 0),
+                 e = qatomic_xchg(&xemu_uwp_error_count, 0);
+        uint64_t cw = qatomic_xchg(&xemu_uwp_ctxsw_wait_ns, 0), ew = qatomic_xchg(&xemu_uwp_error_wait_ns, 0);
+        uint64_t eb = qatomic_xchg(&xemu_uwp_error_bh_ns, 0);
+        last = now;
+        uwp_log("gpu irq: %.1f s | vblank %u | context switch %u, GPU stopped %.1f ms (avg %.2f) | "
+                "software method %u, GPU stopped %.1f ms (avg %.2f, of which raising %.2f)", secs, v, c,
+                cw / 1e6, c ? cw / 1e6 / c : 0, e, ew / 1e6, e ? ew / 1e6 / e : 0, e ? eb / 1e6 / e : 0);
+    }
+    /* code of the hottest places, once each */
+    for (guint i = 0; i < n && i < 4; i++) {
+        gpointer k = GUINT_TO_POINTER(places[i].pc);
+        if (g_hash_table_contains(dumped, k) || g_hash_table_size(dumped) > 200) {
+            continue;
+        }
+        g_hash_table_add(dumped, k);
+        uint8_t code[96];
+        if (cpu_memory_rw_debug(cs, places[i].pc, code, sizeof(code), false) == 0) {
+            GString *hex = g_string_new(NULL);
+            for (size_t j = 0; j < sizeof(code); j++) {
+                g_string_append_printf(hex, "%02x", code[j]);
+            }
+            uwp_log("eip code %08x: %s", places[i].pc, hex->str);
+            g_string_free(hex, true);
+        }
+    }
+    g_string_free(line, true);
+    g_free(places);
+    g_hash_table_remove_all(counts);
+    total = halted = 0;
+}
+
+static void sample(CPUState *cs, run_on_cpu_data data)
+{
+    CPUX86State *env = cpu_env(cs);
+    if (cs->halted) {
+        halted++;
+    } else {
+        guint pc = (guint)(env->segs[R_CS].base + env->eip);
+        gpointer key = GUINT_TO_POINTER(pc);
+        g_hash_table_replace(counts, key,
+                             GUINT_TO_POINTER(GPOINTER_TO_UINT(g_hash_table_lookup(counts, key)) + 1));
+    }
+    if (++total >= REPORT_SAMPLES) {
+        report(cs);
+    }
+    qatomic_set(&pending, 0);
+}
+
+static void *sampler_thread(void *opaque)
+{
+    for (;;) {
+        g_usleep(1000);
+        CPUState *cs = first_cpu;
+        if (!cs || !runstate_is_running() || qatomic_read(&pending)) {
+            continue;
+        }
+        qatomic_set(&pending, 1);
+        async_run_on_cpu(cs, sample, RUN_ON_CPU_NULL);
+    }
+    return NULL;
+}
+
+void xemu_uwp_eip_sampler_start(void)
+{
+    static QemuThread thread;
+    if (!xemu_uwp_test_file_exists("eip-sampler.txt")) {
+        return;
+    }
+    counts = g_hash_table_new(NULL, NULL);
+    dumped = g_hash_table_new(NULL, NULL);
+    qemu_thread_create(&thread, "uwp_eip_sampler", sampler_thread, NULL, QEMU_THREAD_DETACHED);
+    uwp_log("eip sampler: on (eip-sampler.txt)");
+}
+
+#endif

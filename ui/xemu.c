@@ -3304,6 +3304,18 @@ static char *uwp_unescape(const char *in)
  * console's Device Portal can put there: any app on the console can open an xemu: link, and must not
  * crash it or press its buttons. A launcher needs disc, home and the return link only.
  */
+/* a test file next to the log (LocalState/xemu/xemu); only the Device Portal can put one there */
+bool xemu_uwp_test_file_exists(const char *name);
+bool xemu_uwp_test_file_exists(const char *name)
+{
+    char *base = SDL_GetPrefPath("xemu", "xemu");
+    char *file = g_strdup_printf("%s%s", base ? base : "", name);
+    bool found = g_file_test(file, G_FILE_TEST_EXISTS);
+    g_free(file);
+    SDL_free(base);
+    return found;
+}
+
 static bool uwp_test_links_allowed(void)
 {
     char *base = SDL_GetPrefPath("xemu", "xemu");

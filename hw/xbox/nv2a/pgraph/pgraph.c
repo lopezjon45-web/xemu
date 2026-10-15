@@ -29,6 +29,14 @@
 #include "nv2a_vsh_emulator.h"
 #include "qemu/xemu-uwp.h"
 
+#ifdef XEMU_UWP
+/* testing counters, read by hw/xbox/uwp-eipsampler.c: GPU interrupts that stop the GPU until the CPU answers */
+unsigned xemu_uwp_ctxsw_count, xemu_uwp_error_count;
+uint64_t xemu_uwp_ctxsw_wait_ns, xemu_uwp_error_wait_ns;
+static int64_t uwp_ctxsw_since, uwp_error_since, uwp_error_raised;
+uint64_t xemu_uwp_error_bh_ns; /* GPU stop -> interrupt raised to the CPU (main loop) */
+#endif
+
 #define PG_GET_MASK(reg, mask) GET_MASK(pgraph_reg_r(pg, reg), mask)
 #define PG_SET_MASK(reg, mask, value)        \
     do {                                     \
@@ -124,9 +132,22 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         pg->pending_interrupts &= ~val;
 
         if (!(pg->pending_interrupts & NV_PGRAPH_INTR_ERROR)) {
+#ifdef XEMU_UWP
+            if (pg->waiting_for_nop && uwp_error_since) {
+                xemu_uwp_error_wait_ns += get_clock_realtime() - uwp_error_since;
+                uwp_error_since = 0;
+                uwp_error_raised = 0;
+            }
+#endif
             pg->waiting_for_nop = false;
         }
         if (!(pg->pending_interrupts & NV_PGRAPH_INTR_CONTEXT_SWITCH)) {
+#ifdef XEMU_UWP
+            if (pg->waiting_for_context_switch && uwp_ctxsw_since) {
+                xemu_uwp_ctxsw_wait_ns += get_clock_realtime() - uwp_ctxsw_since;
+                uwp_ctxsw_since = 0;
+            }
+#endif
             pg->waiting_for_context_switch = false;
         }
         pfifo_kick(d);
@@ -209,6 +230,12 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 static void pgraph_update_irq_bh(void *opaque)
 {
     NV2AState *d = opaque;
+#ifdef XEMU_UWP
+    if (uwp_error_since && !uwp_error_raised) {
+        uwp_error_raised = get_clock_realtime();
+        xemu_uwp_error_bh_ns += uwp_error_raised - uwp_error_since;
+    }
+#endif
     nv2a_update_irq(d);
 }
 
@@ -220,6 +247,17 @@ static void pgraph_update_irq_bh(void *opaque)
  * the IRQ raise to a main-loop bottom half, which runs with the BQL held. */
 static void pgraph_schedule_irq_update(NV2AState *d)
 {
+#ifdef XEMU_UWP
+    /* Fast path: when nobody holds the BQL, take it without waiting (so the deadlock above cannot happen)
+     * and raise the interrupt at once. Through the main loop it took 0.4 ms on the console, and games
+     * whose GPU stops for a software method on every few draws (Turok: 1300 a second) spent most of
+     * their time waiting for it. */
+    if (!bql_locked() && bql_trylock()) {
+        pgraph_update_irq_bh(d);
+        bql_unlock();
+        return;
+    }
+#endif
     aio_bh_schedule_oneshot(qemu_get_aio_context(), pgraph_update_irq_bh, d);
 }
 
@@ -245,6 +283,10 @@ void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
 
         pg->waiting_for_context_switch = true;
         pg->pending_interrupts |= NV_PGRAPH_INTR_CONTEXT_SWITCH;
+#ifdef XEMU_UWP
+        xemu_uwp_ctxsw_count++;
+        uwp_ctxsw_since = get_clock_realtime();
+#endif
         pgraph_schedule_irq_update(d);
     }
 }
@@ -551,6 +593,7 @@ static const struct {
     static const size_t METHOD_RANGE_END_NAME(gclass, name) = \
         METHOD_ADDR(gclass, name) + 4*stride;
 #include "methods.h.inc"
+
 #undef DEF_METHOD
 #undef DEF_METHOD_RANGE
 #undef DEF_METHOD_CASE_4_OFFSET
@@ -898,6 +941,10 @@ DEF_METHOD(NV097, NO_OPERATION)
     pgraph_reg_w(pg, NV_PGRAPH_NSOURCE,
                  NV_PGRAPH_NSOURCE_NOTIFICATION); /* TODO: check this */
     pg->pending_interrupts |= NV_PGRAPH_INTR_ERROR;
+#ifdef XEMU_UWP
+    xemu_uwp_error_count++;
+    uwp_error_since = get_clock_realtime();
+#endif
     pg->waiting_for_nop = true;
 
     pgraph_schedule_irq_update(d);

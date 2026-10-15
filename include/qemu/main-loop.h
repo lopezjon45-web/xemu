@@ -269,6 +269,9 @@ void rust_bql_mock_lock(void);
  * Please instead refer to qemu_in_main_thread().
  */
 bool bql_locked(void);
+#ifdef XEMU_UWP
+bool bql_trylock(void);
+#endif
 
 /**
  * mutex_is_bql:

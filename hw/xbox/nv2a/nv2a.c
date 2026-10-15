@@ -22,6 +22,10 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "qemu/main-loop.h"
 
+#ifdef XEMU_UWP
+unsigned xemu_uwp_vblank_count; /* testing counter, read by hw/xbox/uwp-eipsampler.c */
+#endif
+
 void nv2a_update_irq(NV2AState *d)
 {
     /* PFIFO */
@@ -207,6 +211,10 @@ static void nv2a_vga_gfx_update(void *opaque)
 
     NV2AState *d = container_of(vga, NV2AState, vga);
     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
+#ifdef XEMU_UWP
+    extern unsigned xemu_uwp_vblank_count;
+    xemu_uwp_vblank_count++;
+#endif
     d->pcrtc.raster = 0;
 
     nv2a_update_irq(d);

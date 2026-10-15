@@ -578,6 +578,15 @@ void bql_lock_impl(const char *file, int line)
     bql_lock_fn(&bql, file, line);
 }
 
+#ifdef XEMU_UWP
+/* Take the BQL only if nobody holds it; never waits (UWP: GPU interrupts raised from the pfifo thread). */
+bool bql_trylock(void)
+{
+    g_assert(!bql_locked());
+    return qemu_mutex_trylock(&bql) == 0;
+}
+#endif
+
 void bql_unlock(void)
 {
     g_assert(bql_locked());

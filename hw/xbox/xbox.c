@@ -309,6 +309,8 @@ void xbox_init_common(MachineState *machine,
 #ifdef XEMU_UWP
     extern void xemu_uwp_dashboard_from_disc(void); /* ui/xemu.c */
     xemu_uwp_dashboard_from_disc();
+    extern void xemu_uwp_eip_sampler_start(void); /* hw/xbox/uwp-eipsampler.c, testing only */
+    xemu_uwp_eip_sampler_start();
 #endif
     // idebus[0] = qdev_get_child_bus(&dev->qdev, "ide.0");
     // idebus[1] = qdev_get_child_bus(&dev->qdev, "ide.1");
