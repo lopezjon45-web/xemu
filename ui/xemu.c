@@ -3111,8 +3111,8 @@ static bool uwp_event_watch(void *userdata, SDL_Event *event)
 /* Game Vault's folder on the games drive, from "home=" in the link (see uwp_home_disk) */
 static char *uwp_home;
 
-/* the frame-rate display: Game Vault sends "fps=1" with each game while it is on */
-bool xemu_uwp_fps_on;
+/* the overlay: the launcher switches it with each game */
+bool xemu_uwp_overlay_on;
 
 /* A link value with the %XX escaping undone and forward slashes (as xemu.toml uses). */
 static char *uwp_unescape(const char *in)
@@ -3139,6 +3139,22 @@ static char *uwp_unescape(const char *in)
     return result;
 }
 
+/*
+ * The test and measuring options of the link (quit, press, crashtest, dash, noflush, skipdraws, state)
+ * are honoured only when test-links.txt lies next to the log (LocalState/xemu/xemu), which only the
+ * console's Device Portal can put there: any app on the console can open an xemu: link, and must not
+ * crash it or press its buttons. A launcher needs disc, home and the return link only.
+ */
+static bool uwp_test_links_allowed(void)
+{
+    char *base = SDL_GetPrefPath("xemu", "xemu");
+    char *file = g_strdup_printf("%stest-links.txt", base ? base : "");
+    bool allowed = g_file_test(file, G_FILE_TEST_EXISTS);
+    g_free(file);
+    SDL_free(base);
+    return allowed;
+}
+
 static char *uwp_take_activation_disc(void)
 {
     const char *hint = SDL_GetHint(UWP_ACTIVATION_HINT);
@@ -3150,11 +3166,19 @@ static char *uwp_take_activation_disc(void)
 
     char *disc = NULL;
     bool fps = false;
+    bool tests = uwp_test_links_allowed(), refused = false;
     char *query = strchr(uri, '?');
     for (char *p = query ? query + 1 : NULL; p && *p;) {
         char *end = strchr(p, '&');
         if (end) {
             *end = '\0';
+        }
+        if (!tests && (!strcmp(p, "quit=1") || !strncmp(p, "state=", 6) || !strncmp(p, "press=", 6) ||
+                       !strcmp(p, "crashtest=1") || !strcmp(p, "dash=0") || !strcmp(p, "noflush=1") ||
+                       !strcmp(p, "skipdraws=1"))) {
+            refused = true;
+            p = end ? end + 1 : NULL;
+            continue;
         }
         if (!strcmp(p, "quit=1")) {
             uwp_quit("asked by link");
@@ -3191,8 +3215,15 @@ static char *uwp_take_activation_disc(void)
             fps = true;
         }
         if (!strncmp(p, "home=", 5)) {
-            g_free(uwp_home);
-            uwp_home = uwp_unescape(p + 5);
+            /* saves are moved into it: only "<drive>:/Game Vault", the folder Game Vault makes */
+            char *home = uwp_unescape(p + 5);
+            if (home && g_ascii_isalpha(home[0]) && !strcmp(home + 1, ":/Game Vault")) {
+                g_free(uwp_home);
+                uwp_home = home;
+            } else {
+                uwp_log("link: home folder refused");
+                g_free(home);
+            }
         }
         if (!strncmp(p, "disc=", 5)) {
             /* undo the %XX escaping; xemu.toml uses forward slashes */
@@ -3217,8 +3248,11 @@ static char *uwp_take_activation_disc(void)
         p = end ? end + 1 : NULL;
     }
     g_free(uri);
+    if (refused) {
+        uwp_log("link: test options ignored (no test-links.txt)");
+    }
     if (disc) {
-        xemu_uwp_fps_on = fps;
+        xemu_uwp_overlay_on = fps;
     }
     if (disc && !disc[0]) {
         g_free(disc);

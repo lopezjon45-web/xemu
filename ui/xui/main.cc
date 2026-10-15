@@ -50,12 +50,12 @@
 #include "welcome.hh"
 #include "menubar.hh"
 
-#if defined(XEMU_UWP) && __has_include("xemu-uwp-testhud.inc")
-/* the frame-rate display */
-#include "xemu-uwp-testhud.inc"
+#if defined(XEMU_UWP) && __has_include("xemu-uwp-overlay.inc")
+/* the overlay */
+#include "xemu-uwp-overlay.inc"
 #define UWP_TEST_HUD 1
 /* shown while Game Vault asks for it (ui/xemu.c) */
-extern "C" bool xemu_uwp_fps_on;
+extern "C" bool xemu_uwp_overlay_on;
 #endif
 #ifdef XEMU_UWP
 extern "C" const char *xemu_uwp_shot_wanted(void);
@@ -240,8 +240,8 @@ void xemu_hud_update(void)
     ProcessKeyboardShortcuts();
 
 #ifdef UWP_TEST_HUD
-    if (xemu_uwp_fps_on) {
-        uwp_test_hud();
+    if (xemu_uwp_overlay_on) {
+        uwp_overlay();
     }
 #endif
 

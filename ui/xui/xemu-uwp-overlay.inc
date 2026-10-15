@@ -1,13 +1,11 @@
 // Copyright (c) 2026 Skitzelles - part of the xemu UWP port, https://github.com/skitzellez/xemu-uwp
 // GPL-2.0-or-later, like xemu.
-// On-screen counter: game FPS against the game's own target (30 or 60),
-// how busy the emulated Xbox CPU and the GPU thread are, the lowest FPS of the last minute, and a
-// one-minute graph. Red = below 75 % of the target, yellow = below 95 %.
+// On-screen overlay with speed and load figures and a one-minute graph, shown when the launcher asks.
 
 extern "C" int xemu_uwp_thread_busy(const char *name, int slot);
 extern "C" void uwp_log(const char *fmt, ...);
 
-static void uwp_test_hud(void)
+static void uwp_overlay(void)
 {
     static float hist[240];            // one sample every 250 ms: one minute
     static int head = 0, filled = 0;
