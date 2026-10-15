@@ -553,6 +553,38 @@ static bool shader_cache_entry_compare(Lru *lru, LruNode *node, const void *key)
 
 #ifdef XEMU_UWP
 static void uwp_warm_start(PGRAPHGLState *r);
+
+/*
+ * The shader caches hold 51200 entries each, so nothing is ever freed. A game that keeps making new shader
+ * variations (Ninja Gaiden: 857 in 100 s of fighting, about 3 MB each in the GL-on-D3D12 driver) used up the
+ * console's 5 GB and crashed, even with old textures being freed. So, at most twice a second: with less than
+ * 1 GB still allowed, the least recently used quarter of the linked programs and of the compiled shader
+ * modules is freed. Called with shader_cache_lock held, after the program for the next draw was picked
+ * (most recently used: never the one freed).
+ */
+static void uwp_shader_cache_trim(PGRAPHGLState *r)
+{
+    static int64_t next_check;
+    int64_t now = g_get_monotonic_time();
+    if (now < next_check) {
+        return;
+    }
+    next_check = now + 500000;
+    uint64_t used, left;
+    if (!xemu_uwp_memory(&used, &left) || left > (1024ull << 20)) {
+        return;
+    }
+    int kept = r->shader_cache.num_used, want = kept / 4, freed = 0;
+    while (freed < want && lru_try_evict_one(&r->shader_cache)) {
+        freed++;
+    }
+    int mkept = r->shader_module_cache.num_used, mwant = mkept / 4, mfreed = 0;
+    while (mfreed < mwant && lru_try_evict_one(&r->shader_module_cache)) {
+        mfreed++;
+    }
+    uwp_log("shader cache: %llu MB in use, %llu MB still allowed: %d of %d programs and %d of %d modules freed",
+            (unsigned long long)(used >> 20), (unsigned long long)(left >> 20), freed, kept, mfreed, mkept);
+}
 #endif
 
 void pgraph_gl_init_shaders(PGRAPHState *pg)
@@ -1436,6 +1468,9 @@ void pgraph_gl_bind_shaders(PGRAPHState *pg)
     assert(binding->initialized);
     r->shader_binding = binding;
     pg->program_data_dirty = false;
+#ifdef XEMU_UWP
+    uwp_shader_cache_trim(r);
+#endif
 
     qemu_mutex_unlock(&r->shader_cache_lock);
 

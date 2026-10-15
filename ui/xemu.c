@@ -64,6 +64,8 @@
 #include "system/blockdev.h"
 #include "xemu-uwp-dash.h"
 #include <signal.h>
+#include <cpuid.h>
+#include <x86intrin.h>
 #include "ui/xemu-notifications.h"
 
 #include <stb_image.h>
@@ -1188,6 +1190,12 @@ static void display_very_early_init(DisplayOptions *o)
         GLint formats = 0;
         glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &formats);
         uwp_log("GL program binary formats: %d (0 = shaders cannot be cached)", formats);
+        const char *rend = (const char *)glGetString(GL_RENDERER);
+        /* the D3D12 adapter's driver name carries the chip's code name */
+        const char *model = rend && strstr(rend, "arden") ? " (Xbox Series X GPU: 52 compute units, 12 TFLOPS)"
+                          : rend && strstr(rend, "lockhart") ? " (Xbox Series S GPU: 20 compute units, 4 TFLOPS)" : "";
+        uwp_log("GPU: %s | %s%s | OpenGL %s", (const char *)glGetString(GL_VENDOR), rend ? rend : "?", model,
+                (const char *)glGetString(GL_VERSION));
     }
 #endif
 
@@ -1914,6 +1922,7 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
  */
 static void uwp_session_summary(const char *how);
 static void uwp_event(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+static const char *uwp_version_text(void);
 
 static void uwp_quit(const char *why)
 {
@@ -2243,7 +2252,10 @@ static void uwp_box_sample(void)
             const typeof(g_nv2a_stats.frame_history[0]) *f =
                 &g_nv2a_stats.frame_history[(g_nv2a_stats.frame_ptr + NV2A_PROF_NUM_FRAMES - 1 - i) %
                                             NV2A_PROF_NUM_FRAMES];
-            slowest = f->mspf > slowest ? f->mspf : slowest;
+            /* the very first frame counts from no previous frame at all: not a real frame time */
+            if (f->mspf < 60000) {
+                slowest = f->mspf > slowest ? f->mspf : slowest;
+            }
             late += f->mspf > 34;
             draws += f->counters[NV2A_PROF_BEGIN_ENDS];
             shaders += f->counters[NV2A_PROF_SHADER_GEN];
@@ -2696,14 +2708,22 @@ static void uwp_event(const char *fmt, ...)
     uwp_shot_request(label);
 }
 
-/* what held the speed back, from how busy the two threads were */
+/*
+ * What held the speed back, from how busy the two threads were (percent of one processor core). The
+ * emulated CPU thread runs the game's code without pause; below 100 % it was not given the core all the
+ * time (other xemu threads, the console), so 40 % and more already means the game's CPU work was the limit.
+ */
 static const char *uwp_limit_words(int vcpu, int gpu)
 {
     if (gpu >= 85) {
         return "the graphics thread";
     }
-    if (vcpu >= 92) {
+    if (vcpu >= 75) {
         return "the emulated CPU (the game's own work)";
+    }
+    if (vcpu >= 40 && gpu < 20) {
+        return "the emulated CPU, which only got part of a processor core (waiting on the frame hand-off or "
+               "other xemu threads)";
     }
     return "neither thread (the game was waiting: timing, loading, or itself)";
 }
@@ -2842,18 +2862,40 @@ static void uwp_session_sample(int fps)
     }
 }
 
+/* the session's start on a clock SDL cannot reset (SDL_Quit restarts SDL_GetTicks before atexit runs) */
+static uint64_t uwp_session_start_tick;
+
+static void uwp_session_summary_print(const char *how);
+
 static void uwp_session_summary(const char *how)
 {
     if (uwp_session.written) {
         return;
     }
     uwp_session.written = true;
-    int secs = (int)((SDL_GetTicks() - uwp_session_start_ms) / 1000);
+    uwp_session_summary_print(how);
+}
+
+/*
+ * When xemu goes to the background the console may close it without any warning, so a summary of the
+ * session so far is written then too (the session is not marked as summed up: the real end still writes one).
+ */
+static void uwp_session_summary_so_far(void)
+{
+    if (!uwp_session.written && uwp_session_start_tick) {
+        uwp_session_summary_print("not ended yet: xemu went to the background (if the console closes it there, "
+                                  "this is the last summary)");
+    }
+}
+
+static void uwp_session_summary_print(const char *how)
+{
+    int secs = uwp_session_start_tick ? (int)((GetTickCount64() - uwp_session_start_tick) / 1000) : 0;
     const char *disc = g_config.sys.files.dvd_path && g_config.sys.files.dvd_path[0]
                            ? g_config.sys.files.dvd_path : "(no disc)";
     uwp_log("===== SUMMARY =====");
     uwp_log("Game: %s", disc);
-    uwp_log("Emulator: xemu for Dev Mode %s", xemu_version);
+    uwp_log("Emulator: xemu for Dev Mode %s", uwp_version_text());
     uwp_log("Played: %d min %d s", secs / 60, secs % 60);
     if (uwp_session.samples) {
         uwp_log("Speed: average %.0f fps, lowest %d fps (at %d:%02d into the session)",
@@ -2989,6 +3031,89 @@ void xemu_uwp_dashboard_from_disc(void)
     }
 }
 
+/* the package version (Major.Minor.Build.Revision); xemu_version is not set in this build */
+static const char *uwp_version_text(void)
+{
+    static char text[32];
+    if (text[0]) {
+        return text;
+    }
+    typedef struct {
+        UINT32 reserved, arch;
+        UINT16 revision, build, minor, major;
+        PWSTR name, publisher, resource, publisher_id;
+    } UwpPackageId;
+    typedef LONG (WINAPI *GetCurrentPackageId_fn)(UINT32 *, BYTE *);
+    GetCurrentPackageId_fn fn = (GetCurrentPackageId_fn)xemu_uwp_kernelbase_proc("GetCurrentPackageId");
+    union { UwpPackageId id; BYTE raw[1024]; } buf;
+    UINT32 len = sizeof(buf);
+    if (fn && fn(&len, buf.raw) == 0) {
+        snprintf(text, sizeof(text), "%u.%u.%u.%u", buf.id.major, buf.id.minor, buf.id.build, buf.id.revision);
+    } else {
+        snprintf(text, sizeof(text), "%s", xemu_version);
+    }
+    return text;
+}
+
+/*
+ * What the console gives xemu, once at start: CPU name (CPUID) and clock (the time-stamp counter measured
+ * against the performance counter for 100 ms), processors xemu may use, memory, Windows build. The GPU line
+ * comes from the GL context ("GPU: ..."). Temperatures and GPU clocks are not readable by apps on the Xbox.
+ */
+static void uwp_log_hardware(void)
+{
+    char brand[49] = "";
+    unsigned int r[4];
+    __get_cpuid(0x80000000, &r[0], &r[1], &r[2], &r[3]);
+    if (r[0] >= 0x80000004) {
+        for (unsigned int i = 0; i < 3; i++) {
+            __get_cpuid(0x80000002 + i, &r[0], &r[1], &r[2], &r[3]);
+            memcpy(brand + i * 16, r, 16);
+        }
+    }
+    char *b = brand;
+    while (*b == ' ') {
+        b++;
+    }
+    LARGE_INTEGER f, q0, q1;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&q0);
+    uint64_t t0 = __rdtsc();
+    Sleep(100);
+    uint64_t t1 = __rdtsc();
+    QueryPerformanceCounter(&q1);
+    double mhz = (double)(t1 - t0) / ((double)(q1.QuadPart - q0.QuadPart) / f.QuadPart) / 1e6;
+    SYSTEM_INFO si;
+    GetNativeSystemInfo(&si);
+    MEMORYSTATUSEX ms = { .dwLength = sizeof(ms) };
+    typedef BOOL (WINAPI *GlobalMemoryStatusEx_fn)(LPMEMORYSTATUSEX);
+    GlobalMemoryStatusEx_fn mem = (GlobalMemoryStatusEx_fn)xemu_uwp_kernelbase_proc("GlobalMemoryStatusEx");
+    bool have_mem = mem && mem(&ms);
+    typedef LONG (WINAPI *RtlGetVersion_fn)(OSVERSIONINFOW *);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    RtlGetVersion_fn ver = ntdll ? (RtlGetVersion_fn)GetProcAddress(ntdll, "RtlGetVersion") : NULL;
+    OSVERSIONINFOW os = { .dwOSVersionInfoSize = sizeof(os) };
+    bool have_os = ver && ver(&os) == 0;
+    uwp_log("xemu for Dev Mode %s", uwp_version_text());
+    /* the time-stamp counter ticks at a fixed rate, not the core clock: the clock comes from the model */
+    const char *clock = strstr(b, "Series X") ? "8 AMD Zen 2 cores at up to 3.8 GHz (3.66 GHz with SMT)"
+                        : strstr(b, "Series S") ? "8 AMD Zen 2 cores at up to 3.6 GHz (3.4 GHz with SMT)"
+                                                : "clock not known for this model";
+    uwp_log("CPU: %s: %s; %lu logical processors visible to xemu (time-stamp counter %.0f MHz)",
+            b[0] ? b : "(unknown)", clock, (unsigned long)si.dwNumberOfProcessors, mhz);
+    if (have_mem) {
+        uwp_log("memory the console gives games: %llu MB in all, %llu MB free", (unsigned long long)(ms.ullTotalPhys >> 20),
+                (unsigned long long)(ms.ullAvailPhys >> 20));
+    }
+    if (have_os) {
+        uwp_log("Windows build %lu.%lu.%lu", (unsigned long)os.dwMajorVersion, (unsigned long)os.dwMinorVersion,
+                (unsigned long)os.dwBuildNumber);
+    }
+    uwp_log("settings: render scale %d, vsync %s", g_config.display.quality.surface_scale,
+            g_config.display.window.vsync ? "on" : "off");
+    uwp_log("not readable by apps on the Xbox: temperatures, GPU clock, fan speed");
+}
+
 static void uwp_log_memory(void)
 {
     typedef struct {
@@ -3077,6 +3202,8 @@ static bool uwp_event_watch(void *userdata, SDL_Event *event)
         uwp_event("went to the background (Xbox button, Home screen or another app); the console may pause or "
                   "close xemu now");
         uwp_save_for_background();
+        uwp_session_summary_so_far();
+        fflush(NULL);
         break;
     case SDL_EVENT_DID_ENTER_FOREGROUND: {
         uint64_t since = uwp_background_since_ms(false, true);
@@ -4079,6 +4206,7 @@ int main(int argc, char **argv)
     signal(SIGABRT, uwp_on_abort);
     SetUnhandledExceptionFilter(uwp_on_crash);
     uwp_session_start_ms = SDL_GetTicks();
+    uwp_session_start_tick = GetTickCount64();
     {
         int w = 0, h = 0;
         SDL_GetWindowSizeInPixels(scon->real_window, &w, &h);
@@ -4087,6 +4215,7 @@ int main(int argc, char **argv)
     atexit(uwp_on_exit);
     g_set_printerr_handler(uwp_glib_print);
     uwp_log_memory();
+    uwp_log_hardware();
     SDL_AddEventWatch(uwp_event_watch, NULL);
     UWP_PROF_THREAD("ui");
     CloseHandle(CreateThread(NULL, 0, uwp_sampler_thread, (void *)"vcpu", 0,
@@ -4164,6 +4293,11 @@ int main(int argc, char **argv)
         }
 #endif
     }
+#ifdef XEMU_UWP
+    /* every way out (xemu's own menu, the console, a link) passes here: the summary before anything else */
+    uwp_session_summary("quit normally");
+    fflush(NULL);
+#endif
     qemu_sem_post(&display_shutdown_sem);
     qemu_thread_join(&thread);
     display_finalize();
