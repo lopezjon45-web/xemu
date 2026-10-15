@@ -2207,17 +2207,95 @@ static bool uwp_memory(uint64_t *used, uint64_t *left)
     return true;
 }
 
+bool xemu_uwp_memory(uint64_t *used, uint64_t *left)
+{
+    return uwp_memory(used, left);
+}
+
 static void uwp_box_sample(void)
 {
     {
+        /*
+         * One line a second, everything that says how the game ran:
+         * speed and stutter (the slowest frame, frames over 34 ms), the emulated Xbox CPU and the
+         * graphics thread, all of xemu and the whole console's CPU, memory, what the graphics did
+         * (objects drawn per frame, shaders built: the usual cause of stutter, textures loaded),
+         * how long the graphics waited on the console's GPU, disc reading (loading), the sound,
+         * and the buttons held.
+         */
+        static unsigned last_frames, last_dvd, last_dry;
+        static int64_t last_sync;
+        static uint64_t last_app, last_wall, last_sys_busy, last_sys_all;
         unsigned at = (unsigned)((SDL_GetTicks() - uwp_session_start_ms) / 1000);
         uint64_t u = 0, l = 0;
         uwp_memory(&u, &l);
         extern char uwp_held_now_for_sec[];
-        uwp_log("SEC %u:%02u %d fps, CPU %d%%, graphics %d%%, memory %llu/%llu MB, holding: %s", at / 60, at % 60,
-                g_nv2a_stats.increment_fps, xemu_uwp_thread_busy("vcpu", 5), xemu_uwp_thread_busy("pfifo", 5),
-                (unsigned long long)(u >> 20), (unsigned long long)((u + l) >> 20),
+        extern volatile unsigned xemu_uwp_audio_dry;
+        /* frames since the last line */
+        unsigned fc = g_nv2a_stats.frame_count, n = fc - last_frames;
+        last_frames = fc;
+        if (n > NV2A_PROF_NUM_FRAMES) {
+            n = NV2A_PROF_NUM_FRAMES;
+        }
+        int slowest = 0, late = 0;
+        long draws = 0, shaders = 0, textures = 0;
+        for (unsigned i = 0; i < n; i++) {
+            const typeof(g_nv2a_stats.frame_history[0]) *f =
+                &g_nv2a_stats.frame_history[(g_nv2a_stats.frame_ptr + NV2A_PROF_NUM_FRAMES - 1 - i) %
+                                            NV2A_PROF_NUM_FRAMES];
+            slowest = f->mspf > slowest ? f->mspf : slowest;
+            late += f->mspf > 34;
+            draws += f->counters[NV2A_PROF_BEGIN_ENDS];
+            shaders += f->counters[NV2A_PROF_SHADER_GEN];
+            textures += f->counters[NV2A_PROF_TEX_UPLOAD];
+        }
+        /* CPU: all of xemu (as cores' worth) and the whole console */
+        FILETIME c, e, k, us, now;
+        GetSystemTimeAsFileTime(&now);
+        uint64_t wall = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime, app = 0;
+        if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &us)) {
+            app = (((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) +
+                  (((uint64_t)us.dwHighDateTime << 32) | us.dwLowDateTime);
+        }
+        double app_cores = last_wall && wall > last_wall ? (double)(app - last_app) / (wall - last_wall) : 0;
+        char console[48] = "";
+        typedef BOOL (WINAPI *GetSystemTimes_fn)(LPFILETIME, LPFILETIME, LPFILETIME);
+        GetSystemTimes_fn st = (GetSystemTimes_fn)xemu_uwp_kernelbase_proc("GetSystemTimes");
+        FILETIME idle, kern, user;
+        if (st && st(&idle, &kern, &user)) {
+            uint64_t i64 = ((uint64_t)idle.dwHighDateTime << 32) | idle.dwLowDateTime;
+            uint64_t all = (((uint64_t)kern.dwHighDateTime << 32) | kern.dwLowDateTime) +
+                           (((uint64_t)user.dwHighDateTime << 32) | user.dwLowDateTime);
+            uint64_t busy = all - i64;
+            if (last_sys_all && all > last_sys_all) {
+                snprintf(console, sizeof(console), ", whole console %d%%",
+                         (int)((busy - last_sys_busy) * 100 / (all - last_sys_all)));
+            }
+            last_sys_busy = busy;
+            last_sys_all = all;
+        }
+        /* the graphics thread waiting for the console's GPU to finish (the GPU is the limit when this is high) */
+        LARGE_INTEGER freq;
+        QueryPerformanceFrequency(&freq);
+        int64_t sync = uwp_prof_ticks[UWP_PROF_PF_SYNC];
+        int gpu_wait = last_wall && wall > last_wall
+                           ? (int)((sync - last_sync) * 100.0 / freq.QuadPart / ((wall - last_wall) / 1e7)) : 0;
+        last_sync = sync;
+        unsigned dvd = uwp_prof_calls[UWP_PROF_DVD_READ], dry = xemu_uwp_audio_dry;
+        double disc_mb = (dvd - last_dvd) * 2048.0 / (1 << 20);
+        uwp_log("SEC %u:%02u | %d fps, slowest frame %d ms, %d frames over 34 ms | CPU: game %d%%, graphics %d%%, "
+                "xemu %.1f cores%s | memory %llu of %llu MB | per frame: %ld objects drawn; this second: %ld shaders "
+                "built, %ld textures loaded | waiting on the GPU %d%% | disc %.1f MB/s | sound %s | holding: %s",
+                at / 60, at % 60, g_nv2a_stats.increment_fps, slowest, late, xemu_uwp_thread_busy("vcpu", 5),
+                xemu_uwp_thread_busy("pfifo", 5), app_cores, console, (unsigned long long)(u >> 20),
+                (unsigned long long)((u + l) >> 20), n ? draws / (long)n : 0, shaders, textures,
+                gpu_wait > 100 ? 100 : gpu_wait, disc_mb,
+                dry != last_dry ? "RAN DRY (the game could not make sound fast enough)" : "ok",
                 uwp_held_now_for_sec[0] ? uwp_held_now_for_sec : "no buttons");
+        last_dvd = dvd;
+        last_dry = dry;
+        last_app = app;
+        last_wall = wall;
     }
     struct uwp_box_sample *b = &uwp_box[uwp_box_count % UWP_BOX_SECONDS];
     uint64_t used = 0, left = 0;

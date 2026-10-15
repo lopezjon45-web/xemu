@@ -30,6 +30,9 @@
 
 static TextureBinding* generate_texture(const TextureShape s, const uint8_t *texture_data, const uint8_t *palette_data);
 static void texture_binding_destroy(gpointer data);
+#ifdef XEMU_UWP
+static void uwp_texture_cache_trim(PGRAPHGLState *r);
+#endif
 
 struct pgraph_texture_possibly_dirty_struct {
     hwaddr addr, end;
@@ -442,6 +445,9 @@ void pgraph_gl_bind_textures(NV2AState *d)
             key.palette_length = palette_length;
         }
 
+#ifdef XEMU_UWP
+        uwp_texture_cache_trim(r);
+#endif
         // Search for existing texture binding in cache
         uint64_t tex_binding_hash = fast_hash((uint8_t*)&key, sizeof(key));
         LruNode *found = lru_lookup(&r->texture_cache,
@@ -971,6 +977,34 @@ static void texture_binding_destroy(gpointer data)
         g_free(binding);
     }
 }
+
+#ifdef XEMU_UWP
+/*
+ * The cache holds up to 4096 textures and frees one only when it is full. A game with many big textures
+ * (Ninja Gaiden: 557 kept after 80 s of play, about 5 MB each, almost none freed) used up all of the
+ * console's 5 GB that way and crashed. So, at most twice a second: with less than 1 GB still allowed, the
+ * least recently used quarter of the cache is freed. A texture that is bound keeps its own reference.
+ */
+static void uwp_texture_cache_trim(PGRAPHGLState *r)
+{
+    static int64_t next_check;
+    int64_t now = g_get_monotonic_time();
+    if (now < next_check) {
+        return;
+    }
+    next_check = now + 500000;
+    uint64_t used, left;
+    if (!xemu_uwp_memory(&used, &left) || left > (1024ull << 20)) {
+        return;
+    }
+    int kept = r->texture_cache.num_used, want = kept / 4, freed = 0;
+    while (freed < want && lru_try_evict_one(&r->texture_cache)) {
+        freed++;
+    }
+    uwp_log("texture cache: %llu MB in use, %llu MB still allowed: %d of %d textures freed",
+            (unsigned long long)(used >> 20), (unsigned long long)(left >> 20), freed, kept);
+}
+#endif
 
 /* functions for texture LRU cache */
 static void texture_cache_entry_init(Lru *lru, LruNode *node, const void *key)

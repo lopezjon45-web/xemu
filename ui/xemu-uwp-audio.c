@@ -27,6 +27,8 @@ void uwp_log(const char *fmt, ...);
 typedef HRESULT (WINAPI *XAudio2Create_fn)(IXAudio2 **, UINT32, XAUDIO2_PROCESSOR);
 
 static SDL_AudioStream *stream;
+/* for the log (ui/xemu.c): times the sound output ran dry, i.e. the game did not make sound fast enough */
+volatile unsigned xemu_uwp_audio_dry;
 static IXAudio2SourceVoice *voice;
 static Uint8 buffers[NUM_BUFFERS][CHUNK_FRAMES * FRAME_BYTES];
 
@@ -46,6 +48,11 @@ static DWORD WINAPI feeder_thread(LPVOID unused)
             next_report += 2000;
         }
         int avail = SDL_GetAudioStreamAvailable(stream);
+        static UINT32 last_queued = 1;
+        if (state.BuffersQueued == 0 && last_queued != 0 && state.SamplesPlayed) {
+            xemu_uwp_audio_dry++;
+        }
+        last_queued = state.BuffersQueued;
         if (state.BuffersQueued >= MAX_QUEUED || avail < FRAME_BYTES) {
             SDL_Delay(2);
             continue;
