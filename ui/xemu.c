@@ -70,6 +70,7 @@
 
 #include <stb_image.h>
 #include <locale.h>
+#include <glib/gstdio.h>
 #include <math.h>
 #include <SDL3/SDL.h>
 
