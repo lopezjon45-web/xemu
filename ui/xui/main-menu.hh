@@ -170,6 +170,14 @@ protected:
     EasingAnimation                 m_animation;
     bool                            m_focus_view;
     bool                            m_had_focus_last_frame;
+#ifdef XEMU_UWP
+    // controller: which side has the focus, and moves between the tab list and the settings
+    bool                            m_tab_focused = false;
+    bool                            m_tab_focused_before = false;   // the frame before: ImGui moves the focus on B itself
+    bool                            m_focus_tab = false;
+    int                             m_focus_view_tries = 0;
+    int                             m_focus_view_frames = 0;
+#endif
     int                             m_current_view_index;
     int                             m_next_view_index;
     BackgroundGradient              m_background;

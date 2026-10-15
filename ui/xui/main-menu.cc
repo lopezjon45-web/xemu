@@ -1772,6 +1772,9 @@ void MainMenuScene::SetNextViewIndexWithFocus(int i)
 
 void MainMenuScene::Show()
 {
+#ifdef XEMU_UWP
+    m_focus_tab = true;   /* the controller starts on the current tab */
+#endif
     m_background.Show();
     m_nav_control_view.Show();
     m_animation.EaseIn();
@@ -1806,12 +1809,33 @@ void MainMenuScene::HandleInput()
     // XXX: Ensure we have focus for two frames. If a user cancels a popup
     // window, we do not want to cancel main
     //      window as well.
+#ifdef XEMU_UWP
+    /* Controller (UWP): Right or A on a tab goes into its settings, B in the settings goes back to the tabs,
+     * B on the tabs closes. ImGui's own moves between the two halves did not work on the console. */
+    if (focus && m_had_focus_last_frame && !m_tab_focused_before && !m_focus_view &&
+        ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) {
+        m_focus_tab = true;
+        m_had_focus_last_frame = focus;
+        return;
+    }
+    if (focus && m_had_focus_last_frame && m_tab_focused &&
+        ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight, false)) {
+        m_focus_view = true;
+    }
+    if (nofocus || (focus && m_had_focus_last_frame &&
+                    ((m_tab_focused_before && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) ||
+                     ImGui::IsKeyDown(ImGuiKey_Escape)))) {
+        Hide();
+        return;
+    }
+#else
     if (nofocus || (focus && m_had_focus_last_frame &&
                     (ImGui::IsKeyDown(ImGuiKey_GamepadFaceRight) ||
                      ImGui::IsKeyDown(ImGuiKey_Escape)))) {
         Hide();
         return;
     }
+#endif
 
     if (focus && m_had_focus_last_frame) {
         if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1)) {
@@ -1841,6 +1865,24 @@ bool MainMenuScene::IsInputRebinding()
 {
     return m_input_view.IsInputRebinding();
 }
+
+#ifdef XEMU_UWP
+/* Move the controller focus to the next item drawn in this window, shown with its outline. Unlike
+ * ImGui::SetKeyboardFocusHere() it does not activate the item: that put sliders (the volume) into
+ * type-a-number mode, would flip a switch, and hid the outline. */
+static void FocusNextItemWithoutActivating()
+{
+    ImGuiContext &g = *GImGui;
+    ImGuiWindow *window = g.CurrentWindow;
+    ImGui::SetNavWindow(window);
+    ImGui::NavMoveRequestSubmit(ImGuiDir_None, ImGuiDir_Down,
+                                ImGuiNavMoveFlags_IsTabbing | ImGuiNavMoveFlags_FocusApi |
+                                    ImGuiNavMoveFlags_NoSelect,
+                                ImGuiScrollFlags_KeepVisibleEdgeX | ImGuiScrollFlags_KeepVisibleEdgeY);
+    g.NavTabbingDir = 1;
+    g.NavTabbingCounter = 1;
+}
+#endif
 
 bool MainMenuScene::Draw()
 {
@@ -1880,8 +1922,14 @@ bool MainMenuScene::Draw()
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(26, 26, 26, 255));
 
+#ifdef XEMU_UWP
+        /* UWP: the tab list and the settings are separate for the D-pad (moves between them: HandleInput);
+         * flattened, Up from a setting jumped to the tab list and the volume slider could not be reached */
+        ImGui::BeginChild("###MainWindowNav", ImVec2(nav_width, -1), true, 0);
+#else
         ImGui::BeginChild("###MainWindowNav", ImVec2(nav_width, -1), true,
                           ImGuiWindowFlags_NavFlattened);
+#endif
 
         bool move_focus_to_tab = false;
         if (m_current_view_index != m_next_view_index) {
@@ -1891,20 +1939,43 @@ bool MainMenuScene::Draw()
             }
         }
 
+#ifdef XEMU_UWP
+        if (m_focus_tab) {
+            move_focus_to_tab = true;
+            m_focus_tab = false;
+        }
+        bool tab_focused = false;
+#endif
         int i = 0;
         for (auto &button : m_tabs) {
             if (move_focus_to_tab && i == m_current_view_index) {
+#ifdef XEMU_UWP
+                FocusNextItemWithoutActivating();
+#else
                 ImGui::SetKeyboardFocusHere();
+#endif
                 move_focus_to_tab = false;
             }
             if (button->Draw(i == m_current_view_index)) {
                 SetNextViewIndex(i);
+#ifdef XEMU_UWP
+                m_focus_view = true;   /* A on a tab: into its settings */
+#endif
             }
+#ifdef XEMU_UWP
+            if (ImGui::IsItemFocused()) {
+                tab_focused = true;
+            }
+#endif
             if (i == m_current_view_index) {
                 ImGui::SetItemDefaultFocus();
             }
             i++;
         }
+#ifdef XEMU_UWP
+        m_tab_focused_before = m_tab_focused;
+        m_tab_focused = tab_focused;
+#endif
         ImGui::EndChild();
         ImGui::PopStyleColor();
 
@@ -1921,8 +1992,12 @@ bool MainMenuScene::Draw()
         ImGui::PushID(m_current_view_index);
         ImGui::BeginChild("###MainWindowContent", ImVec2(content_width, -1),
                           true,
+#ifdef XEMU_UWP
+                          ImGuiWindowFlags_AlwaysUseWindowPadding);
+#else
                           ImGuiWindowFlags_AlwaysUseWindowPadding |
                               ImGuiWindowFlags_NavFlattened);
+#endif
 
         if (!g_input_mgr.IsNavigatingWithController()) {
             // Close button
@@ -1943,10 +2018,28 @@ bool MainMenuScene::Draw()
         }
 
         ImGui::PushFont(g_font_mgr.m_default_font);
+#ifdef XEMU_UWP
+        /* a request made while the window fades in or a tab changes is overruled by ImGui's own first focus
+         * (the tab): wait until the window has faded in and the tab list has had the focus for 10 frames, then move it, as
+         * D-pad Right does (4 s at most) */
+        if (m_focus_view) {
+            if (m_tab_focused && !m_animation.IsAnimating() && ++m_focus_view_tries > 10) {
+                FocusNextItemWithoutActivating();
+                m_focus_view = false;
+                m_focus_view_tries = 0;
+                m_focus_view_frames = 0;
+            } else if (m_focus_view_tries >= 120 || ++m_focus_view_frames >= 240) {
+                m_focus_view = false;
+                m_focus_view_tries = 0;
+                m_focus_view_frames = 0;
+            }
+        }
+#else
         if (m_focus_view) {
             ImGui::SetKeyboardFocusHere();
             m_focus_view = false;
         }
+#endif
         m_views[m_current_view_index]->Draw();
 
         ImGui::PopFont();

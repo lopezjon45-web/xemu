@@ -253,7 +253,13 @@ void Slider(const char *str_id, float *v, const char *description)
     ImGui::SetCursorPos(ImVec2(wpos.x + size.x - slider_size.x - style.FramePadding.x,
                                wpos.y));
 
+#ifdef XEMU_UWP
+    /* ImGui 1.91 leaves invisible buttons out of D-pad navigation unless asked: without this the
+     * volume slider could not be reached with a controller */
+    ImGui::InvisibleButton("###slider", slider_size, ImGuiButtonFlags_EnableNav);
+#else
     ImGui::InvisibleButton("###slider", slider_size, 0);
+#endif
 
 
     if (ImGui::IsItemHovered()) {
