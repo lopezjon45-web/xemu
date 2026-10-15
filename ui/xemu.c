@@ -3112,6 +3112,37 @@ static void uwp_log_hardware(void)
     uwp_log("settings: render scale %d, vsync %s", g_config.display.quality.surface_scale,
             g_config.display.window.vsync ? "on" : "off");
     uwp_log("not readable by apps on the Xbox: temperatures, GPU clock, fan speed");
+    /* Mesa's shader disk cache (MESA_SHADER_CACHE_DIR, set in main): how much a session can reuse */
+    const char *cache = getenv("MESA_SHADER_CACHE_DIR");
+    if (cache) {
+        unsigned files = 0;
+        uint64_t bytes = 0;
+        GQueue dirs = G_QUEUE_INIT;
+        g_queue_push_tail(&dirs, g_strdup(cache));
+        char *dir;
+        while ((dir = g_queue_pop_head(&dirs))) {
+            GDir *d = g_dir_open(dir, 0, NULL);
+            const char *name;
+            while (d && (name = g_dir_read_name(d))) {
+                char *path = g_build_filename(dir, name, NULL);
+                GStatBuf st;
+                if (g_file_test(path, G_FILE_TEST_IS_DIR)) {
+                    g_queue_push_tail(&dirs, path);
+                    continue;
+                }
+                if (g_stat(path, &st) == 0) {
+                    files++;
+                    bytes += (uint64_t)st.st_size;
+                }
+                g_free(path);
+            }
+            if (d) {
+                g_dir_close(d);
+            }
+            g_free(dir);
+        }
+        uwp_log("shader disk cache: %u files, %llu MB in %s", files, (unsigned long long)(bytes >> 20), cache);
+    }
 }
 
 static void uwp_log_memory(void)
@@ -4031,6 +4062,16 @@ int main(int argc, char **argv)
             setvbuf(stdout, NULL, _IONBF, 0);
             setvbuf(stderr, NULL, _IONBF, 0);
             g_free(log_path);
+            /*
+             * Mesa's shader cache (a Mesa build with the D3D12 DXIL / pipeline disk cache): shaders built in
+             * one session load from disk in the next instead of pausing the game. Set before the GL driver
+             * loads; both the C runtime's and Windows' copies of the environment.
+             */
+            char *cache = g_strdup_printf("%smesa_shader_cache", base);
+            g_mkdir_with_parents(cache, 0755);
+            _putenv_s("MESA_SHADER_CACHE_DIR", cache);
+            SetEnvironmentVariableA("MESA_SHADER_CACHE_DIR", cache);
+            g_free(cache);
             SDL_free(base);
         }
     }
