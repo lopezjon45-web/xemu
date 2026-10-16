@@ -467,7 +467,9 @@ void *pfifo_thread(void *arg)
     while (true) {
         d->pfifo.fifo_kick = false;
 
+        UWP_PROF_BEGIN(t_pend);
         pgraph_process_pending(d);
+        UWP_PROF_END(PF_PENDING, t_pend);
 
         if (!d->pfifo.halt) {
             UWP_PROF_BEGIN(t_push);
@@ -475,7 +477,36 @@ void *pfifo_thread(void *arg)
             UWP_PROF_END(PF_PUSHER, t_push);
         }
 
+        UWP_PROF_BEGIN(t_rep);
+#ifdef XEMU_UWP
+        /* Reading occlusion query results waits for the GPU (a full sync on GL-on-D3D12); with
+         * pfifo.lock held every guest PGRAPH write queued behind it (Turok: a third of the time).
+         * Only this thread touches the report queue and its GL context, so wait without the lock,
+         * as the puller does around pgraph_method; a kick meanwhile sets fifo_kick, checked below. */
+        extern bool xemu_uwp_reports_nowait, xemu_uwp_reports_left;   /* gl/reports.c */
+        qemu_mutex_unlock(&d->pfifo.lock);
+        xemu_uwp_reports_nowait = true;
         pgraph_process_pending_reports(d);
+        /* nothing else to do: wait for the rest of the results before going idle, in short steps
+         * that end as soon as the guest kicks the FIFO (it may be acknowledging a software method
+         * the GPU stopped at); after 2 ms an ordinary wait */
+        int64_t until = get_clock_realtime() + 2000000;
+        while (xemu_uwp_reports_left && !qatomic_read(&d->pfifo.fifo_kick)) {
+            if (get_clock_realtime() > until) {
+                xemu_uwp_reports_nowait = false;
+                pgraph_process_pending_reports(d);
+                break;
+            }
+            for (int i = 0; i < 500; i++) {
+                __builtin_ia32_pause();
+            }
+            pgraph_process_pending_reports(d);
+        }
+        qemu_mutex_lock(&d->pfifo.lock);
+#else
+        pgraph_process_pending_reports(d);
+#endif
+        UWP_PROF_END(PF_REPORTS, t_rep);
 
         if (!d->pfifo.fifo_kick) {
             qemu_cond_broadcast(&d->pfifo.fifo_idle_cond);

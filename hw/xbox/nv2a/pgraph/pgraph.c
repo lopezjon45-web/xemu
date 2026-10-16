@@ -48,6 +48,30 @@ uint64_t xemu_uwp_error_bh_ns; /* GPU stop -> interrupt raised to the CPU (main 
 
 NV2AState *g_nv2a;
 
+#ifdef XEMU_UWP
+/* NV_PGRAPH_SURFACE is changed by the FIFO thread (flip methods, under pg->lock) and by the guest's
+ * NV_PGRAPH_INCREMENT write (without pg->lock, see pgraph_write): every change is a compare-and-swap so
+ * neither loses the other's. increment: field + 1 modulo MODULO_3D, else field = value. */
+static void uwp_surface_set(PGRAPHState *pg, uint32_t mask, bool increment, uint32_t value)
+{
+    uint32_t *reg = &pg->regs_[NV_PGRAPH_SURFACE];
+    uint32_t old = qatomic_read(reg);
+    for (;;) {
+        uint32_t nv = old, v = value;
+        if (increment) {
+            uint32_t mod = GET_MASK(old, NV_PGRAPH_SURFACE_MODULO_3D);
+            v = mod ? (GET_MASK(old, mask) + 1) % mod : 0;
+        }
+        SET_MASK(nv, mask, v);
+        uint32_t seen = qatomic_cmpxchg(reg, old, nv);
+        if (seen == old) {
+            return;
+        }
+        old = seen;
+    }
+}
+#endif
+
 uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
@@ -74,6 +98,39 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
         nv2a_reg_log_read(NV_PGRAPH, addr, size, fr);
         return fr;
     }
+
+#ifdef XEMU_UWP
+    /*
+     * The registers the guest's PGRAPH interrupt handler reads, served without pg->lock (the idea of
+     * Mainkill1/xemu PR #271). The FIFO thread holds pg->lock for whole draws, shader builds and GPU
+     * waits, and the handler's reads queued behind it with the BQL held: 2-5 ms a frame, and games
+     * that stop the GPU for a software method every few draws (Turok) spent most of their time
+     * there. The trap registers are written before the interrupt bit is set with a full barrier
+     * (pgraph_method_trap), so a handler that sees the bit sees them; otherwise a read may be a
+     * moment stale, as a CPU reading a busy GPU's registers would see.
+     */
+    if (size == 4 && !(addr & 3)) {
+        switch (addr) {
+        case NV_PGRAPH_INTR:
+        case NV_PGRAPH_INTR_EN: {
+            uint64_t fr = addr == NV_PGRAPH_INTR ? qatomic_read(&pg->pending_interrupts)
+                                                 : qatomic_read(&pg->enabled_interrupts);
+            nv2a_reg_log_read(NV_PGRAPH, addr, size, fr);
+            return fr;
+        }
+        case NV_PGRAPH_RDI_DATA:
+            break;   /* reading it moves the RDI index on: under the lock below */
+        default: {
+            /* every other register read is a plain stored word, e.g. the status register at 0x700 that
+             * the D3D handler polls until the GPU is idle (Turok: thousands of times a second) */
+            smp_rmb();
+            uint64_t fr = qatomic_read(&pg->regs_[addr]);
+            nv2a_reg_log_read(NV_PGRAPH, addr, size, fr);
+            return fr;
+        }
+        }
+    }
+#endif
 
     UWP_PROF_BEGIN(t_lock);
     qemu_mutex_lock(&pg->lock);
@@ -120,6 +177,70 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     PGRAPHState *pg = &d->pgraph;
 
     nv2a_reg_log_write(NV_PGRAPH, addr, size, val);
+
+#ifdef XEMU_UWP
+    /* The handler's writes without pg->lock too (see pgraph_read); pfifo.lock still orders them with
+     * the FIFO thread's stall checks and wake-up. */
+    if (addr == NV_PGRAPH_INTR || addr == NV_PGRAPH_INTR_EN || addr == NV_PGRAPH_FIFO ||
+        addr == NV_PGRAPH_INCREMENT) {
+        UWP_PROF_BEGIN(t_flock);
+        /* The FIFO thread holds pfifo.lock almost all the time it is awake and lets go for a moment
+         * between methods; blocking here put the vCPU to sleep and the wake-up cost ~0.2 ms on the
+         * console, thousands of times a second (Turok). Catch one of those moments first (~100 us). */
+        bool locked = false;
+        for (int i = 0; i < 4000 && !locked; i++) {
+            locked = qemu_mutex_trylock(&d->pfifo.lock) == 0;
+            if (!locked) {
+                __builtin_ia32_pause();
+            }
+        }
+        if (!locked) {
+            qemu_mutex_lock(&d->pfifo.lock);
+        }
+        UWP_PROF_END(VC_FIFO_LOCK, t_flock);
+        UWP_TRACE("  pgraph write %x = %x (no pg lock)", (unsigned)addr, (unsigned)val);
+        switch (addr) {
+        case NV_PGRAPH_INTR: {
+            uint32_t was = qatomic_fetch_and(&pg->pending_interrupts, ~(uint32_t)val);
+            /* only an acknowledgement of the interrupt itself lets the FIFO go on: the FIFO thread
+             * sets its wait flag before the bit, so an ack that found the bit always finds the flag */
+            if (was & val & NV_PGRAPH_INTR_ERROR) {
+                if (qatomic_read(&pg->waiting_for_nop) && uwp_error_since) {
+                    xemu_uwp_error_wait_ns += get_clock_realtime() - uwp_error_since;
+                    uwp_error_since = 0;
+                    uwp_error_raised = 0;
+                }
+                qatomic_set(&pg->waiting_for_nop, false);
+            }
+            if (was & val & NV_PGRAPH_INTR_CONTEXT_SWITCH) {
+                if (qatomic_read(&pg->waiting_for_context_switch) && uwp_ctxsw_since) {
+                    xemu_uwp_ctxsw_wait_ns += get_clock_realtime() - uwp_ctxsw_since;
+                    uwp_ctxsw_since = 0;
+                }
+                qatomic_set(&pg->waiting_for_context_switch, false);
+            }
+            pfifo_kick(d);
+            break;
+        }
+        case NV_PGRAPH_INTR_EN:
+            qatomic_set(&pg->enabled_interrupts, (uint32_t)val);
+            break;
+        case NV_PGRAPH_FIFO:
+            qatomic_set(&pg->regs_[NV_PGRAPH_FIFO], (uint32_t)val);
+            pfifo_kick(d);
+            break;
+        case NV_PGRAPH_INCREMENT:
+            if (val & NV_PGRAPH_INCREMENT_READ_3D) {
+                uwp_surface_set(pg, NV_PGRAPH_SURFACE_READ_3D, true, 0);
+                nv2a_profile_increment();
+                pfifo_kick(d);
+            }
+            break;
+        }
+        qemu_mutex_unlock(&d->pfifo.lock);
+        return;
+    }
+#endif
 
     UWP_PROF_BEGIN(t_lock);
     qemu_mutex_lock(&d->pfifo.lock); // FIXME: Factor out fifo lock here
@@ -281,11 +402,15 @@ void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
         assert(!PG_GET_MASK(NV_PGRAPH_DEBUG_3,
                             NV_PGRAPH_DEBUG_3_HW_CONTEXT_SWITCH));
 
-        pg->waiting_for_context_switch = true;
-        pg->pending_interrupts |= NV_PGRAPH_INTR_CONTEXT_SWITCH;
 #ifdef XEMU_UWP
+        /* the flag first, then the bit with a full barrier: the guest acknowledges without pg->lock */
         xemu_uwp_ctxsw_count++;
         uwp_ctxsw_since = get_clock_realtime();
+        qatomic_set(&pg->waiting_for_context_switch, true);
+        qatomic_or(&pg->pending_interrupts, NV_PGRAPH_INTR_CONTEXT_SWITCH);
+#else
+        pg->waiting_for_context_switch = true;
+        pg->pending_interrupts |= NV_PGRAPH_INTR_CONTEXT_SWITCH;
 #endif
         pgraph_schedule_irq_update(d);
     }
@@ -940,12 +1065,17 @@ DEF_METHOD(NV097, NO_OPERATION)
     pgraph_reg_w(pg, NV_PGRAPH_TRAPPED_DATA_LOW, parameter);
     pgraph_reg_w(pg, NV_PGRAPH_NSOURCE,
                  NV_PGRAPH_NSOURCE_NOTIFICATION); /* TODO: check this */
-    pg->pending_interrupts |= NV_PGRAPH_INTR_ERROR;
 #ifdef XEMU_UWP
+    /* the trap registers above, then the wait flag, then the bit with a full barrier: the guest reads
+     * and acknowledges these without pg->lock (pgraph_read / pgraph_write) */
     xemu_uwp_error_count++;
     uwp_error_since = get_clock_realtime();
-#endif
+    qatomic_set(&pg->waiting_for_nop, true);
+    qatomic_or(&pg->pending_interrupts, NV_PGRAPH_INTR_ERROR);
+#else
+    pg->pending_interrupts |= NV_PGRAPH_INTR_ERROR;
     pg->waiting_for_nop = true;
+#endif
 
     pgraph_schedule_irq_update(d);
 }
@@ -955,22 +1085,31 @@ DEF_METHOD(NV097, WAIT_FOR_IDLE)
     d->pgraph.renderer->ops.surface_update(d, false, true, true);
 }
 
+#ifdef XEMU_UWP
+/* NV_PGRAPH_SURFACE: compare-and-swap, the guest's INCREMENT write changes it without pg->lock */
+#define PG_SURFACE_SET(mask, value) uwp_surface_set(pg, mask, false, value)
+#define PG_SURFACE_INCREMENT(mask) uwp_surface_set(pg, mask, true, 0)
+#else
+#define PG_SURFACE_SET(mask, value) PG_SET_MASK(NV_PGRAPH_SURFACE, mask, value)
+#define PG_SURFACE_INCREMENT(mask)                                                  \
+    PG_SET_MASK(NV_PGRAPH_SURFACE, mask,                                            \
+                (PG_GET_MASK(NV_PGRAPH_SURFACE, mask) + 1) %                        \
+                    PG_GET_MASK(NV_PGRAPH_SURFACE, NV_PGRAPH_SURFACE_MODULO_3D))
+#endif
+
 DEF_METHOD(NV097, SET_FLIP_READ)
 {
-    PG_SET_MASK(NV_PGRAPH_SURFACE, NV_PGRAPH_SURFACE_READ_3D,
-             parameter);
+    PG_SURFACE_SET(NV_PGRAPH_SURFACE_READ_3D, parameter);
 }
 
 DEF_METHOD(NV097, SET_FLIP_WRITE)
 {
-    PG_SET_MASK(NV_PGRAPH_SURFACE, NV_PGRAPH_SURFACE_WRITE_3D,
-             parameter);
+    PG_SURFACE_SET(NV_PGRAPH_SURFACE_WRITE_3D, parameter);
 }
 
 DEF_METHOD(NV097, SET_FLIP_MODULO)
 {
-    PG_SET_MASK(NV_PGRAPH_SURFACE, NV_PGRAPH_SURFACE_MODULO_3D,
-             parameter);
+    PG_SURFACE_SET(NV_PGRAPH_SURFACE_MODULO_3D, parameter);
 }
 
 DEF_METHOD(NV097, FLIP_INCREMENT_WRITE)
@@ -978,12 +1117,7 @@ DEF_METHOD(NV097, FLIP_INCREMENT_WRITE)
     uint32_t old =
         PG_GET_MASK(NV_PGRAPH_SURFACE, NV_PGRAPH_SURFACE_WRITE_3D);
 
-    PG_SET_MASK(NV_PGRAPH_SURFACE,
-             NV_PGRAPH_SURFACE_WRITE_3D,
-             (PG_GET_MASK(NV_PGRAPH_SURFACE,
-                      NV_PGRAPH_SURFACE_WRITE_3D)+1)
-                % PG_GET_MASK(NV_PGRAPH_SURFACE,
-                           NV_PGRAPH_SURFACE_MODULO_3D) );
+    PG_SURFACE_INCREMENT(NV_PGRAPH_SURFACE_WRITE_3D);
 
     uint32_t new =
         PG_GET_MASK(NV_PGRAPH_SURFACE, NV_PGRAPH_SURFACE_WRITE_3D);

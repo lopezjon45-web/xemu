@@ -52,6 +52,10 @@ void pgraph_gl_uwp_fold_queries(PGRAPHState *pg)
 }
 #endif
 
+#ifdef XEMU_UWP
+bool xemu_uwp_reports_nowait, xemu_uwp_reports_left;   /* set and read by the FIFO thread only */
+#endif
+
 static void process_pending_report(NV2AState *d, QueryReport *report)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -95,10 +99,28 @@ void pgraph_gl_process_pending_reports(NV2AState *d)
     QueryReport *report, *next;
 
     QSIMPLEQ_FOREACH_SAFE(report, &r->report_queue, entry, next) {
+#ifdef XEMU_UWP
+        /* Like the real GPU, which writes a report when it gets there: when the FIFO thread asks
+         * without waiting, stop at the first report whose queries the GPU has not finished (each
+         * wait is a full GPU round trip on GL-on-D3D12) and carry on feeding the GPU; it waits
+         * for the rest before it goes idle (pfifo_thread). Queries finish in order. */
+        if (xemu_uwp_reports_nowait && !report->clear && report->query_count) {
+            GLuint available = 0;
+            glGetQueryObjectuiv(report->queries[report->query_count - 1],
+                                GL_QUERY_RESULT_AVAILABLE, &available);
+            if (!available) {
+                xemu_uwp_reports_left = true;
+                return;
+            }
+        }
+#endif
         process_pending_report(d, report);
         QSIMPLEQ_REMOVE_HEAD(&r->report_queue, entry);
         g_free(report);
     }
+#ifdef XEMU_UWP
+    xemu_uwp_reports_left = false;
+#endif
 }
 
 void pgraph_gl_clear_report_value(NV2AState *d)
@@ -118,7 +140,7 @@ void pgraph_gl_clear_report_value(NV2AState *d)
     uwp_query_carry = 0;
 #endif
 
-    QueryReport *report = g_malloc(sizeof(QueryReport));
+    QueryReport *report = g_malloc0(sizeof(QueryReport));   /* no queries: count 0, not garbage */
     report->clear = true;
     QSIMPLEQ_INSERT_TAIL(&r->report_queue, report, entry);
 }
