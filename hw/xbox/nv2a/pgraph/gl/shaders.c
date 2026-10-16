@@ -929,6 +929,51 @@ static uint64_t uwp_warm_check(const UwpWarmRecord *rec)
     return fast_hash((const uint8_t *)&rec->ms, sizeof(*rec) - sizeof(rec->check));
 }
 
+/*
+ * Lists written before VshState.uwp_attr_kinds existed (up to 0.9.104): the field was added at the end of
+ * VshState, so every byte after it moved by 4. Such a list is converted (the new field 0 = attributes read
+ * as before, which is what those shaders were built for) and written back, instead of being thrown away
+ * - players would otherwise get first-play stutter again in every game after updating.
+ */
+QEMU_BUILD_BUG_ON(offsetof(VshState, uwp_attr_kinds) + 4 != sizeof(VshState));
+QEMU_BUILD_BUG_ON(offsetof(ShaderState, vsh) != 0);
+static bool uwp_warm_migrate(const char *path, char **data, gsize *len, const uint32_t want[3])
+{
+    const uint32_t *head = (const uint32_t *)*data;
+    size_t ins = offsetof(UwpWarmRecord, state) + offsetof(VshState, uwp_attr_kinds);
+    size_t used_new = offsetof(UwpWarmRecord, pipe) + sizeof(UwpWarmPipe);
+    size_t used_old = used_new - 4;
+    size_t old_size = ROUND_UP(used_old, __alignof__(UwpWarmRecord));
+    if (head[0] != want[0] || head[2] != want[2] || head[1] != old_size || old_size == sizeof(UwpWarmRecord)) {
+        return false;
+    }
+    int n = (*len - 3 * sizeof(uint32_t)) / old_size;
+    GString *out = g_string_sized_new(3 * sizeof(uint32_t) + n * sizeof(UwpWarmRecord));
+    g_string_append_len(out, (const char *)want, 3 * sizeof(uint32_t));
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *old = (const uint8_t *)*data + 3 * sizeof(uint32_t) + (size_t)i * old_size;
+        uint64_t check;
+        memcpy(&check, old, sizeof(check));
+        if (check != fast_hash(old + sizeof(check), old_size - sizeof(check))) {
+            break; /* damaged from here on */
+        }
+        UwpWarmRecord rec;
+        memset(&rec, 0, sizeof(rec));
+        memcpy(&rec, old, ins);
+        memcpy((uint8_t *)&rec + ins + 4, old + ins, used_old - ins);
+        rec.check = uwp_warm_check(&rec);
+        g_string_append_len(out, (const char *)&rec, sizeof(rec));
+        kept++;
+    }
+    g_free(*data);
+    *len = out->len;
+    *data = g_string_free(out, false);
+    g_file_set_contents(path, *data, *len, NULL);
+    uwp_log("shader warm-up: list from an older build converted (%d of %d entries)", kept, n);
+    return true;
+}
+
 /* a small texture of this kind and format, made once */
 static GLuint uwp_warm_texture(GLenum target, GLenum fmt)
 {
@@ -1201,6 +1246,9 @@ static void uwp_warm_start(PGRAPHGLState *r)
         uwp_log("shader warm-up: no list yet");
         g_free(path);
         return;
+    }
+    if (len >= sizeof(want) && uwp_warm_migrate(path, &data, &len, want)) {
+        /* converted from the layout before the vertex attribute kinds (0.9.105) */
     }
     if (len < sizeof(want) || memcmp(data, want, sizeof(want))) {
         /* another xemu build: shader states may differ, start a new list */

@@ -135,6 +135,19 @@ typedef struct PGRAPHRenderer {
     } ops;
 } PGRAPHRenderer;
 
+#ifdef XEMU_UWP
+/*
+ * Vertex formats that D3D12 cannot read, which Mesa would otherwise convert on the CPU before each
+ * draw (u_vbuf) - reading the vertex buffer back, which waits for the GPU. They are bound as integer
+ * attributes (native D3D12 formats) and turned into floats in the vertex shader, as the GPU does.
+ */
+#define UWP_ATTR_FLOAT 0  /* as before */
+#define UWP_ATTR_SCALED 1 /* S32K, 1-3 components: signed shorts used as they are */
+#define UWP_ATTR_UNORM8 2 /* UB_OGL, 3 components: unsigned bytes / 255 */
+#define UWP_ATTR_SNORM16 3 /* S1, 3 components: signed shorts / 32767, at least -1 */
+#define UWP_ATTR_KIND(kinds, i) (((kinds) >> (2 * (i))) & 3)
+#endif
+
 typedef struct PGRAPHState {
     QemuMutex lock;
     QemuMutex renderer_lock;
@@ -217,6 +230,9 @@ typedef struct PGRAPHState {
 
     VertexAttribute vertex_attributes[NV2A_VERTEXSHADER_ATTRIBUTES];
     uint16_t compressed_attrs;
+#ifdef XEMU_UWP
+    uint32_t uwp_attr_kinds; /* 2 bits per attribute, UWP_ATTR_*: read as integers, converted in the shader */
+#endif
     uint16_t uniform_attrs;
     uint16_t swizzle_attrs;
 

@@ -1659,6 +1659,16 @@ static void uwp_prof_report(double seconds)
                           (unsigned long long)s, (unsigned long long)w, s > w ? l / 1e3 / (s - w) : 0.0);
         }
     }
+    {
+        /* GPU thread wake-ups after it ran out of work (hw/xbox/nv2a/pfifo.c) */
+        extern uint64_t xemu_uwp_gpu_wakes, xemu_uwp_gpu_wake_ns, xemu_uwp_gpu_spin_wakes;
+        uint64_t k = qatomic_xchg(&xemu_uwp_gpu_wakes, 0), ns = qatomic_xchg(&xemu_uwp_gpu_wake_ns, 0),
+                 sp = qatomic_xchg(&xemu_uwp_gpu_spin_wakes, 0);
+        if (k) {
+            n += snprintf(line + n, sizeof(line) - n, " | gpu wakes %llu (spun %llu), avg %.0f us",
+                          (unsigned long long)k, (unsigned long long)sp, ns / 1e3 / k);
+        }
+    }
     n += snprintf(line + n, sizeof(line) - n, " | wall%% (calls):");
     for (int i = 0; i < UWP_PROF__COUNT; i++) {
         int64_t t = uwp_prof_ticks[i];
@@ -1959,7 +1969,8 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
              * stub in win32u / ntdll says which kernel service), the first
              * caller inside the GL driver, and the first caller in xemu.exe.
              */
-            static struct uwp_count where[160], gallium[160], ours[160];
+            static struct uwp_count where[160], gallium[160], ours[160], chains[160];
+            memset(chains, 0, sizeof(chains));
             memset(where, 0, sizeof(where));
             memset(gallium, 0, sizeof(gallium));
             memset(ours, 0, sizeof(ours));
@@ -1983,6 +1994,10 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
                 }
                 uwp_count_add(where, 160, name);
                 bool got_gallium = false, got_ours = false;
+                /* the return addresses inside the GL driver, innermost first: named on the PC with its .pdb */
+                char chain[72];
+                int clen = 0;
+                chain[0] = '\0';
                 for (int f = 0; f < UWP_STACK_FRAMES && stacks[i][f]; f++) {
                     uint64_t a = stacks[i][f];
                     if (a - exe_base < exe_size) {
@@ -2006,11 +2021,26 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
                             got_gallium = true;
                         }
                     }
+                    HMODULE m3 = NULL;
+                    if (clen < (int)sizeof(chain) - 10 &&
+                        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           (LPCWSTR)(uintptr_t)a, &m3) && m3) {
+                        uwp_module_name(m3, modname, sizeof(modname));
+                        if (!g_ascii_strcasecmp(modname, "libgallium_wgl.dll")) {
+                            clen += snprintf(chain + clen, sizeof(chain) - clen, "%s%llx", clen ? "<" : "",
+                                             (unsigned long long)(a - (uint64_t)(uintptr_t)m3));
+                        }
+                    }
+                }
+                if (clen) {
+                    uwp_count_add(chains, 160, chain);
                 }
             }
             uwp_count_log("pfifo outside xemu, by export", where, 160, 24);
             uwp_count_log("pfifo first caller in libgallium_wgl", gallium, 160, 24);
             uwp_count_log("pfifo first caller in xemu.exe", ours, 160, 16);
+            uwp_count_log("pfifo call chains in libgallium_wgl (innermost first)", chains, 160, 12);
         }
 
         /* the same samples by guest address (start of the translated block) */
@@ -3211,6 +3241,26 @@ static void uwp_on_abort(int sig)
     fflush(NULL);
 }
 
+#ifdef XEMU_PGO_GEN
+/*
+ * Profile-guided build, first step (build-uwp-pgo with -fprofile-generate): the counters are written
+ * to LocalState\pgo every 60 seconds and reset, because an app on the console is usually ended, not
+ * closed, and the end-of-program write would never happen. Never in a release build.
+ */
+extern void __gcov_dump(void);
+extern void __gcov_reset(void);
+static DWORD WINAPI uwp_pgo_thread(void *arg)
+{
+    for (int n = 1;; n++) {
+        Sleep(60000);
+        __gcov_dump();
+        __gcov_reset();
+        uwp_log("profile for the optimized build written (%d)", n);
+    }
+    return 0;
+}
+#endif
+
 static void uwp_on_exit(void)
 {
     uwp_session_summary("closed (quit, or the console closed the app)");
@@ -3431,11 +3481,12 @@ static void uwp_log_memory(void)
         static unsigned int last[UWP_CNT_MAX];
         unsigned int *c = xemu_uwp_counters;
         uwp_log("gpu objects: queries waiting %u (read early %u), textures +%u -%u, surfaces +%u -%u, "
-                "stream buffers %u, GL errors %u",
+                "stream buffers %u, vertex arrays realigned %u, GL errors %u",
                 c[UWP_CNT_QUERIES_PENDING], c[UWP_CNT_QUERIES_FOLDED] - last[UWP_CNT_QUERIES_FOLDED],
                 c[UWP_CNT_TEX_NEW] - last[UWP_CNT_TEX_NEW], c[UWP_CNT_TEX_DEL] - last[UWP_CNT_TEX_DEL],
                 c[UWP_CNT_SURF_NEW] - last[UWP_CNT_SURF_NEW], c[UWP_CNT_SURF_DEL] - last[UWP_CNT_SURF_DEL],
-                c[UWP_CNT_STREAM_WRAP] - last[UWP_CNT_STREAM_WRAP], c[UWP_CNT_GL_ERRORS]);
+                c[UWP_CNT_STREAM_WRAP] - last[UWP_CNT_STREAM_WRAP],
+                c[UWP_CNT_VERTEX_REPACK] - last[UWP_CNT_VERTEX_REPACK], c[UWP_CNT_GL_ERRORS]);
         memcpy(last, c, sizeof(last));
     }
 }
@@ -4534,6 +4585,10 @@ int main(int argc, char **argv)
         uwp_story_start(w, h);
     }
     atexit(uwp_on_exit);
+#ifdef XEMU_PGO_GEN
+    CloseHandle(CreateThread(NULL, 0, uwp_pgo_thread, NULL, 0, NULL));
+    uwp_log("PROFILING BUILD: counters go to LocalState/pgo every minute (slower than a normal build)");
+#endif
     g_set_printerr_handler(uwp_glib_print);
     uwp_log_memory();
     uwp_log_hardware();

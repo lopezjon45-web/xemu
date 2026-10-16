@@ -246,6 +246,63 @@ GLintptr pgraph_gl_uwp_stream_put(const void *data, size_t size)
 }
 #endif
 
+#ifdef XEMU_UWP
+/*
+ * D3D12 reads vertex data only at addresses and strides that are multiples of 4. Xbox games often pack
+ * vertices tighter (Turok: 27 bytes each), and Mesa then converts every such draw on the CPU (u_vbuf),
+ * reading the data back from the GPU buffer - which waits for the GPU to finish everything queued that
+ * shares the buffer's memory. The data is right here in guest RAM, so the elements the draw uses are
+ * copied to the stream buffer with each element on its own 4-byte boundary instead. Returns the offset
+ * of element 0 (so that the draw's indices work unchanged), or -1 when it cannot (the caller then streams
+ * the pages as before). Inline arrays (vertices in the push buffer) are repacked the same way.
+ * Test file vertex-repack-off.txt: never. src points at element 0 and holds src_len bytes.
+ */
+static GLintptr uwp_stream_repack(const uint8_t *src, size_t src_len, size_t stride, size_t esize,
+                                  unsigned first, unsigned last, size_t *out_stride)
+{
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("vertex-repack-off.txt");
+        uwp_log("vertex data: %s", off ? "unaligned layouts left to the driver (vertex-repack-off.txt)"
+                                       : "unaligned layouts repacked from guest memory");
+    }
+    size_t es4 = ROUND_UP(esize, 4);
+    size_t n = (size_t)last - first + 1;
+    size_t size = n * es4;
+    GLintptr min_off = (GLintptr)first * es4;
+    if (off || !esize || last < first || size > UWP_STREAM_SIZE / 4 || min_off > UWP_STREAM_SIZE / 2 ||
+        (size_t)last * stride + esize > src_len) {
+        return -1;
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, uwp_stream_buffer);
+    GLintptr pos = MAX(ROUND_UP(uwp_stream_pos, 64), ROUND_UP(min_off, 64));
+    if (pos + (GLintptr)size > UWP_STREAM_SIZE) {
+        uwp_stream_next_buffer();
+        pos = ROUND_UP(min_off, 64);
+    }
+    uint8_t *map = glMapBufferRange(GL_ARRAY_BUFFER, pos, size,
+                                    GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+    if (!map) {
+        while (glGetError() != GL_NO_ERROR) {
+        }
+        return -1;
+    }
+    src += (size_t)first * stride;
+    for (size_t i = 0; i < n; i++, src += stride, map += es4) {
+        memcpy(map, src, esize);
+        if (es4 > esize) {
+            memset(map + esize, 0, es4 - esize);
+        }
+    }
+    glUnmapBuffer(GL_ARRAY_BUFFER);
+    xemu_uwp_counters[UWP_CNT_VERTEX_REPACK]++;
+    uwp_stream_pos = pos + size;
+    *out_stride = es4;
+    return pos - min_off;
+}
+#endif
+
 void pgraph_gl_update_entire_memory_buffer(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -347,12 +404,25 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
 #ifdef XEMU_UWP
         GLintptr attrib_pointer = 0;
         bool uwp_streamed = false;
+        size_t gl_stride = 0; /* when not 0: the stride of a repacked copy (the guest's stays in stride) */
 #endif
         if (inline_data) {
 #ifdef XEMU_UWP
             glBindBuffer(GL_ARRAY_BUFFER, uwp_stream_buffer);
             attrib_pointer = uwp_inline_array_base + attr->inline_array_offset;
             uwp_streamed = true;
+            if (inline_stride && ((inline_stride | attr->inline_array_offset) & 3) &&
+                pg->inline_array_length * 4 > attr->inline_array_offset) {
+                size_t repacked_stride = 0;
+                GLintptr repacked = uwp_stream_repack(
+                    (const uint8_t *)pg->inline_array + attr->inline_array_offset,
+                    pg->inline_array_length * 4 - attr->inline_array_offset, inline_stride,
+                    attr->size * attr->count, min_element, max_element, &repacked_stride);
+                if (repacked >= 0) {
+                    attrib_pointer = repacked;
+                    gl_stride = repacked_stride;
+                }
+            }
 #else
             glBindBuffer(GL_ARRAY_BUFFER, r->gl_inline_array_buffer);
 #endif
@@ -368,7 +438,19 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
             stride = attr->stride;
             start = attrib_data_addr + min_element * stride;
 #ifdef XEMU_UWP
-            {
+            size_t repacked_stride = 0;
+            GLintptr repacked = -1;
+            if (stride && ((stride | attrib_data_addr) & 3) && attrib_data_addr < memory_region_size(d->vram)) {
+                repacked = uwp_stream_repack(d->vram_ptr + attrib_data_addr,
+                                             memory_region_size(d->vram) - attrib_data_addr, stride,
+                                             attr->size * attr->count, min_element, max_element,
+                                             &repacked_stride);
+            }
+            if (repacked >= 0) {
+                attrib_pointer = repacked;
+                gl_stride = repacked_stride;
+                uwp_streamed = true;
+            } else {
                 hwaddr lo = start & TARGET_PAGE_MASK;
                 hwaddr hi = TARGET_PAGE_ALIGN(start + num_elements * stride);
                 assert(hi < memory_region_size(d->vram));
@@ -420,13 +502,25 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
 #else
 #define UWP_ATTRIB_POINTER ((void *)attrib_data_addr)
 #endif
+#ifdef XEMU_UWP
+#define UWP_GL_STRIDE (gl_stride ? gl_stride : stride)
+#else
+#define UWP_GL_STRIDE stride
+#endif
         if (needs_conversion) {
-            glVertexAttribIPointer(i, gl_count, gl_type, stride,
+            glVertexAttribIPointer(i, gl_count, gl_type, UWP_GL_STRIDE,
                                    UWP_ATTRIB_POINTER);
+#ifdef XEMU_UWP
+        } else if (UWP_ATTR_KIND(pg->uwp_attr_kinds, i) != UWP_ATTR_FLOAT) {
+            /* a format D3D12 lacks: read as integers, turned into floats by the vertex shader
+             * (glsl/vsh.c), so that Mesa need not convert it on the CPU */
+            glVertexAttribIPointer(i, gl_count, gl_type, UWP_GL_STRIDE, UWP_ATTRIB_POINTER);
+#endif
         } else {
-            glVertexAttribPointer(i, gl_count, gl_type, gl_normalize, stride,
+            glVertexAttribPointer(i, gl_count, gl_type, gl_normalize, UWP_GL_STRIDE,
                                   UWP_ATTRIB_POINTER);
         }
+#undef UWP_GL_STRIDE
 #undef UWP_ATTRIB_POINTER
 
         glEnableVertexAttribArray(i);

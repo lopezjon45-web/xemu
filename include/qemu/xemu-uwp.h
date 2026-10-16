@@ -51,6 +51,7 @@ enum {
     UWP_CNT_SURF_NEW,
     UWP_CNT_SURF_DEL,
     UWP_CNT_STREAM_WRAP,     /* 64 MB vertex stream buffer replaced */
+    UWP_CNT_VERTEX_REPACK,   /* unaligned vertex attributes copied aligned (gl/vertex.c) */
     UWP_CNT_GL_ERRORS,
     UWP_CNT_MAX
 };

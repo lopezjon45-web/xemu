@@ -73,7 +73,12 @@ typedef struct {
     bool is_fixed_function;
     FixedFunctionVshState fixed_function;
     ProgrammableVshState programmable;
+#ifdef XEMU_UWP
+    /* last, so that shader warm-up lists from older builds can be converted (gl/shaders.c) */
+    uint32_t uwp_attr_kinds;
+#endif
 } VshState;
+
 
 void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *state);
 

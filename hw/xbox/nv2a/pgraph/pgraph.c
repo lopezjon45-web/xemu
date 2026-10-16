@@ -2678,6 +2678,30 @@ DEF_METHOD_INC(NV097, SET_VERTEX_DATA_ARRAY_FORMAT)
     } else {
         pg->compressed_attrs &= ~(1 << slot);
     }
+#ifdef XEMU_UWP
+    {
+        /* only with the GL renderer (gl/vertex.c binds them); a stride of 0 is a constant value */
+        unsigned kind = UWP_ATTR_FLOAT;
+        if (pg->renderer && pg->renderer->type == CONFIG_DISPLAY_RENDERER_OPENGL && attr->stride) {
+            if (attr->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S32K && attr->count >= 1 &&
+                attr->count <= 3) {
+                kind = UWP_ATTR_SCALED;
+            } else if (attr->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL && attr->count == 3) {
+                kind = UWP_ATTR_UNORM8;
+            } else if (attr->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S1 && attr->count == 3) {
+                kind = UWP_ATTR_SNORM16;
+            }
+        }
+        pg->uwp_attr_kinds = (pg->uwp_attr_kinds & ~(3u << (2 * slot))) | (kind << (2 * slot));
+        /* each vertex format a game uses, once (to see which ones D3D12 may lack) */
+        static uint8_t seen[8][8];
+        if (attr->format < 8 && attr->count < 8 && !seen[attr->format][attr->count]) {
+            seen[attr->format][attr->count] = 1;
+            uwp_log("vertex format: type %d, %d components, stride %d, read as kind %u", attr->format, attr->count,
+                    attr->stride, kind);
+        }
+    }
+#endif
 }
 
 DEF_METHOD_INC(NV097, SET_VERTEX_DATA_ARRAY_OFFSET)

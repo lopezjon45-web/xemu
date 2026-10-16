@@ -112,6 +112,9 @@ void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *vsh)
     vsh->surface_scale_factor = pg->surface_scale_factor; // FIXME
 
     vsh->compressed_attrs = pg->compressed_attrs;
+#ifdef XEMU_UWP
+    vsh->uwp_attr_kinds = pg->uwp_attr_kinds;
+#endif
     vsh->uniform_attrs = pg->uniform_attrs;
     vsh->swizzle_attrs = pg->swizzle_attrs;
 
@@ -272,6 +275,11 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
             if (state->compressed_attrs & (1 << i)) {
                 mstring_append_fmt(header,
                                    "layout(location = %d) in int v%d_cmp;\n", i, i);
+#ifdef XEMU_UWP
+            } else if (UWP_ATTR_KIND(state->uwp_attr_kinds, i) != UWP_ATTR_FLOAT) {
+                mstring_append_fmt(header, "layout(location = %d) in %s v%d_int;\n", i,
+                                   UWP_ATTR_KIND(state->uwp_attr_kinds, i) == UWP_ATTR_UNORM8 ? "uvec4" : "ivec4", i);
+#endif
             } else if (state->swizzle_attrs & (1 << i)) {
                 mstring_append_fmt(header, "layout(location = %d) in vec4 v%d_sw;\n",
                                    i, i);
@@ -295,6 +303,23 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
         if (state->swizzle_attrs & (1 << i)) {
             mstring_append_fmt(body, "vec4 v%d = v%d_sw.bgra;\n", i, i);
         }
+#ifdef XEMU_UWP
+        /* missing components of an integer attribute read as (0, 0, 0, 1), as for floats */
+        switch (state->compressed_attrs & (1 << i) ? UWP_ATTR_FLOAT : UWP_ATTR_KIND(state->uwp_attr_kinds, i)) {
+        case UWP_ATTR_SCALED:
+            mstring_append_fmt(body, "vec4 v%d = vec4(v%d_int);\n", i, i);
+            break;
+        case UWP_ATTR_UNORM8:
+            mstring_append_fmt(body, "vec4 v%d = vec4(vec3(v%d_int.xyz) / 255.0, 1.0);\n", i, i);
+            break;
+        case UWP_ATTR_SNORM16:
+            mstring_append_fmt(body, "vec4 v%d = vec4(max(vec3(v%d_int.xyz) / 32767.0, vec3(-1.0)), 1.0);\n",
+                               i, i);
+            break;
+        default:
+            break;
+        }
+#endif
 
     }
 

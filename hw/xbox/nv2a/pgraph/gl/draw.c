@@ -503,9 +503,18 @@ static void pgraph_gl_flush_draw_inner(NV2AState *d)
         }
         UWP_WARM_DRAW(r);
         { UWP_PROF_BEGIN(t_gld);
+#ifdef XEMU_UWP
+        /* With the index range given, Mesa's vertex fallback (u_vbuf) does not read the index buffer
+         * back to find it; on D3D12 that read waited for the GPU to finish everything queued that
+         * shares the buffer's memory block (Turok: a third of the renderer thread). The range is
+         * exact (computed above). */
+        glDrawRangeElements(r->shader_binding->gl_primitive_mode, min_element, max_element,
+                            pg->inline_elements_length, GL_UNSIGNED_INT, (void *)0);
+#else
         glDrawElements(r->shader_binding->gl_primitive_mode,
                        pg->inline_elements_length, GL_UNSIGNED_INT,
                        (void *)0);
+#endif
         UWP_PROF_END(PF_GLDRAW, t_gld); }
     } else if (pg->inline_buffer_length) {
         NV2A_GL_DPRINTF(false, "Inline Buffer");

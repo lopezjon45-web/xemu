@@ -72,6 +72,9 @@ bool pgraph_glsl_check_shader_state_dirty(PGRAPHState *pg,
     if (pg->uniform_attrs != state->vsh.uniform_attrs ||
         pg->swizzle_attrs != state->vsh.swizzle_attrs ||
         pg->compressed_attrs != state->vsh.compressed_attrs ||
+#ifdef XEMU_UWP
+        pg->uwp_attr_kinds != state->vsh.uwp_attr_kinds ||
+#endif
         pg->primitive_mode != state->geom.primitive_mode ||
         pg->surface_scale_factor != state->vsh.surface_scale_factor ||
         pg->surface_shape.zeta_format != state->psh.surface_zeta_format) {

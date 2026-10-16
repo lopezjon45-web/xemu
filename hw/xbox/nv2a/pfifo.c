@@ -94,9 +94,23 @@ void pfifo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     qemu_mutex_unlock(&d->pfifo.lock);
 }
 
+#ifdef XEMU_UWP
+/* GPU thread wake-ups, for the log: count, total ns from the kick to running again, and how many ended a
+ * short spin instead of a sleep */
+uint64_t xemu_uwp_gpu_wakes, xemu_uwp_gpu_wake_ns, xemu_uwp_gpu_spin_wakes;
+static int64_t uwp_kick_at; /* when the first kick since the thread went idle came, ns */
+#endif
+
 void pfifo_kick(NV2AState *d)
 {
+#ifdef XEMU_UWP
+    if (!qatomic_read(&uwp_kick_at)) {
+        qatomic_set(&uwp_kick_at, get_clock_realtime());
+    }
+    qatomic_set(&d->pfifo.fifo_kick, true);
+#else
     d->pfifo.fifo_kick = true;
+#endif
     qemu_cond_broadcast(&d->pfifo.fifo_cond);
 }
 
@@ -486,7 +500,27 @@ void *pfifo_thread(void *arg)
         extern bool xemu_uwp_reports_nowait, xemu_uwp_reports_left;   /* gl/reports.c */
         qemu_mutex_unlock(&d->pfifo.lock);
         xemu_uwp_reports_nowait = true;
-        pgraph_process_pending_reports(d);
+        /* Asking GL whether a query result is ready makes Mesa's D3D12 driver submit the commands
+         * gathered so far as a batch; it keeps 8 batches, and starting one that the GPU still uses
+         * waits for the GPU. Asked after every pusher run (thousands a second), that put a GPU wait
+         * inside most draws (Turok: 0.5 ms a draw, the renderer thread 66 % in draw calls). While
+         * the guest keeps feeding the FIFO, ask at most once a millisecond; once it stops (it may be
+         * waiting for this very result), the loop below asks at once. Test file
+         * reports-poll-always.txt: ask every time. */
+        static int64_t uwp_reports_asked;
+        static int uwp_poll_always = -1;
+        if (uwp_poll_always < 0) {
+            extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+            uwp_poll_always = xemu_uwp_test_file_exists("reports-poll-always.txt");
+            uwp_log("occlusion results: %s", uwp_poll_always ? "asked for after every FIFO run (reports-poll-always.txt)"
+                                                            : "asked for at most once a millisecond while the FIFO is busy");
+        }
+        int64_t uwp_now = get_clock_realtime();
+        bool uwp_busy = qatomic_read(&d->pfifo.fifo_kick);
+        if (uwp_poll_always || !uwp_busy || uwp_now - uwp_reports_asked >= 1000000) {
+            uwp_reports_asked = uwp_now;
+            pgraph_process_pending_reports(d);
+        }
         /* nothing else to do: wait for the rest of the results before going idle, in short steps
          * that end as soon as the guest kicks the FIFO (it may be acknowledging a software method
          * the GPU stopped at); after 2 ms an ordinary wait */
@@ -513,9 +547,27 @@ void *pfifo_thread(void *arg)
 
             // Both the pusher and puller are waiting for some action
             UWP_PROF_BEGIN(t0);
+#ifdef XEMU_UWP
+            bool spun = false; /* a short spin before sleeping was tried: wake-ups take 1-2 us, no gain */
+            if (!d->pfifo.fifo_kick) {
+                qemu_cond_wait(&d->pfifo.fifo_cond, &d->pfifo.lock);
+            }
+            int64_t kicked = qatomic_xchg(&uwp_kick_at, 0);
+            if (kicked) {
+                xemu_uwp_gpu_wakes++;
+                xemu_uwp_gpu_wake_ns += MAX(0, get_clock_realtime() - kicked);
+                xemu_uwp_gpu_spin_wakes += spun;
+            }
+#else
             qemu_cond_wait(&d->pfifo.fifo_cond, &d->pfifo.lock);
+#endif
             UWP_PROF_END(PF_IDLE, t0);
         }
+#ifdef XEMU_UWP
+        else {
+            qatomic_set(&uwp_kick_at, 0); /* kicked while busy: no wake-up to time */
+        }
+#endif
 
         if (d->exiting) {
             break;

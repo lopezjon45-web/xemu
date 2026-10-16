@@ -90,10 +90,14 @@ static void report(CPUState *cs)
             if (st) {
                 uwp_log("eip stack %08x: %08x %08x %08x %08x %08x %08x %08x %08x", places[i].pc, st[0], st[1], st[2],
                         st[3], st[4], st[5], st[6], st[7]);
+                uwp_log("eip regs %08x: eax %08x ecx %08x edx %08x ebx %08x esp %08x ebp %08x esi %08x edi %08x",
+                        places[i].pc, st[8], st[9], st[10], st[11], st[12], st[13], st[14], st[15]);
                 /* code before stack words that look like kernel return addresses: the call sites */
                 for (int w = 0; w < 8; w++) {
                     uint8_t site[64];
-                    if (st[w] < 0x80010000u || st[w] >= 0x80080000u ||
+                    /* kernel code, or game code (XBE sections load from 0x10000) */
+                    bool code = (st[w] >= 0x80010000u && st[w] < 0x80080000u) || (st[w] >= 0x11000u && st[w] < 0x800000u);
+                    if (!code ||
                         cpu_memory_rw_debug(cs, st[w] - 48, site, sizeof(site), false) != 0) {
                         continue;
                     }
@@ -127,13 +131,16 @@ static void sample(CPUState *cs, run_on_cpu_data data)
         /* the stack names the callers of a hot loop (return addresses among these words) */
         uint32_t *st = g_hash_table_lookup(stacks, key);
         if (!st && g_hash_table_size(stacks) < 4096) {
-            st = g_new0(uint32_t, 8);
+            st = g_new0(uint32_t, 16);
             g_hash_table_insert(stacks, key, st);
         }
         if (st) {
             target_ulong sp = env->segs[R_SS].base + env->regs[R_ESP];
             if (cpu_memory_rw_debug(cs, sp, st, 8 * sizeof(uint32_t), false) != 0) {
                 memset(st, 0, 8 * sizeof(uint32_t));
+            }
+            for (int r = 0; r < 8; r++) {
+                st[8 + r] = (uint32_t)env->regs[r]; /* eax ecx edx ebx esp ebp esi edi */
             }
         }
     }
