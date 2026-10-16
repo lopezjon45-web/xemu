@@ -2466,6 +2466,12 @@ static void uwp_box_sample(void)
         last_dry = dry;
         last_app = app;
         last_wall = wall;
+        static unsigned last_brief;
+        if (at >= 300 && at / 300 != last_brief / 300) {
+            extern void uwp_session_summary_brief(void);
+            last_brief = at;
+            uwp_session_summary_brief();
+        }
     }
     struct uwp_box_sample *b = &uwp_box[uwp_box_count % UWP_BOX_SECONDS];
     uint64_t used = 0, left = 0;
@@ -3093,7 +3099,26 @@ static void uwp_session_summary_so_far(void)
     }
 }
 
+static void uwp_session_summary_head(const char *how, bool story);
+
 static void uwp_session_summary_print(const char *how)
+{
+    uwp_session_summary_head(how, true);
+}
+
+/*
+ * Every 5 minutes of play a short summary (no event list): when the player closes the game from the Xbox
+ * menu, the console ends xemu without a word, and the report used to have no summary at all.
+ */
+void uwp_session_summary_brief(void)
+{
+    if (!uwp_session.written && uwp_session_start_tick) {
+        uwp_session_summary_head("not ended yet: still playing (a short summary every 5 minutes; if nothing follows, "
+                                 "the console closed xemu)", false);
+    }
+}
+
+static void uwp_session_summary_head(const char *how, bool story)
 {
     int secs = uwp_session_start_tick ? (int)((GetTickCount64() - uwp_session_start_tick) / 1000) : 0;
     const char *disc = g_config.sys.files.dvd_path && g_config.sys.files.dvd_path[0]
@@ -3113,7 +3138,9 @@ static void uwp_session_summary_print(const char *how)
         uwp_log("Speed: the game never drew a frame");
     }
     uwp_log("Ended: %s", how);
-    uwp_story_print();
+    if (story) {
+        uwp_story_print();
+    }
     uwp_log("===== END OF SUMMARY =====");
     fflush(NULL);
 }
