@@ -305,6 +305,26 @@ void pgraph_gl_bind_textures(NV2AState *d)
         texture_vram_offset = pgraph_get_texture_phys_addr(pg, i);
         palette_vram_offset = pgraph_get_texture_palette_phys_addr_length(pg, i, &palette_length);
 
+#ifdef XEMU_UWP
+        /*
+         * A texture (or palette) said to reach past the end of video memory: left unbound for this draw, like a
+         * disabled stage, instead of stopping xemu (a game's start menu hit this assert: the whole app closed).
+         */
+        if ((texture_vram_offset + length) >= memory_region_size(d->vram) ||
+            (palette_vram_offset + palette_length) >= memory_region_size(d->vram)) {
+            static int told;
+            if (told++ < 3) {
+                uwp_log("texture: stage %d at 0x%llx, %zu bytes (palette 0x%llx, %zu) lies past the end of video "
+                        "memory: left out of this draw", i, (unsigned long long)texture_vram_offset, length,
+                        (unsigned long long)palette_vram_offset, palette_length);
+            }
+            glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+            glBindTexture(GL_TEXTURE_1D, 0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glBindTexture(GL_TEXTURE_3D, 0);
+            continue;
+        }
+#endif
         assert((texture_vram_offset + length) < memory_region_size(d->vram));
         assert((palette_vram_offset + palette_length)
                < memory_region_size(d->vram));
