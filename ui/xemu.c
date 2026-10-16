@@ -1537,8 +1537,78 @@ static struct {
 } uwp_prof_threads[UWP_PROF_MAX_THREADS];
 static int uwp_prof_num_threads;
 
+/*
+ * The emulated Xbox CPU gets a processor core of its own. The console gives xemu three cores with two logical
+ * processors each (SMT); left to the scheduler, the vcpu thread shares a core with the renderer, the UI or the
+ * shader warm-up threads, and two busy threads on one core each run much slower. So: vcpu alone on one logical
+ * processor of the first core, every other thread (the process default) on the other cores; the sibling of the
+ * vcpu's processor stays free. Nothing is done with fewer than two cores. Testing: cpu-pin-off.txt next to
+ * xemu.toml turns it off.
+ */
+static void uwp_pin_vcpu(void)
+{
+    typedef BOOL (WINAPI *Info_fn)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+    typedef BOOL (WINAPI *Thread_fn)(HANDLE, const ULONG *, ULONG);
+    typedef BOOL (WINAPI *Process_fn)(HANDLE, const ULONG *, ULONG);
+    Info_fn info = (Info_fn)xemu_uwp_kernelbase_proc("GetSystemCpuSetInformation");
+    Thread_fn thread = (Thread_fn)xemu_uwp_kernelbase_proc("SetThreadSelectedCpuSets");
+    Process_fn process = (Process_fn)xemu_uwp_kernelbase_proc("SetProcessDefaultCpuSets");
+    {
+        char *own = SDL_GetPrefPath("xemu", "xemu");
+        char *off = g_strdup_printf("%scpu-pin-off.txt", own ? own : "");
+        bool skip = g_file_test(off, G_FILE_TEST_EXISTS);
+        g_free(off);
+        SDL_free(own);
+        if (skip) {
+            uwp_log("cpu: vcpu not given a core of its own (cpu-pin-off.txt)");
+            return;
+        }
+    }
+    static char buf[4096];
+    ULONG len = 0;
+    if (!info || !thread || !process ||
+        !info((PSYSTEM_CPU_SET_INFORMATION)buf, sizeof(buf), &len, GetCurrentProcess(), 0)) {
+        uwp_log("cpu: core sets not available, vcpu left to the scheduler");
+        return;
+    }
+    ULONG ids[64], cores[64], n = 0;
+    for (ULONG off = 0; off < len && n < 64;) {
+        PSYSTEM_CPU_SET_INFORMATION s = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (s->Size == 0) {
+            break;
+        }
+        if (s->Type == CpuSetInformation && s->CpuSet.AllocatedToTargetProcess) {
+            ids[n] = s->CpuSet.Id;
+            cores[n++] = s->CpuSet.CoreIndex;
+        }
+        off += s->Size;
+    }
+    ULONG others[64], m = 0;
+    for (ULONG i = 1; i < n; i++) {
+        if (cores[i] != cores[0]) {
+            others[m++] = ids[i];
+        }
+    }
+    if (n < 2 || m == 0) {
+        uwp_log("cpu: %lu processors for xemu on one core, vcpu left to the scheduler", (unsigned long)n);
+        return;
+    }
+    bool ok_p = process(GetCurrentProcess(), others, m);
+    bool ok_t = thread(GetCurrentThread(), ids, 1);
+    uwp_log("cpu: vcpu alone on processor %lu (core %lu), %lu processors on other cores for the rest%s%s",
+            (unsigned long)ids[0], (unsigned long)cores[0], (unsigned long)m, ok_t ? "" : " (vcpu: failed)",
+            ok_p ? "" : " (rest: failed)");
+}
+
 void uwp_prof_register_thread(const char *name)
 {
+    if (!strcmp(name, "vcpu")) {
+        static bool pinned;
+        if (!pinned) {
+            pinned = true;
+            uwp_pin_vcpu();
+        }
+    }
     static SRWLOCK lock = SRWLOCK_INIT;
     HANDLE h = NULL;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
