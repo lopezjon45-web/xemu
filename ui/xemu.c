@@ -1506,16 +1506,36 @@ static void uwp_err_drain(void)
     if (!uwp_err_read) {
         return;
     }
+    /*
+     * No PeekNamedPipe here: the reader thread sits in a blocking ReadFile on the same pipe, and Windows
+     * queues the peek behind that read, so after a crash (no more output) it waited forever and the crash
+     * report was never written: the picture froze with the sound going on (2026-10-16, two players).
+     */
     fflush(stdout);
     fflush(stderr);
-    for (int i = 0; i < 20; i++) {
-        DWORD avail = 0;
-        if (!PeekNamedPipe(uwp_err_read, NULL, 0, NULL, &avail, NULL) || !avail) {
-            break;
-        }
-        Sleep(10);
+    Sleep(50);   /* the reader thread takes the last lines and splits them */
+}
+
+/*
+ * Safety net for a crash: if writing the report or the summary takes longer than 8 s (something it needs is
+ * stuck), xemu closes itself, so the player is back on the Home screen instead of a frozen picture.
+ */
+static HANDLE uwp_crash_started;
+
+static DWORD WINAPI uwp_crash_guard(void *arg)
+{
+    WaitForSingleObject(uwp_crash_started, INFINITE);
+    Sleep(8000);
+    TerminateProcess(GetCurrentProcess(), 0xE0000001);
+    return 0;
+}
+
+static void uwp_crash_guard_start(void)
+{
+    uwp_crash_started = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (uwp_crash_started) {
+        CloseHandle(CreateThread(NULL, 0, uwp_crash_guard, NULL, 0, NULL));
     }
-    Sleep(20);   /* the last chunk read is being split into lines */
 }
 
 /* Profiler state, see include/qemu/xemu-uwp.h. */
@@ -2833,6 +2853,9 @@ static const char *uwp_thread_role(char *name, size_t n)
 static void uwp_crash_report(const char *what, CONTEXT *ctx, void *const *frames, int nframes)
 {
     char name[40], line[320];
+    if (uwp_crash_started) {
+        SetEvent(uwp_crash_started);
+    }
     const char *role = uwp_thread_role(name, sizeof(name));
     uwp_err_drain();
     uwp_log("===== CRASH REPORT =====");
@@ -4909,6 +4932,7 @@ int main(int argc, char **argv)
     uwp_machine_running = true;
     setvbuf(stderr, NULL, _IONBF, 0);
     signal(SIGABRT, uwp_on_abort);
+    uwp_crash_guard_start();
     SetUnhandledExceptionFilter(uwp_on_crash);
     uwp_session_start_ms = SDL_GetTicks();
     uwp_session_start_tick = GetTickCount64();
