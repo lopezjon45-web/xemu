@@ -77,6 +77,9 @@ void pgraph_gl_reload_surface_scale_factor(PGRAPHState *pg)
 {
     int factor = g_config.display.quality.surface_scale;
     pg->surface_scale_factor = factor < 1 ? 1 : factor;
+#ifdef XEMU_UWP
+    pg->surface_scale_factor = xemu_uwp_cap_surface_scale(pg->surface_scale_factor);
+#endif
 }
 
 // FIXME: Move to common

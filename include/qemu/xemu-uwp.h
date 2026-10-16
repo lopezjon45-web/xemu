@@ -168,6 +168,8 @@ extern int uwp_dl_counts[UWP_DL__COUNT];
 void uwp_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 /* the app's memory: in use and still allowed by the console (bytes); false when it cannot be read */
 bool xemu_uwp_memory(uint64_t *used, uint64_t *left);
+/* the render scale to use: the setting held to what the TV shows and the memory allows (logs when lowered) */
+unsigned int xemu_uwp_cap_surface_scale(unsigned int want);
 #define UWP_DL_SITE(site) (uwp_dl_site = UWP_DL_##site)
 /* Event trace: the heartbeat hands out a small budget of lines now and then. */
 extern int uwp_trace_budget;

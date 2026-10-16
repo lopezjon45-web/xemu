@@ -2424,6 +2424,45 @@ bool xemu_uwp_memory(uint64_t *used, uint64_t *left)
     return uwp_memory(used, left);
 }
 
+/*
+ * The render scale actually used: the player's setting, held to what the TV can show (more lines than the screen
+ * has only cost memory) and to what the console's memory allows. Each scale step multiplies every game picture by
+ * scale x scale: at 10x a 4 MB picture needs 400 MB, and a player's session froze when that could not be had
+ * (2026-10-16, 1440p TV, 5086 MB allowed). Measured: about 2.0 GB at 1x, about 4.0 GB at 5x, so ~90 MB per
+ * scale squared on top of ~2 GB; 600 MB is kept back. Called from the graphics thread when surfaces are set up.
+ */
+unsigned int xemu_uwp_cap_surface_scale(unsigned int want)
+{
+    static unsigned screen_lines, last_want, last_used;
+    if (want <= 1) {
+        return 1;
+    }
+    if (!screen_lines) {
+        const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
+        screen_lines = mode && mode->h > 0 ? (unsigned)mode->h : 1080;
+    }
+    unsigned by_screen = (screen_lines + 479) / 480;   /* 1080 and 1440 lines: 3, 2160 (4K): 5 */
+    uint64_t used = 0, left = 0;
+    unsigned by_memory = 3;   /* when the memory cannot be read: safe for every game seen so far */
+    if (uwp_memory(&used, &left)) {
+        double room = (double)((used + left) >> 20) - 2000.0 - 600.0;
+        by_memory = room > 90.0 ? (unsigned)sqrt(room / 90.0) : 1;
+    }
+    unsigned use = MIN(want, MIN(by_screen, by_memory));
+    if (use < 1) {
+        use = 1;
+    }
+    if (want != last_want || use != last_used) {
+        last_want = want;
+        last_used = use;
+        if (use < want) {
+            uwp_log("render scale: %ux asked, %ux used (the TV shows %u lines, so up to %ux helps; memory allows up "
+                    "to %ux)", want, use, screen_lines, by_screen, by_memory);
+        }
+    }
+    return use;
+}
+
 static void uwp_box_sample(void)
 {
     {
