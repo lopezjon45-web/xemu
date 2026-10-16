@@ -2850,12 +2850,114 @@ static const char *uwp_thread_role(char *name, size_t n)
     return "a thread of the emulator or of the system (sound, disk, network)";
 }
 
+/*
+ * The game cache on the Xbox hard disk (partitions X, Y, Z). Sector 4 of the disk (offset 0x800) is the
+ * kernel's cache table: 0x97315286, a word, then one 12-byte entry per cache partition: title ID, partition
+ * (0..2), in use. A title that finds itself there reuses that partition's files; one that does not gets a
+ * partition formatted afresh. A session that crashes can leave half-written cache files, and the game then
+ * says the disc may be dirty on every start (a player's racing game, 2026-10-16). So: a crash notes the game
+ * (cache_check.txt next to the log), and its next start takes it out of the table first; Game Vault can also
+ * ask for it (clearcache=1). tid= is the game's ID from Game Vault, e.g. VU-003.
+ */
+static char uwp_title_key[8];
+static bool uwp_clear_cache_wanted;
+
+static uint32_t uwp_title_id(const char *key)
+{
+    /* "VU-003" -> 0x56550003 */
+    if (strlen(key) < 4 || key[2] != '-') {
+        return 0;
+    }
+    return ((uint32_t)(uint8_t)key[0] << 24) | ((uint32_t)(uint8_t)key[1] << 16) | (uint32_t)(atoi(key + 3) & 0xffff);
+}
+
+static char *uwp_cache_mark_path(void)
+{
+    char *own = SDL_GetPrefPath("xemu", "xemu");
+    char *path = g_strdup_printf("%scache_check.txt", own ? own : "");
+    SDL_free(own);
+    return path;
+}
+
+/* from the crash handlers: this game's cache may be half written */
+static void uwp_cache_mark_crash(void)
+{
+    if (!uwp_title_key[0]) {
+        return;
+    }
+    char *path = uwp_cache_mark_path();
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fputs(uwp_title_key, f);
+        fclose(f);
+    }
+    g_free(path);
+}
+
+/* in qemu_main after qemu_init (the main loop's lock held), before the game reaches its cache */
+static void uwp_game_cache_check(void)
+{
+    if (!uwp_title_key[0]) {
+        return;
+    }
+    const char *why = uwp_clear_cache_wanted ? "asked for in Game Vault" : NULL;
+    char *path = uwp_cache_mark_path();
+    gchar *mark = NULL;
+    if (g_file_get_contents(path, &mark, NULL, NULL)) {
+        if (!strcmp(g_strstrip(mark), uwp_title_key)) {
+            why = why ? why : "the last session of this game crashed";
+        }
+        g_remove(path);
+    }
+    g_free(mark);
+    g_free(path);
+    if (!why) {
+        return;
+    }
+    uint32_t tid = uwp_title_id(uwp_title_key);
+    BlockBackend *blk = blk_by_name("ide0-hd0");
+    uint8_t sec[512];
+    if (!tid || !blk || blk_pread(blk, 0x800, sizeof(sec), sec, 0) < 0) {
+        uwp_log("game cache: could not read the cache table (%s)", why);
+        return;
+    }
+    if (ldl_le_p(sec) != 0x97315286) {
+        uwp_log("game cache: no cache table on this hard disk yet (%s)", why);
+        return;
+    }
+    int cleared = 0;
+    for (int i = 0; i < 3; i++) {
+        uint8_t *e = sec + 8 + 12 * i;
+        if (ldl_le_p(e) == tid) {
+            stl_le_p(e, 0);
+            stl_le_p(e + 8, 0);
+            cleared++;
+        }
+    }
+    if (cleared && blk_pwrite(blk, 0x800, sizeof(sec), sec, 0) >= 0) {
+        blk_flush(blk);
+        uwp_event("game cache of %s cleared (%s): the game builds it again", uwp_title_key, why);
+    } else {
+        char held[64] = "";
+        for (int i = 0; i < 3; i++) {
+            uint32_t t = ldl_le_p(sec + 8 + 12 * i);
+            if (t) {
+                snprintf(held + strlen(held), sizeof(held) - strlen(held), "%s%c%c-%03u", held[0] ? ", " : "",
+                         (char)(t >> 24), (char)(t >> 16), t & 0xffff);
+            }
+        }
+        uwp_log("game cache: %s has none to clear (%s); the cache holds: %s", uwp_title_key, why,
+                held[0] ? held : "nothing");
+    }
+}
+
 static void uwp_crash_report(const char *what, CONTEXT *ctx, void *const *frames, int nframes)
 {
     char name[40], line[320];
     if (uwp_crash_started) {
         SetEvent(uwp_crash_started);
     }
+    uwp_cache_mark_crash();
     const char *role = uwp_thread_role(name, sizeof(name));
     uwp_err_drain();
     uwp_log("===== CRASH REPORT =====");
@@ -4032,6 +4134,21 @@ static char *uwp_take_activation_disc(void)
                 uwp_log("link: clock starts on %s", v);
             }
         }
+        if (!strncmp(p, "tid=", 4)) {
+            /* the game's ID from Game Vault (two letters, '-', digits): its cache entry (see uwp_game_cache_check) */
+            const char *v = p + 4;
+            bool ok = strlen(v) >= 4 && strlen(v) < sizeof(uwp_title_key) && v[2] == '-' && g_ascii_isalpha(v[0]) &&
+                      g_ascii_isalpha(v[1]);
+            for (const char *c = v + 3; ok && *c; c++) {
+                ok = g_ascii_isdigit(*c);
+            }
+            if (ok) {
+                g_strlcpy(uwp_title_key, v, sizeof(uwp_title_key));
+            }
+        }
+        if (!strcmp(p, "clearcache=1")) {
+            uwp_clear_cache_wanted = true;
+        }
         if (!strncmp(p, "warm=", 5)) {
             /* the game's ID (from Game Vault, e.g. VU-003): a shared shader warm-up list may lie in the
              * publisher's games\xbox-system\warm folder (gl/shaders.c uses it when this disc has no list yet) */
@@ -4654,6 +4771,9 @@ static void *qemu_main(void *opaque)
     uwp_log("qemu_init start");
 #endif
     qemu_init(gArgc, gArgv);
+#ifdef XEMU_UWP
+    uwp_game_cache_check();
+#endif
 #ifdef XEMU_UWP
     uwp_log("qemu_init done, entering main loop");
 #endif
