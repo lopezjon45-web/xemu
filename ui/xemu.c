@@ -58,6 +58,8 @@
 #include "hw/xbox/nv2a/debug.h"
 #ifdef XEMU_UWP
 #include "xemu-uwp-audio.h"
+#include <io.h>
+#include <fcntl.h>
 #endif
 #include "qemu/xemu-uwp.h"
 #include "system/block-backend.h"
@@ -1351,6 +1353,16 @@ void uwp_log(const char *fmt, ...)
     int n = snprintf(line, sizeof(line), "[%8.3f] ", SDL_GetTicks() / 1000.0);
     vsnprintf(line + n, sizeof(line) - n, fmt, ap);
     va_end(ap);
+    /*
+     * Several threads log (the xemu.log reader among them): one whole line at a time. Never wait forever:
+     * a crash report must still be written if the crashing thread died holding the lock.
+     */
+    static SRWLOCK lock = SRWLOCK_INIT;
+    BOOLEAN locked = TryAcquireSRWLockExclusive(&lock);
+    for (int i = 0; !locked && i < 200; i++) {
+        Sleep(1);
+        locked = TryAcquireSRWLockExclusive(&lock);
+    }
     fputs(line, f);
     fputc('\n', f);
     fflush(f);
@@ -1359,6 +1371,126 @@ void uwp_log(const char *fmt, ...)
         fputc('\n', uwp_log_copy);
         fflush(uwp_log_copy);
     }
+    if (locked) {
+        ReleaseSRWLockExclusive(&lock);
+    }
+}
+
+/*
+ * xemu.log (stdout and stderr: failed checks, QEMU errors, the GL driver's messages) used to stay in
+ * LocalState, was never part of a report, and was deleted at the next start. Both streams now go through
+ * a pipe: a reader thread writes everything to xemu.log as before and also puts each line, prefixed
+ * "xemu: ", into the progress log, so it lands in the game's shared log next to the fps lines and goes
+ * out with the reports. Repeated lines are folded and only the first UWP_ERR_MAX lines are copied, so a
+ * message in a loop cannot flood the log; xemu.log itself keeps everything.
+ */
+#define UWP_ERR_MAX 3000
+static HANDLE uwp_err_read;
+static FILE *uwp_err_file;
+
+static void uwp_err_line(const char *line)
+{
+    static char last[512];
+    static unsigned repeats, copied;
+    if (!strcmp(line, last)) {
+        repeats++;
+        return;
+    }
+    if (repeats) {
+        uwp_log("xemu: (the line above %u more times)", repeats);
+        repeats = 0;
+    }
+    snprintf(last, sizeof(last), "%s", line);
+    if (copied < UWP_ERR_MAX) {
+        uwp_log("xemu: %s", line);
+    } else if (copied == UWP_ERR_MAX) {
+        uwp_log("xemu: (more lines only in xemu.log)");
+    }
+    copied++;
+}
+
+static DWORD WINAPI uwp_err_thread(LPVOID unused)
+{
+    char buf[4096], line[512];
+    size_t len = 0;
+    DWORD got;
+    while (ReadFile(uwp_err_read, buf, sizeof(buf), &got, NULL) && got) {
+        fwrite(buf, 1, got, uwp_err_file);
+        fflush(uwp_err_file);
+        for (DWORD i = 0; i < got; i++) {
+            char c = buf[i];
+            if (c == '\n' || len == sizeof(line) - 1) {
+                while (len && line[len - 1] == '\r') {
+                    len--;
+                }
+                line[len] = '\0';
+                if (len) {
+                    uwp_err_line(line);
+                }
+                len = 0;
+                if (c == '\n') {
+                    continue;
+                }
+            }
+            line[len++] = c;
+        }
+    }
+    return 0;
+}
+
+/* Called right after stdout and stderr were opened on xemu.log; on any failure they simply stay there. */
+static void uwp_err_start(const char *log_path)
+{
+    HANDLE rd, wr;
+    if (!CreatePipe(&rd, &wr, NULL, 1 << 16)) {
+        return;
+    }
+    int fd = _open_osfhandle((intptr_t)wr, _O_BINARY | _O_WRONLY);
+    FILE *file = fopen(log_path, "ab");
+    if (fd < 0 || !file) {
+        if (file) {
+            fclose(file);
+        }
+        if (fd >= 0) {
+            _close(fd);
+        } else {
+            CloseHandle(wr);
+        }
+        CloseHandle(rd);
+        return;
+    }
+    uwp_err_read = rd;
+    uwp_err_file = file;
+    fflush(stdout);
+    fflush(stderr);
+    _dup2(fd, _fileno(stdout));
+    _dup2(fd, _fileno(stderr));
+    _close(fd);
+    SetStdHandle(STD_OUTPUT_HANDLE, (HANDLE)_get_osfhandle(_fileno(stdout)));
+    SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(_fileno(stderr)));
+    uwp_log("xemu.log lines follow as \"xemu: ...\"");   /* opens the progress log on this thread first */
+    HANDLE t = CreateThread(NULL, 0, uwp_err_thread, NULL, 0, NULL);
+    if (t) {
+        CloseHandle(t);
+    }
+}
+
+/* Before a crash report: give the reader thread a moment to pass on what was just written (an assert's text). */
+static void uwp_err_drain(void)
+{
+    if (!uwp_err_read) {
+        return;
+    }
+    fflush(stdout);
+    fflush(stderr);
+    for (int i = 0; i < 20; i++) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(uwp_err_read, NULL, 0, NULL, &avail, NULL) || !avail) {
+            break;
+        }
+        Sleep(10);
+    }
+    Sleep(20);   /* the last chunk read is being split into lines */
 }
 
 /* Profiler state, see include/qemu/xemu-uwp.h. */
@@ -2439,6 +2571,7 @@ static void uwp_crash_report(const char *what, CONTEXT *ctx, void *const *frames
 {
     char name[40], line[320];
     const char *role = uwp_thread_role(name, sizeof(name));
+    uwp_err_drain();
     uwp_log("===== CRASH REPORT =====");
     uwp_log("What happened: %s", what);
     uwp_log("In: %s (%s)", role, name);
@@ -4074,6 +4207,7 @@ int main(int argc, char **argv)
             freopen(log_path, "a", stderr);
             setvbuf(stdout, NULL, _IONBF, 0);
             setvbuf(stderr, NULL, _IONBF, 0);
+            uwp_err_start(log_path);
             g_free(log_path);
             /*
              * Mesa's shader cache (a Mesa build with the D3D12 DXIL / pipeline disk cache): shaders built in
