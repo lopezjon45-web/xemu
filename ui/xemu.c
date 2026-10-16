@@ -1649,6 +1649,16 @@ static void uwp_prof_report(double seconds)
             last_total = total;
         }
     }
+    {
+        /* main loop sleeps before timer deadlines (util/qemu-timer.c) */
+        extern uint64_t xemu_uwp_ml_sleeps, xemu_uwp_ml_late_ns, xemu_uwp_ml_woken;
+        uint64_t s = qatomic_xchg(&xemu_uwp_ml_sleeps, 0), l = qatomic_xchg(&xemu_uwp_ml_late_ns, 0),
+                 w = qatomic_xchg(&xemu_uwp_ml_woken, 0);
+        if (s) {
+            n += snprintf(line + n, sizeof(line) - n, " | ml sleeps %llu (woken %llu), late avg %.0f us",
+                          (unsigned long long)s, (unsigned long long)w, s > w ? l / 1e3 / (s - w) : 0.0);
+        }
+    }
     n += snprintf(line + n, sizeof(line) - n, " | wall%% (calls):");
     for (int i = 0; i < UWP_PROF__COUNT; i++) {
         int64_t t = uwp_prof_ticks[i];
@@ -2390,7 +2400,7 @@ static void uwp_box_sample(void)
          * how long the graphics waited on the console's GPU, disc reading (loading), the sound,
          * and the buttons held.
          */
-        static unsigned last_frames, last_dvd, last_dry;
+        static unsigned last_frames, last_dry;
         static int64_t last_sync;
         static uint64_t last_app, last_wall, last_sys_busy, last_sys_all;
         unsigned at = (unsigned)((SDL_GetTicks() - uwp_session_start_ms) / 1000);
@@ -2451,15 +2461,23 @@ static void uwp_box_sample(void)
         int gpu_wait = last_wall && wall > last_wall
                            ? (int)((sync - last_sync) * 100.0 / freq.QuadPart / ((wall - last_wall) / 1e7)) : 0;
         last_sync = sync;
-        unsigned dvd = uwp_prof_calls[UWP_PROF_DVD_READ], dry = xemu_uwp_audio_dry;
-        double disc_mb = (dvd - last_dvd) * 2048.0 / (1 << 20);
+        unsigned dry = xemu_uwp_audio_dry;
+        /* bytes the game read from the disc and the Xbox hard disk (hw/ide), DMA and PIO */
+        extern uint64_t xemu_uwp_hdd_read_bytes, xemu_uwp_dvd_read_bytes, xemu_uwp_dvd_reads;
+        static uint64_t last_hdd, last_dvd, last_reads;
+        uint64_t reads = qatomic_read(&xemu_uwp_dvd_reads);
+        uint64_t dvd = qatomic_read(&xemu_uwp_dvd_read_bytes), hdd = qatomic_read(&xemu_uwp_hdd_read_bytes);
+        double disc_mb = (dvd - last_dvd) / (double)(1 << 20), hdd_mb = (hdd - last_hdd) / (double)(1 << 20);
+        last_hdd = hdd;
+        unsigned nreads = (unsigned)(reads - last_reads);
+        last_reads = reads;
         uwp_log("SEC %u:%02u | %d fps, slowest frame %d ms, %d frames over 34 ms | CPU: game %d%%, graphics %d%%, "
                 "xemu %.1f cores%s | memory %llu of %llu MB | per frame: %ld objects drawn; this second: %ld shaders "
-                "built, %ld textures loaded | waiting on the GPU %d%% | disc %.1f MB/s | sound %s | holding: %s",
+                "built, %ld textures loaded | waiting on the GPU %d%% | disc %.1f MB/s (%u reads) | hard disk %.1f MB/s | sound %s | holding: %s",
                 at / 60, at % 60, g_nv2a_stats.increment_fps, slowest, late, xemu_uwp_thread_busy("vcpu", 5),
                 xemu_uwp_thread_busy("pfifo", 5), app_cores, console, (unsigned long long)(u >> 20),
                 (unsigned long long)((u + l) >> 20), n ? draws / (long)n : 0, shaders, textures,
-                gpu_wait > 100 ? 100 : gpu_wait, disc_mb,
+                gpu_wait > 100 ? 100 : gpu_wait, disc_mb, nreads, hdd_mb,
                 dry != last_dry ? "RAN DRY (the game could not make sound fast enough)" : "ok",
                 uwp_held_now_for_sec[0] ? uwp_held_now_for_sec : "no buttons");
         last_dvd = dvd;
@@ -3322,6 +3340,34 @@ static void uwp_log_hardware(void)
                                                 : "clock not known for this model";
     uwp_log("CPU: %s: %s; %lu logical processors visible to xemu (time-stamp counter %.0f MHz)",
             b[0] ? b : "(unknown)", clock, (unsigned long)si.dwNumberOfProcessors, mhz);
+    {
+        /* which logical processors share a physical core (SMT): threads on the same core slow each other */
+        typedef BOOL (WINAPI *GetSystemCpuSetInformation_fn)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+        GetSystemCpuSetInformation_fn sets =
+            (GetSystemCpuSetInformation_fn)xemu_uwp_kernelbase_proc("GetSystemCpuSetInformation");
+        static char buf[4096];
+        ULONG len = 0;
+        if (sets && sets((PSYSTEM_CPU_SET_INFORMATION)buf, sizeof(buf), &len, GetCurrentProcess(), 0)) {
+            char line[512];
+            int n = snprintf(line, sizeof(line), "CPU sets (id core/logical, a=allocated to xemu, r=reserved):");
+            for (ULONG off = 0; off < len && n < (int)sizeof(line) - 32;) {
+                PSYSTEM_CPU_SET_INFORMATION s = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+                if (s->Size == 0) {
+                    break;
+                }
+                if (s->Type == CpuSetInformation) {
+                    n += snprintf(line + n, sizeof(line) - n, " %lu %u/%u%s%s", (unsigned long)s->CpuSet.Id,
+                                  s->CpuSet.CoreIndex, s->CpuSet.LogicalProcessorIndex,
+                                  s->CpuSet.AllocatedToTargetProcess ? "a" : "",
+                                  s->CpuSet.Allocated && !s->CpuSet.AllocatedToTargetProcess ? "r" : "");
+                }
+                off += s->Size;
+            }
+            uwp_log("%s", line);
+        } else {
+            uwp_log("CPU sets: not available (%lu)", (unsigned long)GetLastError());
+        }
+    }
     if (have_mem) {
         uwp_log("memory the console gives games: %llu MB in all, %llu MB free", (unsigned long long)(ms.ullTotalPhys >> 20),
                 (unsigned long long)(ms.ullAvailPhys >> 20));

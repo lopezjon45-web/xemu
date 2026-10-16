@@ -321,6 +321,72 @@ int qemu_timeout_ns_to_ms(int64_t ns)
 }
 
 
+#if defined(XBOX) && defined(XEMU_UWP)
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+
+/* main loop sleep counters, for the log: sleeps, ns slept past the wake-up time, events that cut a sleep short */
+uint64_t xemu_uwp_ml_sleeps, xemu_uwp_ml_late_ns, xemu_uwp_ml_woken;
+
+/* Waits like g_poll for at most timeout ns, sleeping on a high-resolution timer until 0.2 ms before the end
+ * and spinning only the rest. On the console the timer fires about 0.5 ms late, so timers run about 0.3 ms
+ * late; a tail long enough to hide that (it was tried) made the main loop spin nearly all the time again,
+ * because guest timers fall due every millisecond. Returns -1 when it cannot (no timer, too many handles, spin-wait.txt test
+ * file): the caller then spins as before. */
+static int uwp_poll_precise(GPollFD *fds, guint nfds, int64_t timeout)
+{
+    static __thread int mode; /* 0 unknown, 1 on, 2 off; per thread, other threads poll too */
+    static __thread HANDLE timer;
+    if (!mode) {
+        timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        mode = timer && !xemu_uwp_test_file_exists("spin-wait.txt") ? 1 : 2;
+        uwp_log("main loop: %s", mode == 1 ? "sleeps on a high-resolution timer before timer deadlines"
+                                           : timer ? "spins before timer deadlines (spin-wait.txt)"
+                                                   : "spins before timer deadlines (no high-resolution timer)");
+    }
+    if (mode != 1 || nfds + 1 > MAXIMUM_WAIT_OBJECTS) {
+        return -1;
+    }
+    int64_t start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME), end = start + timeout;
+    const int64_t tail = 200000;
+    if (timeout > tail) {
+        GPollFD all[MAXIMUM_WAIT_OBJECTS];
+        memcpy(all, fds, nfds * sizeof(GPollFD));
+        all[nfds].fd = (gint64)(intptr_t)timer;
+        all[nfds].events = G_IO_IN;
+        all[nfds].revents = 0;
+        LARGE_INTEGER due = { .QuadPart = -((timeout - tail) / 100) }; /* relative, 100 ns units */
+        if (!SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+            mode = 2;
+            return -1;
+        }
+        /* the timer ends the wait; the 2 ms timeout only guards against a lost timer */
+        int r = g_poll(all, nfds + 1, 2);
+        bool fired = all[nfds].revents != 0;
+        if (!fired) {
+            CancelWaitableTimer(timer);
+        }
+        memcpy(fds, all, nfds * sizeof(GPollFD));
+        xemu_uwp_ml_sleeps++;
+        if (r > (fired ? 1 : 0)) {
+            xemu_uwp_ml_woken++;
+            return r - (fired ? 1 : 0);
+        }
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        if (now > end) {
+            xemu_uwp_ml_late_ns += now - end;
+        }
+    }
+    UWP_PROF_BEGIN(t_spin);
+    while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < end) {
+    }
+    UWP_PROF_END(ML_SPIN, t_spin);
+    return g_poll(fds, nfds, 0);
+}
+#endif
+
 /* qemu implementation of g_poll which uses a nanosecond timeout but is
  * otherwise identical to g_poll
  */
@@ -349,6 +415,16 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
      * near, to avoid missing deadlines due to costly sleeps.
      */
     #define XBOX_BUSYWAIT_THRESHOLD_NS 1250000
+#ifdef XEMU_UWP
+    /* Sleep on a precise timer and spin only the last stretch: the plain spin kept a whole console core
+     * busy (qemu_main ~93 %) next to the emulated CPU, and ignored events that came in meanwhile. */
+    if ((0 < timeout) && (timeout < XBOX_BUSYWAIT_THRESHOLD_NS)) {
+        int r = uwp_poll_precise(fds, nfds, timeout);
+        if (r >= 0) {
+            return r;
+        }
+    }
+#endif
     if ((0 < timeout) && (timeout < XBOX_BUSYWAIT_THRESHOLD_NS)) {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         int64_t end = now + timeout;

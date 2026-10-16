@@ -315,6 +315,9 @@
 #define SMART_STATUS          0xda
 
 extern const char *IDE_DMA_CMD_lookup[IDE_DMA__COUNT];
+#ifdef XEMU_UWP
+extern uint64_t xemu_uwp_hdd_read_bytes, xemu_uwp_dvd_read_bytes; /* core.c, for the log */
+#endif
 
 extern const MemoryRegionPortio ide_portio_list[];
 extern const MemoryRegionPortio ide_portio2_list[];

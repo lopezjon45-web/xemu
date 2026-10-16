@@ -26,6 +26,7 @@ bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
 
 static GHashTable *counts;      /* linear address -> samples, vCPU thread only */
 static GHashTable *dumped;      /* addresses whose code is already in the log */
+static GHashTable *stacks;      /* linear address -> the top of the stack at its last sample (8 dwords) */
 static unsigned total, halted;
 static int pending;
 
@@ -85,6 +86,25 @@ static void report(CPUState *cs)
                 g_string_append_printf(hex, "%02x", code[j]);
             }
             uwp_log("eip code %08x: %s", places[i].pc, hex->str);
+            uint32_t *st = g_hash_table_lookup(stacks, k);
+            if (st) {
+                uwp_log("eip stack %08x: %08x %08x %08x %08x %08x %08x %08x %08x", places[i].pc, st[0], st[1], st[2],
+                        st[3], st[4], st[5], st[6], st[7]);
+                /* code before stack words that look like kernel return addresses: the call sites */
+                for (int w = 0; w < 8; w++) {
+                    uint8_t site[64];
+                    if (st[w] < 0x80010000u || st[w] >= 0x80080000u ||
+                        cpu_memory_rw_debug(cs, st[w] - 48, site, sizeof(site), false) != 0) {
+                        continue;
+                    }
+                    GString *h = g_string_new(NULL);
+                    for (size_t j = 0; j < sizeof(site); j++) {
+                        g_string_append_printf(h, "%02x", site[j]);
+                    }
+                    uwp_log("eip site %08x (from %08x): %s", st[w] - 48, places[i].pc, h->str);
+                    g_string_free(h, true);
+                }
+            }
             g_string_free(hex, true);
         }
     }
@@ -104,6 +124,18 @@ static void sample(CPUState *cs, run_on_cpu_data data)
         gpointer key = GUINT_TO_POINTER(pc);
         g_hash_table_replace(counts, key,
                              GUINT_TO_POINTER(GPOINTER_TO_UINT(g_hash_table_lookup(counts, key)) + 1));
+        /* the stack names the callers of a hot loop (return addresses among these words) */
+        uint32_t *st = g_hash_table_lookup(stacks, key);
+        if (!st && g_hash_table_size(stacks) < 4096) {
+            st = g_new0(uint32_t, 8);
+            g_hash_table_insert(stacks, key, st);
+        }
+        if (st) {
+            target_ulong sp = env->segs[R_SS].base + env->regs[R_ESP];
+            if (cpu_memory_rw_debug(cs, sp, st, 8 * sizeof(uint32_t), false) != 0) {
+                memset(st, 0, 8 * sizeof(uint32_t));
+            }
+        }
     }
     if (++total >= REPORT_SAMPLES) {
         report(cs);
@@ -133,6 +165,7 @@ void xemu_uwp_eip_sampler_start(void)
     }
     counts = g_hash_table_new(NULL, NULL);
     dumped = g_hash_table_new(NULL, NULL);
+    stacks = g_hash_table_new_full(NULL, NULL, NULL, g_free);
     qemu_thread_create(&thread, "uwp_eip_sampler", sampler_thread, NULL, QEMU_THREAD_DETACHED);
     uwp_log("eip sampler: on (eip-sampler.txt)");
 }

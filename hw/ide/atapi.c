@@ -155,6 +155,9 @@ static int cd_read_sector(IDEState *s)
 {
     void *buf;
     UWP_PROF_COUNT(DVD_READ);
+#ifdef XEMU_UWP
+    qatomic_add(&xemu_uwp_dvd_read_bytes, ATAPI_SECTOR_SIZE); /* PIO reads, for the log */
+#endif
 
     if (s->cd_sector_size != 2048 && s->cd_sector_size != 2352) {
         block_acct_invalid(blk_get_stats(s->blk), BLOCK_ACCT_READ);
@@ -209,6 +212,39 @@ static void atapi_deferred_completion_cb(void *opaque)
     ide_bus_set_irq(s->bus);
 }
 
+#ifdef XEMU_UWP
+/* bytes of the DMA read now finishing (one DVD drive), counted in ide_atapi_cmd_read_dma_cb */
+static uint64_t atapi_read_bytes;
+uint64_t xemu_uwp_dvd_reads; /* read commands, for the log */
+bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+
+/*
+ * How long the finished read stays busy. A flat 5 ms for every read (#2957) held games that read the
+ * disc in small pieces to 200 reads a second: Turok loaded at 0.7 MB/s with the emulated CPU idle. A real
+ * drive answers small and sequential reads from its read-ahead cache at the speed of the ATA bus
+ * (UDMA mode 2, 33 MB/s), so the delay follows the size at that speed: a 128 KB read still takes
+ * about 4 ms (close to the 5 ms that fixed Rayman Arena's hang between races), 4 KB about 0.12 ms.
+ * Test file dvd-delay-5ms.txt brings back the flat 5 ms.
+ */
+static int64_t atapi_completion_delay_us(void)
+{
+    static int flat = -1;
+    if (flat < 0) {
+        flat = xemu_uwp_test_file_exists("dvd-delay-5ms.txt");
+        uwp_log("disc reads: %s", flat ? "5 ms each (dvd-delay-5ms.txt)" : "finish at the speed of the drive's bus");
+    }
+    uint64_t bytes = atapi_read_bytes;
+    atapi_read_bytes = 0;
+    xemu_uwp_dvd_reads++;
+    if (flat) {
+        return ATAPI_COMPLETION_DELAY_US;
+    }
+    return MAX(100, (int64_t)(bytes * 1000000 / (33 * 1000 * 1000)));
+}
+#else
+#define atapi_completion_delay_us() ATAPI_COMPLETION_DELAY_US
+#endif
+
 static void atapi_defer_completion(IDEState *s)
 {
     if (!atapi_completion_timer) {
@@ -219,7 +255,7 @@ static void atapi_defer_completion(IDEState *s)
     s->status = READY_STAT | SEEK_STAT | BUSY_STAT;
     atapi_completion_pending = s;
     timer_mod(atapi_completion_timer,
-              qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + ATAPI_COMPLETION_DELAY_US);
+              qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + atapi_completion_delay_us());
 }
 
 void ide_atapi_cmd_error(IDEState *s, int sense_key, int asc)
@@ -415,6 +451,10 @@ static void ide_atapi_cmd_read_dma_cb(void *opaque, int ret)
                 n = s->io_buffer_size >> 11;
             }
             s->lba += n;
+#ifdef XEMU_UWP
+            qatomic_add(&xemu_uwp_dvd_read_bytes, (uint64_t)n * ATAPI_SECTOR_SIZE); /* DMA reads, for the log */
+            atapi_read_bytes += (uint64_t)n * ATAPI_SECTOR_SIZE;
+#endif
         }
         s->packet_transfer_size -= s->io_buffer_size;
         if (s->bus->dma->ops->rw_buf(s->bus->dma, 1) == 0)

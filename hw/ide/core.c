@@ -767,6 +767,9 @@ void ide_cancel_dma_sync(IDEState *s)
     }
 }
 
+#ifdef XEMU_UWP
+uint64_t xemu_uwp_hdd_read_bytes, xemu_uwp_dvd_read_bytes; /* bytes read by the guest, for the log */
+#endif
 static void ide_sector_read(IDEState *s);
 
 static void ide_sector_read_cb(void *opaque, int ret)
@@ -793,6 +796,9 @@ static void ide_sector_read_cb(void *opaque, int ret)
 
     ide_set_sector(s, ide_get_sector(s) + n);
     s->nsector -= n;
+#ifdef XEMU_UWP
+    qatomic_add(&xemu_uwp_hdd_read_bytes, (uint64_t)n * BDRV_SECTOR_SIZE); /* for the log's MB/s */
+#endif
     /* Allow the guest to read the io_buffer */
     ide_transfer_start(s, s->io_buffer, n * BDRV_SECTOR_SIZE, ide_sector_read);
     ide_bus_set_irq(s->bus);
@@ -918,6 +924,11 @@ static void ide_dma_cb(void *opaque, int ret)
     }
 
     sector_num = ide_get_sector(s);
+#ifdef XEMU_UWP
+    if (n > 0 && s->dma_cmd == IDE_DMA_READ) {
+        qatomic_add(&xemu_uwp_hdd_read_bytes, (uint64_t)n * 512); /* for the log's MB/s */
+    }
+#endif
     if (n > 0) {
         assert(n * 512 == s->sg.size);
         ide_dma_buf_commit(s, s->sg.size);
