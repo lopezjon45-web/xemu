@@ -3468,6 +3468,19 @@ static DWORD WINAPI uwp_pgo_thread(void *arg)
 }
 #endif
 
+static bool uwp_machine_started;
+/* exit() before the machine ran: QEMU's own error text comes through the stderr pipe, which needs a moment */
+static void uwp_on_early_exit(void)
+{
+    if (uwp_machine_started) {
+        return;
+    }
+    fflush(stderr);
+    Sleep(300);
+    uwp_log("xemu stopped while starting (exit before the game ran); the lines above say why");
+    fflush(NULL);
+}
+
 static void uwp_on_exit(void)
 {
     uwp_session_summary("closed (quit, or the console closed the app)");
@@ -3878,6 +3891,13 @@ char *xemu_uwp_warm_seed(void)
 }
 static HANDLE uwp_share_handle;
 
+void xemu_uwp_open_note(LPCWSTR name, const char *what)
+{
+    char *n = g_utf16_to_utf8(name, -1, NULL, NULL, NULL);
+    uwp_log("open %s: %s", n ? n : "?", what);
+    g_free(n);
+}
+
 HANDLE xemu_uwp_shared_file(LPCWSTR name, DWORD access)
 {
     if (!uwp_share_token || !uwp_share_disc || (access & GENERIC_WRITE)) {
@@ -3900,6 +3920,7 @@ HANDLE xemu_uwp_shared_file(LPCWSTR name, DWORD access)
         typedef void *(SDLCALL *open_fn)(const char *, bool);
         HMODULE sdl = GetModuleHandleA("SDL3.dll");
         open_fn open = sdl ? (open_fn)GetProcAddress(sdl, "SDL_WinRTOpenSharedFile") : NULL;
+        uwp_log("disc: asking for Game Vault's share");
         uwp_share_handle = open ? (HANDLE)open(uwp_share_token, false) : NULL;
         uwp_log("disc: opened through Game Vault's share: %s", uwp_share_handle ? "yes" : open ? "no" : "no (old SDL)");
         if (!uwp_share_handle) {
@@ -4830,6 +4851,14 @@ int main(int argc, char **argv)
     display_very_early_init(NULL);
 #ifdef XEMU_UWP
     uwp_log("display_very_early_init done");
+    /*
+     * From here on a failure is logged: an error that ends xemu while it starts (exit, abort, crash) used to
+     * leave nothing but "qemu_init start" (games on a 1 TB drive, 2026-10-16).
+     */
+    signal(SIGABRT, uwp_on_abort);
+    uwp_crash_guard_start();
+    SetUnhandledExceptionFilter(uwp_on_crash);
+    atexit(uwp_on_early_exit);
     uwp_startup_disc();
 #endif
 
@@ -4932,7 +4961,6 @@ int main(int argc, char **argv)
     uwp_machine_running = true;
     setvbuf(stderr, NULL, _IONBF, 0);
     signal(SIGABRT, uwp_on_abort);
-    uwp_crash_guard_start();
     SetUnhandledExceptionFilter(uwp_on_crash);
     uwp_session_start_ms = SDL_GetTicks();
     uwp_session_start_tick = GetTickCount64();
@@ -4941,6 +4969,7 @@ int main(int argc, char **argv)
         SDL_GetWindowSizeInPixels(scon->real_window, &w, &h);
         uwp_story_start(w, h);
     }
+    uwp_machine_started = true;
     atexit(uwp_on_exit);
 #ifdef XEMU_PGO_GEN
     CloseHandle(CreateThread(NULL, 0, uwp_pgo_thread, NULL, 0, NULL));

@@ -59,11 +59,24 @@ extern unsigned int xemu_uwp_counters[UWP_CNT_MAX];
 
 /* ui/xemu.c: the disc image Game Vault shared through a token, when the normal open is refused */
 HANDLE xemu_uwp_shared_file(LPCWSTR name, DWORD access);
+/* one log line about opening a file the normal way failed (ui/xemu.c) */
+void xemu_uwp_open_note(LPCWSTR name, const char *what);
 
 static inline HANDLE xemu_uwp_create_file_w(LPCWSTR name, DWORD access,
                                             DWORD share, DWORD creation,
                                             DWORD flags)
 {
+    /*
+     * The disc Game Vault shared with us comes from that share first: asking the file broker for a drive this app
+     * has no consent for can wait for a consent prompt an Xbox never shows, until the console ends xemu (games on
+     * a 1 TB USB disk did not start at all after a reinstall, 2026-10-16).
+     */
+    if (!(access & GENERIC_WRITE)) {
+        HANDLE shared = xemu_uwp_shared_file(name, access);
+        if (shared != INVALID_HANDLE_VALUE) {
+            return shared;
+        }
+    }
     xemu_uwp_CreateFileFromAppW_fn fn = (xemu_uwp_CreateFileFromAppW_fn)
         xemu_uwp_kernelbase_proc("CreateFileFromAppW");
     if (fn) {
@@ -77,13 +90,21 @@ static inline HANDLE xemu_uwp_create_file_w(LPCWSTR name, DWORD access,
             *o = 0;
             name = fixed;
         }
+        bool usb = name[0] && name[1] == L':' && name[0] != L'Q' && name[0] != L'q';
+        if (usb) {
+            xemu_uwp_open_note(name, access & GENERIC_WRITE ? "asking the broker (write)" : "asking the broker (read)");
+        }
         HANDLE h = fn(name, access, share, NULL, creation, flags, NULL);
+        if (usb) {
+            xemu_uwp_open_note(name, h != INVALID_HANDLE_VALUE ? "broker: opened" : "broker: refused");
+        }
         if (h != INVALID_HANDLE_VALUE) {
             return h;
         }
     }
     HANDLE h = CreateFileW(name, access, share, NULL, creation, flags, NULL);
     if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED) {
+        xemu_uwp_open_note(name, "refused, trying Game Vault's share");
         /* the disc Game Vault shared with us (ui/xemu.c) */
         HANDLE shared = xemu_uwp_shared_file(name, access);
         if (shared != INVALID_HANDLE_VALUE) {
