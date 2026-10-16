@@ -1157,10 +1157,41 @@ static bool uwp_warm_replay(const UwpWarmPipe *p, GLuint fbo, GLuint vao)
 /* the list read at start, replayed by the warm-up thread */
 static UwpWarmRecord *uwp_warm_list;
 static int uwp_warm_list_len;
+
+/*
+ * What is in the list already (shader state + draw setup), so nothing goes in twice. A shader freed when
+ * memory runs low (uwp_shader_cache_trim) comes back without its "listed" mark and was written again:
+ * Ninja Gaiden's list was full (2048) with 171 repeats, and nothing new was learned after that.
+ */
+static GHashTable *uwp_warm_seen;
+static uint64_t uwp_warm_body_hash(const UwpWarmRecord *rec)
+{
+    return fast_hash((const uint8_t *)&rec->state, sizeof(*rec) - offsetof(UwpWarmRecord, state));
+}
+static int uwp_warm_by_time(const void *a, const void *b)
+{
+    uint32_t x = ((const UwpWarmRecord *)a)->ms, y = ((const UwpWarmRecord *)b)->ms;
+    return x < y ? -1 : x > y;
+}
+static bool uwp_warm_seen_add(const UwpWarmRecord *rec) /* false: it was there already */
+{
+    if (!uwp_warm_seen) {
+        uwp_warm_seen = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+    }
+    gint64 *key = g_new(gint64, 1);
+    *key = (gint64)uwp_warm_body_hash(rec);
+    if (g_hash_table_contains(uwp_warm_seen, key)) {
+        g_free(key);
+        return false;
+    }
+    g_hash_table_add(uwp_warm_seen, key);
+    return true;
+}
 #define UWP_WARM_THREADS 3
 extern GloContext *g_uwp_warm_context[UWP_WARM_THREADS]; /* renderer.c: one per warm-up thread */
 static int uwp_warm_threads_left;
 static char *uwp_warm_busy_path; /* exists while a warm-up runs */
+static int uwp_warm_unfinished; /* warm-ups before this one that ended unfinished, in a row (in the busy file) */
 static int uwp_warm_progress[UWP_WARM_THREADS]; /* next entry each thread will take */
 static int uwp_warm_before; /* entries [0, uwp_warm_before) are needed before the first frame */
 
@@ -1234,12 +1265,26 @@ static void uwp_warm_start(PGRAPHGLState *r)
     gsize len = 0;
     uint32_t want[3];
     uwp_warm_header(want);
-    /* a warm-up that never finished last time (xemu ended in it): do not trust that list */
+    /*
+     * A warm-up that never finished (xemu ended in it). Once is usually the player quitting early or the
+     * console closing xemu, and throwing the list away then cost the game all it had learned (every
+     * shader compiled with a stall again). Twice in a row: the list itself may be what stops xemu, so
+     * it is started anew. The busy file holds how many warm-ups before the last one ended unfinished.
+     */
     char *busy = g_strdup_printf("%s.busy", path);
     if (g_file_test(busy, G_FILE_TEST_EXISTS)) {
-        qemu_unlink(path);
-        qemu_unlink(busy);
-        uwp_log("shader warm-up: the last one did not finish, starting a new list");
+        gchar *count = NULL;
+        g_file_get_contents(busy, &count, NULL, NULL);
+        uwp_warm_unfinished = (count ? atoi(count) : 0) + 1;
+        g_free(count);
+        if (uwp_warm_unfinished >= 2) {
+            qemu_unlink(path);
+            qemu_unlink(busy);
+            uwp_warm_unfinished = 0;
+            uwp_log("shader warm-up: the last two did not finish, starting a new list");
+        } else {
+            uwp_log("shader warm-up: the last one did not finish (xemu was closed during it); list kept");
+        }
     }
     uwp_warm_busy_path = busy;
     if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
@@ -1287,6 +1332,32 @@ static void uwp_warm_start(PGRAPHGLState *r)
         }
     }
     g_free(path);
+    /* repeats written by earlier builds are dropped, and the list is written back without them, so
+       their room goes to shaders not learned yet */
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        if (uwp_warm_seen_add(&uwp_warm_list[i])) {
+            if (kept != i) {
+                uwp_warm_list[kept] = uwp_warm_list[i];
+            }
+            kept++;
+        }
+    }
+    if (kept < n) {
+        char *wpath = uwp_warm_path();
+        gsize wlen = sizeof(want) + kept * sizeof(UwpWarmRecord);
+        char *out = g_malloc(wlen);
+        memcpy(out, want, sizeof(want));
+        memcpy(out + sizeof(want), uwp_warm_list, kept * sizeof(UwpWarmRecord));
+        g_file_set_contents(wpath, out, wlen, NULL);
+        g_free(out);
+        g_free(wpath);
+        uwp_log("shader warm-up: %d repeats taken out of the list (%d left)", n - kept, kept);
+        n = kept;
+    }
+    /* in the order the game first needed them: each run adds its new shaders at the end, so one needed in
+       the first seconds but learned on a later run would otherwise wait behind all the others */
+    qsort(uwp_warm_list, n, sizeof(UwpWarmRecord), uwp_warm_by_time);
     uwp_warm_list_len = n;
     uwp_warm_count = n;
     uwp_warm_before = 0;
@@ -1307,7 +1378,9 @@ static void uwp_warm_start(PGRAPHGLState *r)
     qemu_mutex_unlock(&r->shader_cache_lock);
 
     if (n > 0 && g_uwp_warm_context[0]) {
-        g_file_set_contents(uwp_warm_busy_path, "", 0, NULL);
+        char count[16];
+        snprintf(count, sizeof(count), "%d", uwp_warm_unfinished);
+        g_file_set_contents(uwp_warm_busy_path, count, -1, NULL);
         /* the driver compiles in parallel: several threads finish before the logo needs them */
         uwp_warm_threads_left = UWP_WARM_THREADS;
         for (int t = 0; t < UWP_WARM_THREADS; t++) {
@@ -1467,6 +1540,10 @@ void uwp_warm_draw(PGRAPHGLState *r)
     while (glGetError() != GL_NO_ERROR) {
     }
     rec->check = uwp_warm_check(rec);
+    if (!uwp_warm_seen_add(rec)) {
+        g_free(rec);
+        return;
+    }
 
     char *path = uwp_warm_path();
     FILE *f = qemu_fopen(path, "ab");

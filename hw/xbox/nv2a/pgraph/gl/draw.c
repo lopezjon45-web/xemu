@@ -442,6 +442,9 @@ static void pgraph_gl_flush_draw_inner(NV2AState *d)
                                       pg->draw_arrays_max_count - 1,
                                       false, 0,
                                       pg->draw_arrays_max_count - 1);
+        /* like the other three kinds of draw: a shader only ever used by Draw Arrays was never put in
+           the warm-up list, so it was compiled with a stall at the same spot on every run (Orta) */
+        UWP_WARM_DRAW(r);
         { UWP_PROF_BEGIN(t_gld);
         glMultiDrawArrays(r->shader_binding->gl_primitive_mode,
                           pg->draw_arrays_start,
