@@ -39,19 +39,26 @@
 #include <emmintrin.h>
 #define UWP_MXCSR_CTL (SSE_RC_MASK | SSE_FZ | SSE_DAZ)
 
+/*
+ * A game that sets rounding, flush-to-zero or denormals-are-zero: the host's MXCSR is switched to the same
+ * only when it differs (writing MXCSR stalls the pipeline; switching to it and back around every
+ * instruction was the larger part of each call in a game's software video decoder) and left there. Flags
+ * keep collecting in the host's MXCSR, as with the default settings, and are folded in when the guest reads
+ * MXCSR (update_mxcsr_from_sse_status); a guest write puts the host back to the default (cpu_set_mxcsr).
+ */
 static inline void uwp_sse_begin(CPUX86State *env)
 {
     if (unlikely(env->mxcsr & UWP_MXCSR_CTL)) {
-        _mm_setcsr((env->mxcsr & UWP_MXCSR_CTL) | 0x1f80);
+        unsigned want = (env->mxcsr & UWP_MXCSR_CTL) | 0x1f80;
+        unsigned cur = _mm_getcsr();
+        if ((cur & 0xffc0) != want) {
+            _mm_setcsr(want | (cur & 0x3f));
+        }
     }
 }
 
 static inline void uwp_sse_end(CPUX86State *env)
 {
-    if (unlikely(env->mxcsr & UWP_MXCSR_CTL)) {
-        env->mxcsr |= _mm_getcsr() & 0x3f;
-        _mm_setcsr(0x1f80);
-    }
 }
 
 /*

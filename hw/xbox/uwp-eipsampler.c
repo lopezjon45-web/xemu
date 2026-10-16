@@ -90,8 +90,10 @@ static void report(CPUState *cs)
             if (st) {
                 uwp_log("eip stack %08x: %08x %08x %08x %08x %08x %08x %08x %08x", places[i].pc, st[0], st[1], st[2],
                         st[3], st[4], st[5], st[6], st[7]);
-                uwp_log("eip regs %08x: eax %08x ecx %08x edx %08x ebx %08x esp %08x ebp %08x esi %08x edi %08x",
-                        places[i].pc, st[8], st[9], st[10], st[11], st[12], st[13], st[14], st[15]);
+                uwp_log("eip regs %08x: eax %08x ecx %08x edx %08x ebx %08x esp %08x ebp %08x esi %08x edi %08x"
+                        " | mxcsr %04x fpuc %04x",
+                        places[i].pc, st[8], st[9], st[10], st[11], st[12], st[13], st[14], st[15],
+                        (unsigned)cpu_env(cs)->mxcsr, (unsigned)cpu_env(cs)->fpuc);
                 /* code before stack words that look like kernel return addresses: the call sites */
                 for (int w = 0; w < 8; w++) {
                     uint8_t site[64];

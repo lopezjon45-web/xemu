@@ -93,30 +93,42 @@ DEF_HELPER_3(glue(pshufhw, SUFFIX), void, Reg, Reg, int)
 /* FPU ops */
 /* XXX: not accurate */
 
+#ifdef XEMU_UWP
+/*
+ * These read and write only XMM/YMM registers (through the pointers) and MXCSR / sse_status, none of which
+ * are TCG globals, and raise no guest exception: TCG_CALL_NO_RWG lets the generated code keep the guest's
+ * general registers in host registers across the call instead of storing and reloading them all (SSE maths
+ * in a game's hot loop is one helper call per instruction).
+ */
+#define UWP_SSE_FLAGS TCG_CALL_NO_RWG
+#else
+#define UWP_SSE_FLAGS 0
+#endif
+
 #define SSE_HELPER_P4(name)                                             \
-    DEF_HELPER_4(glue(name ## ps, SUFFIX), void, env, Reg, Reg, Reg)    \
-    DEF_HELPER_4(glue(name ## pd, SUFFIX), void, env, Reg, Reg, Reg)
+    DEF_HELPER_FLAGS_4(glue(name ## ps, SUFFIX), UWP_SSE_FLAGS, void, env, Reg, Reg, Reg)    \
+    DEF_HELPER_FLAGS_4(glue(name ## pd, SUFFIX), UWP_SSE_FLAGS, void, env, Reg, Reg, Reg)
 
 #define SSE_HELPER_P3(name, ...)                                        \
-    DEF_HELPER_3(glue(name ## ps, SUFFIX), void, env, Reg, Reg)         \
-    DEF_HELPER_3(glue(name ## pd, SUFFIX), void, env, Reg, Reg)
+    DEF_HELPER_FLAGS_3(glue(name ## ps, SUFFIX), UWP_SSE_FLAGS, void, env, Reg, Reg)         \
+    DEF_HELPER_FLAGS_3(glue(name ## pd, SUFFIX), UWP_SSE_FLAGS, void, env, Reg, Reg)
 
 #if SHIFT == 1
 #define SSE_HELPER_S4(name)                                             \
     SSE_HELPER_P4(name)                                                 \
-    DEF_HELPER_4(name ## ss, void, env, Reg, Reg, Reg)                  \
-    DEF_HELPER_4(name ## sd, void, env, Reg, Reg, Reg)
+    DEF_HELPER_FLAGS_4(name ## ss, UWP_SSE_FLAGS, void, env, Reg, Reg, Reg)                  \
+    DEF_HELPER_FLAGS_4(name ## sd, UWP_SSE_FLAGS, void, env, Reg, Reg, Reg)
 #define SSE_HELPER_S3(name)                                             \
     SSE_HELPER_P3(name)                                                 \
-    DEF_HELPER_4(name ## ss, void, env, Reg, Reg, Reg)                  \
-    DEF_HELPER_4(name ## sd, void, env, Reg, Reg, Reg)
+    DEF_HELPER_FLAGS_4(name ## ss, UWP_SSE_FLAGS, void, env, Reg, Reg, Reg)                  \
+    DEF_HELPER_FLAGS_4(name ## sd, UWP_SSE_FLAGS, void, env, Reg, Reg, Reg)
 #else
 #define SSE_HELPER_S4(name, ...) SSE_HELPER_P4(name)
 #define SSE_HELPER_S3(name, ...) SSE_HELPER_P3(name)
 #endif
 
-DEF_HELPER_4(glue(shufps, SUFFIX), void, Reg, Reg, Reg, int)
-DEF_HELPER_4(glue(shufpd, SUFFIX), void, Reg, Reg, Reg, int)
+DEF_HELPER_FLAGS_4(glue(shufps, SUFFIX), UWP_SSE_FLAGS, void, Reg, Reg, Reg, int)
+DEF_HELPER_FLAGS_4(glue(shufpd, SUFFIX), UWP_SSE_FLAGS, void, Reg, Reg, Reg, int)
 
 SSE_HELPER_S4(add)
 SSE_HELPER_S4(sub)
