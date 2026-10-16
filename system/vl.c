@@ -3060,6 +3060,17 @@ void qemu_init(int argc, char **argv)
         fake_argv[fake_argc++] = strdup(flashrom_path);
     }
 
+#ifdef XEMU_UWP
+    {
+        /* testing: the console's clock from another day (link rtcbase=, ui/xemu.c) */
+        extern char *xemu_uwp_rtc_base;
+        if (xemu_uwp_rtc_base) {
+            fake_argv[fake_argc++] = strdup("-rtc");
+            fake_argv[fake_argc++] = g_strdup_printf("base=%sT12:00:00", xemu_uwp_rtc_base);
+        }
+    }
+#endif
+
     int mem = ((int)g_config.sys.mem_limit + 1) * 64;
     fake_argv[fake_argc++] = strdup("-m");
     fake_argv[fake_argc++] = g_strdup_printf("%d", mem);

@@ -1863,7 +1863,7 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
     }
     DWORD next_dump = GetTickCount() + every;
     /* for the renderer thread: who called, to tell what the graphics library asks the kernel for */
-    bool want_stacks = !strcmp(target, "pfifo");
+    bool want_stacks = true; /* both threads: which system calls and library functions the time goes to */
     uint64_t (*stacks)[UWP_STACK_FRAMES] =
         want_stacks ? g_malloc0(UWP_SAMPLES * sizeof(*stacks)) : NULL;
 
@@ -1969,7 +1969,7 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
              * stub in win32u / ntdll says which kernel service), the first
              * caller inside the GL driver, and the first caller in xemu.exe.
              */
-            static struct uwp_count where[160], gallium[160], ours[160], chains[160];
+            static __thread struct uwp_count where[160], gallium[160], ours[160], chains[160]; /* one sampler thread each */
             memset(chains, 0, sizeof(chains));
             memset(where, 0, sizeof(where));
             memset(gallium, 0, sizeof(gallium));
@@ -2037,10 +2037,15 @@ static DWORD WINAPI uwp_sampler_thread(void *arg)
                     uwp_count_add(chains, 160, chain);
                 }
             }
-            uwp_count_log("pfifo outside xemu, by export", where, 160, 24);
-            uwp_count_log("pfifo first caller in libgallium_wgl", gallium, 160, 24);
-            uwp_count_log("pfifo first caller in xemu.exe", ours, 160, 16);
-            uwp_count_log("pfifo call chains in libgallium_wgl (innermost first)", chains, 160, 12);
+            char title[96];
+            snprintf(title, sizeof(title), "%s outside xemu, by export", target);
+            uwp_count_log(title, where, 160, 24);
+            snprintf(title, sizeof(title), "%s first caller in libgallium_wgl", target);
+            uwp_count_log(title, gallium, 160, 24);
+            snprintf(title, sizeof(title), "%s first caller in xemu.exe", target);
+            uwp_count_log(title, ours, 160, 16);
+            snprintf(title, sizeof(title), "%s call chains in libgallium_wgl (innermost first)", target);
+            uwp_count_log(title, chains, 160, 12);
         }
 
         /* the same samples by guest address (start of the translated block) */
@@ -3650,6 +3655,25 @@ static bool uwp_test_links_allowed(void)
  * via xemu_uwp_create_file_w), read-only; the handle comes from SDL_WinRTOpenSharedFile (our SDL3 fork).
  */
 static char *uwp_share_token, *uwp_share_disc;
+char *xemu_uwp_rtc_base; /* link rtcbase= (testing), read by system/vl.c */
+static char uwp_warm_key[17]; /* link warm=: the game's ID for a shared shader warm-up list */
+static char *uwp_system_folder(void);
+
+/* The shared warm-up list for the game being started (games\xbox-system\warm\<ID>.bin), or NULL. */
+char *xemu_uwp_warm_seed(void);
+char *xemu_uwp_warm_seed(void)
+{
+    if (!uwp_warm_key[0]) {
+        return NULL;
+    }
+    char *sys = uwp_system_folder();
+    if (!sys) {
+        return NULL;
+    }
+    char *path = g_strdup_printf("%swarm\\%s.bin", sys, uwp_warm_key);
+    g_free(sys);
+    return path;
+}
 static HANDLE uwp_share_handle;
 
 HANDLE xemu_uwp_shared_file(LPCWSTR name, DWORD access)
@@ -3708,6 +3732,7 @@ static char *uwp_take_activation_disc(void)
             *end = '\0';
         }
         if (!tests && (!strcmp(p, "quit=1") || !strncmp(p, "state=", 6) || !strncmp(p, "press=", 6) ||
+                       !strncmp(p, "rtcbase=", 8) ||
                        !strcmp(p, "crashtest=1") || !strcmp(p, "dash=0") || !strcmp(p, "noflush=1") ||
                        !strcmp(p, "skipdraws=1"))) {
             refused = true;
@@ -3768,6 +3793,33 @@ static char *uwp_take_activation_disc(void)
                 share_token = g_strdup(t);
             } else {
                 uwp_log("link: disc token refused");
+            }
+        }
+        if (!strncmp(p, "rtcbase=", 8)) {
+            /* testing: start the console's clock on this day (YYYY-MM-DD) instead of today (system/vl.c) */
+            extern char *xemu_uwp_rtc_base;
+            const char *v = p + 8;
+            bool ok = strlen(v) == 10 && v[4] == '-' && v[7] == '-';
+            for (int i = 0; ok && i < 10; i++) {
+                ok = i == 4 || i == 7 || g_ascii_isdigit(v[i]);
+            }
+            if (ok) {
+                g_free(xemu_uwp_rtc_base);
+                xemu_uwp_rtc_base = g_strdup(v);
+                uwp_log("link: clock starts on %s", v);
+            }
+        }
+        if (!strncmp(p, "warm=", 5)) {
+            /* the game's ID (from Game Vault, e.g. VU-003): a shared shader warm-up list may lie in the
+             * publisher's games\xbox-system\warm folder (gl/shaders.c uses it when this disc has no list yet) */
+            const char *v = p + 5;
+            size_t len = strlen(v);
+            bool ok = len > 0 && len <= 16;
+            for (const char *c = v; ok && *c; c++) {
+                ok = g_ascii_isalnum(*c) || *c == '-';
+            }
+            if (ok) {
+                g_strlcpy(uwp_warm_key, v, sizeof(uwp_warm_key));
             }
         }
         if (!strncmp(p, "fit=", 4)) {

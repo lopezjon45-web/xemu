@@ -1242,6 +1242,21 @@ static void uwp_warm_start(PGRAPHGLState *r)
         uwp_log("shader warm-up: the last one did not finish, starting a new list");
     }
     uwp_warm_busy_path = busy;
+    if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
+        /* none yet for this disc: start from the shared list for the game, if Game Vault put one there
+         * (made on another console; the records are checked as for any list) */
+        extern char *xemu_uwp_warm_seed(void); /* ui/xemu.c */
+        char *seed = xemu_uwp_warm_seed();
+        gchar *seed_data = NULL;
+        gsize seed_len = 0;
+        if (seed && g_file_get_contents(seed, &seed_data, &seed_len, NULL) && seed_len >= sizeof(want) &&
+            seed_len <= 8 * 1024 * 1024 && g_file_set_contents(path, seed_data, seed_len, NULL)) {
+            uwp_log("shader warm-up: starting from the shared list for this game (%u KB)",
+                    (unsigned)(seed_len >> 10));
+        }
+        g_free(seed_data);
+        g_free(seed);
+    }
     if (!g_file_get_contents(path, &data, &len, NULL)) {
         uwp_log("shader warm-up: no list yet");
         g_free(path);
