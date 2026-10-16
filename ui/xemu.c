@@ -2533,8 +2533,78 @@ unsigned int xemu_uwp_cap_surface_scale(unsigned int want)
     return use;
 }
 
+/*
+ * A start that never shows a picture: no frame at all, not even the Xbox start-up animation (players saw a game
+ * sit like that for 10 minutes, 2026-10-16). Counted once a second while xemu is in front: after 25 s with no
+ * frame since the start, the emulated console is restarted once by itself; if it is still blank 25 s after that,
+ * the log says so and nothing more is done. A frame ends the watch. uwp_watch_start() starts it again when the
+ * launcher swaps the disc.
+ */
+static void uwp_event(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+uint64_t uwp_background_since_ms(bool set, bool clear);
+static struct {
+    bool on, restarted;
+    unsigned frames, quiet;
+} uwp_watch = { .on = true };
+
+static void uwp_watch_start(void)
+{
+    uwp_watch.on = true;
+    uwp_watch.restarted = false;
+    uwp_watch.frames = g_nv2a_stats.frame_count;
+    uwp_watch.quiet = 0;
+}
+
+/* nothing shown since the start (or the last restart): the session is stuck, not worth continuing */
+static bool uwp_watch_no_picture(void)
+{
+    return uwp_watch.on && g_nv2a_stats.frame_count == uwp_watch.frames && uwp_watch.quiet >= 5;
+}
+
+static void uwp_watch_second(void)
+{
+    /* testing: watch-test.txt next to xemu.toml makes the watch ignore the frames, as if nothing were shown */
+    static int fake = -1;
+    if (fake < 0) {
+        char *own = SDL_GetPrefPath("xemu", "xemu");
+        char *f = g_strdup_printf("%swatch-test.txt", own ? own : "");
+        fake = g_file_test(f, G_FILE_TEST_EXISTS);
+        if (fake) {
+            uwp_log("start watch: test file, frames ignored");
+        }
+        g_free(f);
+        SDL_free(own);
+    }
+    if (!uwp_watch.on || uwp_background_since_ms(false, false) || !runstate_is_running()) {
+        return;
+    }
+    if (fake) {
+        uwp_watch.frames = g_nv2a_stats.frame_count;
+    }
+    if (g_nv2a_stats.frame_count != uwp_watch.frames) {
+        uwp_watch.on = false;   /* a picture: the start worked */
+        return;
+    }
+    if (++uwp_watch.quiet < 25) {
+        return;
+    }
+    if (uwp_watch.restarted) {
+        uwp_event("still no picture 25 s after the restart: this game may not start in xemu yet");
+        uwp_watch.on = false;
+        return;
+    }
+    uwp_event("no picture 25 s after the start: restarting the emulated console once");
+    xemu_main_loop_lock();
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    xemu_main_loop_unlock();
+    uwp_watch.restarted = true;
+    uwp_watch.frames = g_nv2a_stats.frame_count;
+    uwp_watch.quiet = 0;
+}
+
 static void uwp_box_sample(void)
 {
+    uwp_watch_second();
     {
         /*
          * One line a second, everything that says how the game ran:
@@ -4507,8 +4577,15 @@ static void uwp_poll_activation(void)
         return;
     }
     const char *current = g_config.sys.files.dvd_path;
-    if (current && !g_ascii_strcasecmp(current, disc)) {
+    if (current && !g_ascii_strcasecmp(current, disc) && !uwp_watch_no_picture()) {
         uwp_log("launcher asked for the disc that is already running");
+    } else if (current && !g_ascii_strcasecmp(current, disc)) {
+        /* the same game picked again while it never showed anything: start it again, not the stuck session */
+        uwp_event("the game was picked again and had shown nothing yet: restarting it");
+        xemu_main_loop_lock();
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        xemu_main_loop_unlock();
+        uwp_watch_start();
     } else {
         Error *err = NULL;
         xemu_main_loop_lock();
@@ -4519,6 +4596,7 @@ static void uwp_poll_activation(void)
         } else {
             uwp_log("disc changed by launcher: %s", disc);
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            uwp_watch_start();
         }
         xemu_main_loop_unlock();
     }
