@@ -71,6 +71,17 @@ static void xbox_pm_gpio_write(void *opaque, hwaddr addr, uint64_t val,
     XBOX_DPRINTF("pm gpio write [0x%llx] = 0x%llx\n", addr, val);
 
     if (addr == XBOX_PM_GPIO_ASPECT_RATIO) {
+#ifdef XEMU_UWP
+        {
+            /* the picture shape the game asked for (5 = widescreen), each change once */
+            extern void uwp_log(const char *fmt, ...);
+            static int64_t last = -1;
+            if ((int64_t)val != last) {
+                last = val;
+                uwp_log("picture shape from the game: %s (gpio %u)", val == 5 ? "16:9" : "4:3", (unsigned)val);
+            }
+        }
+#endif
         xemu_set_widescreen(val == 5);
     }
 

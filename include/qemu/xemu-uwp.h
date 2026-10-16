@@ -57,6 +57,9 @@ enum {
 };
 extern unsigned int xemu_uwp_counters[UWP_CNT_MAX];
 
+/* ui/xemu.c: the disc image Game Vault shared through a token, when the normal open is refused */
+HANDLE xemu_uwp_shared_file(LPCWSTR name, DWORD access);
+
 static inline HANDLE xemu_uwp_create_file_w(LPCWSTR name, DWORD access,
                                             DWORD share, DWORD creation,
                                             DWORD flags)
@@ -79,7 +82,16 @@ static inline HANDLE xemu_uwp_create_file_w(LPCWSTR name, DWORD access,
             return h;
         }
     }
-    return CreateFileW(name, access, share, NULL, creation, flags, NULL);
+    HANDLE h = CreateFileW(name, access, share, NULL, creation, flags, NULL);
+    if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED) {
+        /* the disc Game Vault shared with us (ui/xemu.c) */
+        HANDLE shared = xemu_uwp_shared_file(name, access);
+        if (shared != INVALID_HANDLE_VALUE) {
+            return shared;
+        }
+        SetLastError(ERROR_ACCESS_DENIED);
+    }
+    return h;
 }
 
 static inline PVOID xemu_uwp_virtual_alloc(PVOID addr, SIZE_T size,

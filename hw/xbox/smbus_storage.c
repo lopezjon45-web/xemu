@@ -53,6 +53,38 @@ typedef struct SMBusStorageDevice {
     bool persist;
 } SMBusStorageDevice;
 
+#ifdef XEMU_UWP
+void uwp_log(const char *fmt, ...);
+/* -1: as stored; 0 or 1: the launch link's widescreen= (ui/xemu.c), for this session only */
+int xemu_uwp_widescreen = -1;
+
+/*
+ * The EEPROM's video flags (user section, offset 0x94; 0x00010000 = widescreen) set as Game Vault asked,
+ * in memory only: the player's file changes only if the dashboard saves its settings. The user section
+ * checksum (0x60, over 0x64..0xBF) is made again, as the kernel checks it.
+ */
+static void uwp_eeprom_widescreen(uint8_t *e)
+{
+    if (xemu_uwp_widescreen < 0) {
+        return;
+    }
+    uint32_t flags = ldl_le_p(e + 0x94);
+    uint32_t want = xemu_uwp_widescreen ? flags | 0x00010000 : flags & ~0x00010000u;
+    if (want != flags) {
+        stl_le_p(e + 0x94, want);
+        uint32_t high = 0, low = 0;
+        for (int i = 0; i < 0x5C / 4; i++) {
+            uint32_t val = ldl_le_p(e + 0x64 + 4 * i);
+            uint64_t sum = ((uint64_t)high << 32) | low;
+            high = (sum + val) >> 32;
+            low += val;
+        }
+        stl_le_p(e + 0x60, ~(high + low));
+    }
+    uwp_log("EEPROM: widescreen %s for this session", xemu_uwp_widescreen ? "on" : "off");
+}
+#endif
+
 static void smbus_storage_realize(DeviceState *dev, Error **errp)
 {
     SMBusStorageDevice *s = SMBUS_STORAGE(dev);
@@ -82,6 +114,11 @@ static void smbus_storage_realize(DeviceState *dev, Error **errp)
             return;
         }
         close(fd);
+#ifdef XEMU_UWP
+        if (s->addr == 0x54 && s->size == 256) {
+            uwp_eeprom_widescreen(s->data);
+        }
+#endif
     } else {
         error_setg(errp, "%s: file unspecified\n", __func__);
     }

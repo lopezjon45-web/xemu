@@ -3643,6 +3643,52 @@ static bool uwp_test_links_allowed(void)
     return allowed;
 }
 
+/*
+ * A drive this app may not open itself (the console remembers a refused consent per app, e.g. a big USB hard
+ * disk): Game Vault, which can, shares the disc image with SharedStorageAccessManager and passes the token as
+ * disctoken=. It is used only for that disc and only when opening it the normal way fails (block/file-win32.c
+ * via xemu_uwp_create_file_w), read-only; the handle comes from SDL_WinRTOpenSharedFile (our SDL3 fork).
+ */
+static char *uwp_share_token, *uwp_share_disc;
+static HANDLE uwp_share_handle;
+
+HANDLE xemu_uwp_shared_file(LPCWSTR name, DWORD access)
+{
+    if (!uwp_share_token || !uwp_share_disc || (access & GENERIC_WRITE)) {
+        return INVALID_HANDLE_VALUE;
+    }
+    char *n = g_utf16_to_utf8(name, -1, NULL, NULL, NULL);
+    bool same = n && !g_ascii_strcasecmp(n, uwp_share_disc);
+    if (!same && n) {
+        /* the same path with the other kind of slashes */
+        for (char *c = n; *c; c++) {
+            *c = *c == '\\' ? '/' : *c;
+        }
+        same = !g_ascii_strcasecmp(n, uwp_share_disc);
+    }
+    g_free(n);
+    if (!same) {
+        return INVALID_HANDLE_VALUE;
+    }
+    if (!uwp_share_handle) {
+        typedef void *(SDLCALL *open_fn)(const char *, bool);
+        HMODULE sdl = GetModuleHandleA("SDL3.dll");
+        open_fn open = sdl ? (open_fn)GetProcAddress(sdl, "SDL_WinRTOpenSharedFile") : NULL;
+        uwp_share_handle = open ? (HANDLE)open(uwp_share_token, false) : NULL;
+        uwp_log("disc: opened through Game Vault's share: %s", uwp_share_handle ? "yes" : open ? "no" : "no (old SDL)");
+        if (!uwp_share_handle) {
+            uwp_share_handle = INVALID_HANDLE_VALUE;
+        }
+    }
+    HANDLE dup = INVALID_HANDLE_VALUE;
+    if (uwp_share_handle != INVALID_HANDLE_VALUE &&
+        !DuplicateHandle(GetCurrentProcess(), uwp_share_handle, GetCurrentProcess(), &dup, 0, FALSE,
+                         DUPLICATE_SAME_ACCESS)) {
+        dup = INVALID_HANDLE_VALUE;
+    }
+    return dup;
+}
+
 static char *uwp_take_activation_disc(void)
 {
     const char *hint = SDL_GetHint(UWP_ACTIVATION_HINT);
@@ -3652,7 +3698,7 @@ static char *uwp_take_activation_disc(void)
     char *uri = g_strdup(hint);
     SDL_SetHint(UWP_ACTIVATION_HINT, "");
 
-    char *disc = NULL;
+    char *disc = NULL, *share_token = NULL;
     bool fps = false;
     bool tests = uwp_test_links_allowed(), refused = false;
     char *query = strchr(uri, '?');
@@ -3702,6 +3748,41 @@ static char *uwp_take_activation_disc(void)
         if (!strcmp(p, "fps=1")) {
             fps = true;
         }
+        if (!strcmp(p, "widescreen=1") || !strcmp(p, "widescreen=0")) {
+            /* the console's 16:9 setting for this session (Game Vault, Menu > Picture): games that
+             * support widescreen then draw 16:9 and fill the TV (hw/xbox/smbus_storage.c) */
+            extern int xemu_uwp_widescreen;
+            xemu_uwp_widescreen = p[11] == '1';
+            uwp_log("link: widescreen %s", xemu_uwp_widescreen ? "on" : "off");
+        }
+        if (!strncmp(p, "disctoken=", 10)) {
+            /* letters, digits, '-' and braces only (a GUID-like token), at most 100 characters */
+            const char *t = p + 10;
+            size_t len = strlen(t);
+            bool ok = len > 0 && len <= 100;
+            for (const char *c = t; ok && *c; c++) {
+                ok = g_ascii_isalnum(*c) || *c == '-' || *c == '{' || *c == '}';
+            }
+            if (ok) {
+                g_free(share_token);
+                share_token = g_strdup(t);
+            } else {
+                uwp_log("link: disc token refused");
+            }
+        }
+        if (!strncmp(p, "fit=", 4)) {
+            /* how the picture fills the TV, chosen in Game Vault (Menu > Picture): for this session only */
+            const char *v = p + 4;
+            int fit = !strcmp(v, "stretch") ? CONFIG_DISPLAY_UI_FIT_STRETCH
+                      : !strcmp(v, "scale")  ? CONFIG_DISPLAY_UI_FIT_SCALE
+                      : !strcmp(v, "center") ? CONFIG_DISPLAY_UI_FIT_CENTER : -1;
+            if (fit >= 0) {
+                g_config.display.ui.fit = fit;
+                uwp_log("link: picture %s", v);
+            } else {
+                uwp_log("link: picture setting refused");
+            }
+        }
         if (!strncmp(p, "home=", 5)) {
             /* saves are moved into it: only "<drive>:/Game Vault", the folder Game Vault makes */
             char *home = uwp_unescape(p + 5);
@@ -3746,6 +3827,19 @@ static char *uwp_take_activation_disc(void)
         g_free(disc);
         disc = NULL;
     }
+    if (disc) {
+        /* a new disc: a token from an earlier link no longer applies */
+        g_free(uwp_share_token);
+        g_free(uwp_share_disc);
+        if (uwp_share_handle && uwp_share_handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(uwp_share_handle);
+        }
+        uwp_share_handle = NULL;
+        uwp_share_token = share_token;
+        uwp_share_disc = share_token ? g_strdup(disc) : NULL;
+        share_token = NULL;
+    }
+    g_free(share_token);
     return disc;
 }
 
