@@ -63,6 +63,49 @@ int xemu_uwp_widescreen = -1;
  * in memory only: the player's file changes only if the dashboard saves its settings. The user section
  * checksum (0x60, over 0x64..0xBF) is made again, as the kernel checks it.
  */
+/* the user section checksum (0x60, over 0x64..0xBF), made again after a change: the kernel checks it */
+static void uwp_eeprom_user_checksum(uint8_t *e)
+{
+    uint32_t high = 0, low = 0;
+    for (int i = 0; i < 0x5C / 4; i++) {
+        uint32_t val = ldl_le_p(e + 0x64 + 4 * i);
+        uint64_t sum = ((uint64_t)high << 32) | low;
+        high = (sum + val) >> 32;
+        low += val;
+    }
+    stl_le_p(e + 0x60, ~(high + low));
+}
+
+/*
+ * Games that carry several languages pick one from the EEPROM (user section, 0x90): set it to the Xbox's own
+ * language for the session, in memory only (the player's file changes only if the dashboard saves). Xbox codes:
+ * 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian, 7 Korean, 8 Chinese, 9 Portuguese.
+ * A language the original Xbox did not have stays as stored.
+ */
+static void uwp_eeprom_language(uint8_t *e)
+{
+    wchar_t name[LOCALE_NAME_MAX_LENGTH] = L"";
+    if (!GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH)) {
+        return;
+    }
+    static const struct { const wchar_t *tag; uint32_t code; const char *what; } map[] = {
+        { L"en", 1, "English" }, { L"ja", 2, "Japanese" }, { L"de", 3, "German" }, { L"fr", 4, "French" },
+        { L"es", 5, "Spanish" }, { L"it", 6, "Italian" }, { L"ko", 7, "Korean" }, { L"zh", 8, "Chinese" },
+        { L"pt", 9, "Portuguese" },
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+        if (!_wcsnicmp(name, map[i].tag, 2) && (name[2] == 0 || name[2] == L'-')) {
+            uint32_t was = ldl_le_p(e + 0x90);
+            if (was != map[i].code) {
+                stl_le_p(e + 0x90, map[i].code);
+                uwp_eeprom_user_checksum(e);
+            }
+            uwp_log("EEPROM: language %s for this session (the Xbox's own language; was %u)", map[i].what, was);
+            return;
+        }
+    }
+}
+
 static void uwp_eeprom_widescreen(uint8_t *e)
 {
     if (xemu_uwp_widescreen < 0) {
@@ -72,14 +115,7 @@ static void uwp_eeprom_widescreen(uint8_t *e)
     uint32_t want = xemu_uwp_widescreen ? flags | 0x00010000 : flags & ~0x00010000u;
     if (want != flags) {
         stl_le_p(e + 0x94, want);
-        uint32_t high = 0, low = 0;
-        for (int i = 0; i < 0x5C / 4; i++) {
-            uint32_t val = ldl_le_p(e + 0x64 + 4 * i);
-            uint64_t sum = ((uint64_t)high << 32) | low;
-            high = (sum + val) >> 32;
-            low += val;
-        }
-        stl_le_p(e + 0x60, ~(high + low));
+        uwp_eeprom_user_checksum(e);
     }
     uwp_log("EEPROM: widescreen %s for this session", xemu_uwp_widescreen ? "on" : "off");
 }
@@ -116,6 +152,7 @@ static void smbus_storage_realize(DeviceState *dev, Error **errp)
         close(fd);
 #ifdef XEMU_UWP
         if (s->addr == 0x54 && s->size == 256) {
+            uwp_eeprom_language(s->data);
             uwp_eeprom_widescreen(s->data);
         }
 #endif
