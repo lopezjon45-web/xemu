@@ -1194,9 +1194,15 @@ static void display_very_early_init(DisplayOptions *o)
         glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &formats);
         uwp_log("GL program binary formats: %d (0 = shaders cannot be cached)", formats);
         const char *rend = (const char *)glGetString(GL_RENDERER);
-        /* the D3D12 adapter's driver name carries the chip's code name */
-        const char *model = rend && strstr(rend, "arden") ? " (Xbox Series X GPU: 52 compute units, 12 TFLOPS)"
-                          : rend && strstr(rend, "lockhart") ? " (Xbox Series S GPU: 20 compute units, 4 TFLOPS)" : "";
+        /*
+         * The model from the processor's name: the D3D12 driver is called "SraKmd_arden" (the Series X chip's
+         * code name) on a Series S too (seen in a Series S report, 2026-10-15).
+         */
+        extern const char *uwp_cpu_brand(char brand[49]);
+        char brand[49];
+        const char *cpu = uwp_cpu_brand(brand);
+        const char *model = strstr(cpu, "Series X") ? " (Xbox Series X GPU: 52 compute units, 12 TFLOPS)"
+                          : strstr(cpu, "Series S") ? " (Xbox Series S GPU: 20 compute units, 4 TFLOPS)" : "";
         uwp_log("GPU: %s | %s%s | OpenGL %s", (const char *)glGetString(GL_VENDOR), rend ? rend : "?", model,
                 (const char *)glGetString(GL_VERSION));
     }
@@ -1374,6 +1380,25 @@ void uwp_log(const char *fmt, ...)
     if (locked) {
         ReleaseSRWLockExclusive(&lock);
     }
+}
+
+/* The processor's name ("Microsoft Xbox Series S CPU" and so on), without leading spaces. */
+const char *uwp_cpu_brand(char brand[49])
+{
+    unsigned int r[4];
+    memset(brand, 0, 49);
+    __get_cpuid(0x80000000, &r[0], &r[1], &r[2], &r[3]);
+    if (r[0] >= 0x80000004) {
+        for (unsigned int i = 0; i < 3; i++) {
+            __get_cpuid(0x80000002 + i, &r[0], &r[1], &r[2], &r[3]);
+            memcpy(brand + i * 16, r, 16);
+        }
+    }
+    const char *b = brand;
+    while (*b == ' ') {
+        b++;
+    }
+    return b;
 }
 
 /*
@@ -2680,11 +2705,57 @@ const char *xemu_uwp_shot_wanted(void)
     return uwp_shot_label;
 }
 
+/*
+ * The frame was all black: an event's picture is tried again on the next frames (about 5 s), the
+ * 10-second picture is just skipped. Black pictures used to take one of the few report slots.
+ */
+static unsigned uwp_shot_black_tries;
+
+void xemu_uwp_shot_black(const char *label)
+{
+    if (label[0] && uwp_shot_black_tries++ < 300) {
+        uwp_shot_request(label);
+    } else {
+        uwp_shot_black_tries = 0;
+    }
+}
+
+/*
+ * "<minutes>-<seconds>-<tag>.png": the tag is the first few words of the event, letters and digits
+ * only, joined by '-' ("000-00-BIOS-the-players-own.png"), cut at a word, never mid-word.
+ */
+static void uwp_shot_tag(const char *label, char *out, size_t n)
+{
+    size_t len = 0, word_end = 0;
+    bool gap = false;
+    for (const char *c = label; *c && len + 1 < n; c++) {
+        if (g_ascii_isalnum(*c)) {
+            if (gap && len) {
+                word_end = len;
+                if (len + 2 >= n || len >= 28) {
+                    break;
+                }
+                out[len++] = '-';
+            }
+            out[len++] = *c;
+            gap = false;
+        } else if (*c != '\'') {
+            gap = true;
+        }
+    }
+    if (len >= 28 && word_end) {
+        len = word_end;
+    }
+    out[len] = '\0';
+}
+
 void xemu_uwp_shot_save(const char *label, const void *png, size_t size)
 {
     unsigned at = (unsigned)((SDL_GetTicks() - uwp_session_start_ms) / 1000);
-    char name[96];
-    snprintf(name, sizeof(name), "%03u-%02u%s%s.png", at / 60, at % 60, label[0] ? " " : "", label);
+    char name[96], tag[40];
+    uwp_shot_black_tries = 0;
+    uwp_shot_tag(label, tag, sizeof(tag));
+    snprintf(name, sizeof(name), "%03u-%02u%s%s.png", at / 60, at % 60, tag[0] ? "-" : "", tag);
     char *path = g_strdup_printf("%s\\%s", uwp_shot_dir, name);
     FILE *f = fopen(path, "wb");
     if (f) {
@@ -3196,19 +3267,8 @@ static const char *uwp_version_text(void)
  */
 static void uwp_log_hardware(void)
 {
-    char brand[49] = "";
-    unsigned int r[4];
-    __get_cpuid(0x80000000, &r[0], &r[1], &r[2], &r[3]);
-    if (r[0] >= 0x80000004) {
-        for (unsigned int i = 0; i < 3; i++) {
-            __get_cpuid(0x80000002 + i, &r[0], &r[1], &r[2], &r[3]);
-            memcpy(brand + i * 16, r, 16);
-        }
-    }
-    char *b = brand;
-    while (*b == ' ') {
-        b++;
-    }
+    char brand[49];
+    const char *b = uwp_cpu_brand(brand);
     LARGE_INTEGER f, q0, q1;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&q0);
@@ -4551,6 +4611,7 @@ char *xemu_uwp_disc_filename(const char *path)
         }
         CloseHandle(h);
     } else {
+        /* error 5 on a drive that needs the broker: the console refused this app file access */
         uwp_log("disc: cannot open %s (error %lu)", path, GetLastError());
     }
     if (!found) {

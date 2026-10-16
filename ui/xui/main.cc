@@ -60,6 +60,7 @@ extern "C" bool xemu_uwp_overlay_on;
 #ifdef XEMU_UWP
 extern "C" const char *xemu_uwp_shot_wanted(void);
 extern "C" void xemu_uwp_shot_save(const char *label, const void *png, size_t size);
+extern "C" void xemu_uwp_shot_black(const char *label);
 #endif
 #include "compat.hh"
 #if defined(_WIN32)
@@ -225,6 +226,8 @@ void xemu_hud_update(void)
         std::vector<uint8_t> png;
         if (label && g_tex && RenderFramebufferToPng(g_tex, g_flip_req, png, 320, 240)) {
             xemu_uwp_shot_save(label, png.data(), png.size());
+        } else if (label) {
+            xemu_uwp_shot_black(label);
         }
 #endif
     }

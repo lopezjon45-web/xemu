@@ -1006,6 +1006,19 @@ bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, in
     glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
     fbo.Restore();
 
+#ifdef XEMU_UWP
+    /* an all-black frame (before the first picture, between scenes) is not worth a picture */
+    if (max_width && max_width <= 640) {
+        bool black = true;
+        for (size_t i = 0; i < pixels.size() && black; i++) {
+            black = pixels[i] < 8;
+        }
+        if (black) {
+            png.clear();
+            return false;
+        }
+    }
+#endif
     return fpng::fpng_encode_image_to_memory(pixels.data(), width, height, 3, png);
 }
 

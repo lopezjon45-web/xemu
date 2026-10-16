@@ -32,8 +32,8 @@ static inline FARPROC xemu_uwp_kernelbase_proc(const char *name)
  * CreateFileW works in an app container only where the package itself has
  * been granted access (its own folders, or an NTFS volume with an ACL for
  * ALL APPLICATION PACKAGES). CreateFileFromAppW goes through the storage
- * broker when direct access is refused, which is what makes FAT32 / exFAT
- * USB drives readable with the broadFileSystemAccess capability. The handle
+ * broker when direct access is refused, which is what makes drives without
+ * that ACL readable with the broadFileSystemAccess capability. The handle
  * is an ordinary file handle (ReadFile, overlapped I/O, SetFilePointerEx).
  */
 typedef HANDLE (WINAPI *xemu_uwp_CreateFileFromAppW_fn)(
@@ -63,6 +63,16 @@ static inline HANDLE xemu_uwp_create_file_w(LPCWSTR name, DWORD access,
     xemu_uwp_CreateFileFromAppW_fn fn = (xemu_uwp_CreateFileFromAppW_fn)
         xemu_uwp_kernelbase_proc("CreateFileFromAppW");
     if (fn) {
+        /* the broker takes only backslashes; xemu's paths often have '/' */
+        wchar_t fixed[MAX_PATH * 4];
+        if (wcslen(name) < ARRAYSIZE(fixed)) {
+            wchar_t *o = fixed;
+            for (LPCWSTR c = name; *c; c++) {
+                *o++ = *c == L'/' ? L'\\' : *c;
+            }
+            *o = 0;
+            name = fixed;
+        }
         HANDLE h = fn(name, access, share, NULL, creation, flags, NULL);
         if (h != INVALID_HANDLE_VALUE) {
             return h;
