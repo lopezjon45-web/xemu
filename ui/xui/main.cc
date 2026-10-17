@@ -166,6 +166,15 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
         update_window.CheckForUpdates();
     }
 #endif
+#ifdef XEMU_UWP
+    /*
+     * The menu fonts and their texture now, while no other thread uses the graphics driver yet. Made on the first
+     * frame instead, with the renderer thread already at work, Mesa crashed there on one Series S at 1440p (three
+     * games, 2026-10-17: write to 0x68 under ImGui_ImplOpenGL3_CreateFontsTexture, 2 s into the session).
+     */
+    g_viewport_mgr.Update();
+    g_font_mgr.Update();   /* builds the fonts and their texture (FontManager::Rebuild) */
+#endif
     g_last_scale = g_viewport_mgr.m_scale;
     InitializeStyle();
     g_main_menu.SetNextViewIndex(g_config.general.last_viewed_menu_index);

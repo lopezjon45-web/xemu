@@ -1218,6 +1218,18 @@ static void *uwp_warm_thread(void *arg)
 
     int built = 0, drawn = 0, failed = 0;
     for (int i = job->index; i < uwp_warm_list_len; i += UWP_WARM_THREADS) {
+        /*
+         * Every shader made costs memory the game may need: a player's Munch's Oddysee list (1468 draws) took the
+         * console's 5.1 GB in 25 s and xemu ended (2026-10-17). With less than 1.5 GB still allowed the warm-up
+         * stops here; whatever is left gets made when the game draws it, as without a list.
+         */
+        uint64_t used, left;
+        if ((i / UWP_WARM_THREADS) % 16 == 0 && xemu_uwp_memory(&used, &left) && left < (1536ull << 20)) {
+            uwp_log("shader warm-up thread %d: stopped at entry %d of %d, memory nearly used (%llu MB in use, "
+                    "%llu MB still allowed)", job->index, i, uwp_warm_list_len, (unsigned long long)(used >> 20),
+                    (unsigned long long)(left >> 20));
+            break;
+        }
         qatomic_set(&uwp_warm_progress[job->index], i);
         UwpWarmRecord *rec = &uwp_warm_list[i];
         uint64_t hash = fast_hash((uint8_t *)&rec->state, sizeof(ShaderState));
