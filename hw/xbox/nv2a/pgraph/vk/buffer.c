@@ -76,7 +76,13 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+#ifdef XEMU_UWP
+        /* for 5x surfaces at most (vk/surface.c caps the scale): 10x took 800 MB of the console's 5 GB per
+         * buffer, and Dozen ran out of memory before the first frame */
+        .buffer_size = (1024 * 5) * (1024 * 5) * 8,
+#else
         .buffer_size = (1024 * 10) * (1024 * 10) * 8,
+#endif
     };
 
     r->storage_buffers[BUFFER_COMPUTE_SRC] = (StorageBuffer){
@@ -90,7 +96,11 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+#ifdef XEMU_UWP
+        .buffer_size = sizeof(pg->inline_elements) * 20,   /* 40 MB, not 200 MB (and its staging copy) */
+#else
         .buffer_size = sizeof(pg->inline_elements) * 100,
+#endif
     };
 
     r->storage_buffers[BUFFER_INDEX_STAGING] = (StorageBuffer){
@@ -114,8 +124,15 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+#ifdef XEMU_UWP
+        /* room for two of the largest batches (134 MB each); a full ring is flushed first (ensure_buffer_space).
+         * Ten of them (1.3 GB, and as much again for the staging copy) did not fit in the console's 5 GB. */
+        .buffer_size = NV2A_VERTEXSHADER_ATTRIBUTES * NV2A_MAX_BATCH_LENGTH *
+                       4 * sizeof(float) * 2,
+#else
         .buffer_size = NV2A_VERTEXSHADER_ATTRIBUTES * NV2A_MAX_BATCH_LENGTH *
                        4 * sizeof(float) * 10,
+#endif
     };
 
     r->storage_buffers[BUFFER_VERTEX_INLINE_STAGING] = (StorageBuffer){

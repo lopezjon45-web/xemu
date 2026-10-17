@@ -525,6 +525,26 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
                             level->depth, buffer_offset);
             memcpy(mapped_memory_ptr + buffer_offset, level->decoded_data,
                    level->decoded_size);
+#ifdef XEMU_UWP
+            {
+                /* test switch (vk-pal-white.txt): palette textures solid white, to tell a bad texture from a
+                 * draw that never shows */
+                extern bool xemu_uwp_vk_pal_white;
+                if (xemu_uwp_vk_pal_white &&
+                    state->color_format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8) {
+                    memset(mapped_memory_ptr + buffer_offset, 0xff, level->decoded_size);
+                }
+                /* test switch (vk-pal-opaque.txt): palette textures keep their colours but lose transparency */
+                extern bool xemu_uwp_vk_pal_opaque;
+                if (xemu_uwp_vk_pal_opaque &&
+                    state->color_format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8) {
+                    uint8_t *px = mapped_memory_ptr + buffer_offset;
+                    for (size_t i = 3; i < level->decoded_size; i += 4) {
+                        px[i] = 0xff;
+                    }
+                }
+            }
+#endif
             *region = (VkBufferImageCopy){
                 .bufferOffset = buffer_offset,
                 .bufferRowLength = 0, // Tightly packed
@@ -1166,6 +1186,14 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
             d, texture_vram_offset, texture_length, texture_palette_vram_offset,
             texture_palette_data_size);
     }
+#ifdef XEMU_UWP
+    /* Palette textures are compared by content every time (they are small). A game can fill one after it was
+     * first loaded without the write being seen as dirty, and the empty first copy stayed: Ninja Gaiden's item and
+     * save message boxes were invisible on Vulkan (all index 0 = the clear colour). */
+    if (is_indexed && !surface_to_texture) {
+        possibly_dirty = true;
+    }
+#endif
 
     // Calculate hash of texture data, if necessary
     void *texture_data = (char*)d->vram_ptr + texture_vram_offset;
@@ -1179,6 +1207,49 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         }
     }
 
+#ifdef XEMU_UWP
+    extern int xemu_uwp_vk_capture;
+    if (is_indexed) {
+        /* palette textures (the first 40, and all in a captured frame): ui boxes vanished on Dozen */
+        static int logged;
+        if (logged < 40 || qatomic_read(&xemu_uwp_vk_capture) == 1) {
+            logged++;
+            const uint32_t *pal = (const uint32_t *)palette_data;
+            unsigned n = texture_palette_data_size / 4, clear = 0;
+            for (unsigned i = 0; i < n; i++) {
+                clear += (pal[i] >> 24) == 0;
+            }
+            /* pixels that are not the clear colours, and how the texture is sampled */
+            const uint8_t *idx = (const uint8_t *)texture_data;
+            size_t shown = 0;
+            for (size_t i = 0; i < texture_length; i++) {
+                shown += idx[i] < n && (pal[idx[i]] >> 24) != 0;
+            }
+            fprintf(stderr, "vk   %zu of %zu pixels not clear, filter %08x, address %08x, border %08x\n", shown,
+                    texture_length, filter, address, border_color_pack32);
+            fprintf(stderr, "vk palette texture %ux%u lv %u at %x (%zu bytes), palette at %x, %u colours, %u clear, "
+                    "first %08x, %s%s%s\n", state.width, state.height, state.levels, (unsigned)texture_vram_offset,
+                    texture_length, (unsigned)texture_palette_vram_offset, n, clear, n ? pal[0] : 0,
+                    binding_found ? "cached" : "new", possibly_dirty ? ", possibly dirty" : "",
+                    surface_to_texture ? ", FROM A SURFACE" : "");
+        }
+    } else if (qatomic_read(&xemu_uwp_vk_capture) == 1) {
+        /* every other texture of a captured frame: Ninja Gaiden's item message uses A8 (0x19) textures */
+        size_t nonzero = 0;
+        if (!surface_to_texture) {
+            const uint8_t *b = (const uint8_t *)texture_data;
+            for (size_t i = 0; i < texture_length; i++) {
+                nonzero += b[i] != 0;
+            }
+        }
+        fprintf(stderr, "vk texture %d: fmt %02x %ux%u lv %u at %x (%zu bytes, %zu not zero), filter %08x, "
+                "address %08x, %s%s%s\n", texture_idx, state.color_format, state.width, state.height, state.levels,
+                (unsigned)texture_vram_offset, texture_length, nonzero, filter, address,
+                binding_found ? "cached" : "new", possibly_dirty ? ", possibly dirty" : "",
+                surface_to_texture ? ", FROM A SURFACE" : (surface ? ", over a surface (not used as one)" : ""));
+    }
+#endif
+
     if (binding_found) {
         if (surface_to_texture) {
             // FIXME: Add draw time tracking
@@ -1187,6 +1258,17 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
             }
         } else {
             if (possibly_dirty && content_hash != snode->hash) {
+#ifdef XEMU_UWP
+                if (is_indexed) {
+                    /* a palette texture whose contents changed after it was loaded (see above), first 20 */
+                    static int reloads;
+                    if (reloads < 20) {
+                        reloads++;
+                        fprintf(stderr, "vk palette texture at %x %ux%u changed in memory: loaded again\n",
+                                (unsigned)texture_vram_offset, state.width, state.height);
+                    }
+                }
+#endif
                 upload_texture_image(pg, texture_idx, snode);
                 snode->hash = content_hash;
             }
@@ -1371,6 +1453,23 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         .pNext = sampler_next_struct,
     };
 
+#ifdef XEMU_UWP
+    {
+        /* test switch (vk-tex-test.txt): Mortal Kombat's 3D scene shows flat colours on Dozen */
+        extern int xemu_uwp_vk_tex_test;
+        if (xemu_uwp_vk_tex_test & 1) {
+            sampler_create_info.minLod = sampler_create_info.maxLod = 0.0f;
+            sampler_create_info.mipLodBias = 0.0f;
+        }
+        if (xemu_uwp_vk_tex_test & 2) {
+            sampler_create_info.anisotropyEnable = VK_FALSE;
+        }
+        if (xemu_uwp_vk_tex_test & 4) {
+            sampler_create_info.minFilter = sampler_create_info.magFilter = VK_FILTER_NEAREST;
+            sampler_create_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        }
+    }
+#endif
     VK_CHECK(vkCreateSampler(r->device, &sampler_create_info, NULL,
                              &snode->sampler));
 

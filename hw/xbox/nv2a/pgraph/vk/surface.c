@@ -74,6 +74,12 @@ void pgraph_vk_reload_surface_scale_factor(PGRAPHState *pg)
 {
     int factor = g_config.display.quality.surface_scale;
     pg->surface_scale_factor = MAX(factor, 1);
+#ifdef XEMU_UWP
+    /* as the OpenGL renderer: held to what the TV shows and the memory allows, and never over 5 (the compute
+     * buffers are sized for 5x on the console, see buffer.c) */
+    extern unsigned int xemu_uwp_cap_surface_scale(unsigned int want);
+    pg->surface_scale_factor = MIN(xemu_uwp_cap_surface_scale(pg->surface_scale_factor), 5);
+#endif
 }
 
 // FIXME: Move to common
@@ -796,9 +802,20 @@ static void create_surface_image(PGRAPHState *pg, SurfaceBinding *surface)
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
     };
 
+#ifdef XEMU_UWP
+    {
+        VkResult res = vmaCreateImage(r->allocator, &image_create_info, &alloc_create_info, &surface->image,
+                                      &surface->allocation, NULL);
+        if (res != VK_SUCCESS)
+            fprintf(stderr, "surface image %ux%u, vk format %d, usage 0x%x: vk_result %d\n", width, height,
+                    (int)image_create_info.format, (unsigned)image_create_info.usage, (int)res);
+        VK_CHECK(res);
+    }
+#else
     VK_CHECK(vmaCreateImage(r->allocator, &image_create_info,
                             &alloc_create_info, &surface->image,
                             &surface->allocation, NULL));
+#endif
 
     VK_CHECK(vmaCreateImage(r->allocator, &image_create_info,
                             &alloc_create_info, &surface->image_scratch,

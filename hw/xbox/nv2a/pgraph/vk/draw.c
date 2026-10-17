@@ -734,6 +734,13 @@ static void create_pipeline(PGRAPHState *pg)
     uint32_t control_0 = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0);
     bool depth_test = control_0 & NV_PGRAPH_CONTROL_0_ZENABLE;
     bool depth_write = !!(control_0 & NV_PGRAPH_CONTROL_0_ZWRITEENABLE);
+#ifdef XEMU_UWP
+    /* test switch (vk-zwrite-off.txt next to xemu.toml): no depth writes while the depth test is off, as OpenGL */
+    extern bool xemu_uwp_vk_zwrite_off;
+    if (xemu_uwp_vk_zwrite_off && !depth_test) {
+        depth_write = false;
+    }
+#endif
     bool stencil_test =
         pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1) & NV_PGRAPH_CONTROL_1_STENCIL_TEST_ENABLE;
 
@@ -1504,6 +1511,11 @@ static void end_draw(PGRAPHState *pg)
     r->in_draw = false;
 }
 
+#ifdef XEMU_UWP
+/* 2: capture asked for (ui/xemu.c, vk-capture.txt), 1: capturing this frame, 0: off */
+int xemu_uwp_vk_capture;
+#endif
+
 void pgraph_vk_draw_end(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -1532,7 +1544,70 @@ void pgraph_vk_draw_end(NV2AState *d)
         return;
     }
 
+#ifdef XEMU_UWP
+    int new_kind = 0;
+    {
+        /* each new kind of draw logged the first time it is seen, to find the draws Vulkan loses */
+        static uint64_t seen[1024];
+        static int nseen;
+        uint32_t texfmt[2] = { 0, 0 };
+        for (int i = 0; i < 2; i++) {
+            if (pgraph_reg_r(pg, NV_PGRAPH_TEXCTL0_0 + i * 4) & NV_PGRAPH_TEXCTL0_0_ENABLE) {
+                texfmt[i] = 0x80 | GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_TEXFMT0 + i * 4), NV_PGRAPH_TEXFMT0_COLOR);
+            }
+        }
+        int path = pg->inline_array_length ? 1 : pg->inline_elements_length ? 2 :
+                   pg->inline_buffer_length ? 3 : pg->draw_arrays_length ? 4 : 0;
+        int blend = !!(pgraph_reg_r(pg, NV_PGRAPH_BLEND) & NV_PGRAPH_BLEND_EN);
+        int vsmode = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_D), NV_PGRAPH_CSV0_D_MODE);
+        uint64_t key = (uint64_t)pg->primitive_mode | (uint64_t)texfmt[0] << 8 | (uint64_t)texfmt[1] << 16 |
+                       (uint64_t)path << 24 | (uint64_t)blend << 28 | (uint64_t)depth_test << 29 |
+                       (uint64_t)vsmode << 30 | (uint64_t)(control_0 & 0xff000000u) << 32;
+        int found = 0;
+        for (int i = 0; i < nseen; i++) {
+            if (seen[i] == key) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found && nseen < (int)ARRAY_SIZE(seen)) {
+            seen[nseen++] = key;
+            new_kind = nseen;
+            fprintf(stderr, "vk new draw kind %d: prim %d, tex0 fmt %s%x, tex1 fmt %s%x, path %d (1 inline array, "
+                    "2 inline elements, 3 inline buffer, 4 arrays), blend %d, depth %d, vs mode %d, control_0 %08x, "
+                    "draw_time %u\n", nseen, pg->primitive_mode, texfmt[0] ? "" : "off/", texfmt[0] & 0x7f,
+                    texfmt[1] ? "" : "off/", texfmt[1] & 0x7f, path, blend, depth_test, vsmode, control_0,
+                    (unsigned)pg->draw_time);
+        }
+    }
+#endif
+
     pgraph_vk_flush_draw(d);
+
+#ifdef XEMU_UWP
+    if (qatomic_read(&xemu_uwp_vk_capture) == 1) {
+        /* one frame captured (vk-capture.txt): every draw with the state that decides whether it shows */
+        SurfaceBinding *c = r->color_binding;
+        fprintf(stderr, "cap draw %u: prim %d, tex0 %08x/%08x, tex1 %08x/%08x, control 0-3 %08x %08x %08x %08x, "
+                "blend %08x, setupraster %08x, combinectl %08x, shaderprog %08x, csv0_d %08x, "
+                "windowclip x0 %08x y0 %08x, color %x %ux%u\n",
+                (unsigned)pg->draw_time, pg->primitive_mode,
+                pgraph_reg_r(pg, NV_PGRAPH_TEXCTL0_0), pgraph_reg_r(pg, NV_PGRAPH_TEXFMT0),
+                pgraph_reg_r(pg, NV_PGRAPH_TEXCTL0_0 + 4), pgraph_reg_r(pg, NV_PGRAPH_TEXFMT0 + 4),
+                control_0, pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1), pgraph_reg_r(pg, NV_PGRAPH_CONTROL_2),
+                pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3), pgraph_reg_r(pg, NV_PGRAPH_BLEND),
+                pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER), pgraph_reg_r(pg, NV_PGRAPH_COMBINECTL),
+                pgraph_reg_r(pg, NV_PGRAPH_SHADERPROG), pgraph_reg_r(pg, NV_PGRAPH_CSV0_D),
+                pgraph_reg_r(pg, NV_PGRAPH_WINDOWCLIPX0), pgraph_reg_r(pg, NV_PGRAPH_WINDOWCLIPY0),
+                c ? (unsigned)c->vram_addr : 0, c ? c->width : 0, c ? c->height : 0);
+    }
+    if (new_kind) {
+        SurfaceBinding *c = r->color_binding, *z = r->zeta_binding;
+        fprintf(stderr, "vk   kind %d drew into color %x %ux%u, zeta %x %ux%u; display at %x\n", new_kind,
+                c ? (unsigned)c->vram_addr : 0, c ? c->width : 0, c ? c->height : 0,
+                z ? (unsigned)z->vram_addr : 0, z ? z->width : 0, z ? z->height : 0, (unsigned)d->pcrtc.start);
+    }
+#endif
 
     pg->draw_time++;
     if (r->color_binding && pgraph_color_write_enabled(pg)) {
@@ -1887,6 +1962,13 @@ static void get_size_and_count_for_format(VkFormat fmt, size_t *size, size_t *co
         [VK_FORMAT_R32G32B32_SFLOAT] =      { 4, 3 },
         [VK_FORMAT_R32G32B32A32_SFLOAT] =   { 4, 4 },
         [VK_FORMAT_R32_SINT] =              { 4, 1 },
+#ifdef XEMU_UWP
+        /* integer reads of formats D3D12 lacks (vk/vertex.c) */
+        [VK_FORMAT_R8G8B8A8_UINT] =         { 1, 4 },
+        [VK_FORMAT_R16_SINT] =              { 2, 1 },
+        [VK_FORMAT_R16G16_SINT] =           { 2, 2 },
+        [VK_FORMAT_R16G16B16A16_SINT] =     { 2, 4 },
+#endif
     };
 
     assert(fmt < ARRAY_SIZE(table));
@@ -1929,18 +2011,25 @@ static VertexBufferRemap remap_unaligned_attributes(PGRAPHState *pg,
         size_t element_size, element_count;
         get_size_and_count_for_format(attr->format, &element_size, &element_count);
 
+#ifdef XEMU_UWP
+        /* D3D12 (Dozen) wants vertex data at 4-byte boundaries: a 2-byte aligned stride (Mortal Kombat:
+         * Shaolin Monks, 3 shorts in 18 bytes) is copied as for an unaligned one */
+        size_t align = MAX(element_size, 4);
+#else
+        size_t align = element_size;
+#endif
         bool offset_valid =
-            (r->vertex_attribute_offsets[attr_id] % element_size == 0);
-        bool stride_valid = (desc->stride % element_size == 0);
+            (r->vertex_attribute_offsets[attr_id] % align == 0);
+        bool stride_valid = (desc->stride % align == 0);
 
         if (offset_valid && stride_valid) {
             continue;
         }
 
         remap.attributes |= 1 << attr_id;
-        remap.map[attr_id].offset = ROUND_UP(output_offset, element_size);
+        remap.map[attr_id].offset = ROUND_UP(output_offset, align);
         remap.map[attr_id].old_stride = desc->stride;
-        remap.map[attr_id].new_stride = element_size * element_count;
+        remap.map[attr_id].new_stride = ROUND_UP(element_size * element_count, align);
 
         // fprintf(stderr,
         //         "attr %02d remapped: "

@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Skitzelles - part of xemu for Xbox Dev Mode (github.com/skitzellez/xemu-uwp). GPL-2.0-or-later.
+ *
  * Helpers for the Xbox (UWP, Dev Mode) build of xemu.
  *
  * Xbox apps run in an app container: executable memory must come from the

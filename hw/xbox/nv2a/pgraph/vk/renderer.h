@@ -294,6 +294,12 @@ typedef struct PGRAPHVkDisplayState {
 #endif
     GLuint gl_memory_obj;
     GLuint gl_texture_id;
+#ifdef XEMU_UWP
+    /* the Xbox's OpenGL (Mesa on D3D12) cannot import Vulkan memory: each frame is copied through this buffer */
+    VkBuffer readback;
+    VmaAllocation readback_allocation;
+    void *readback_mapped;
+#endif
 } PGRAPHVkDisplayState;
 
 typedef struct ComputePipelineKey {

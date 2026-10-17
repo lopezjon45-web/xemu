@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Skitzelles - part of xemu for Xbox Dev Mode (github.com/skitzellez/xemu-uwp). GPL-2.0-or-later.
+ *
  * xemu UWP port: install the Xbox dashboard from the user's own game disc.
  * See xemu-uwp-dash.h. This file has no dependency on QEMU so that it can be
  * built and tested on its own (XemuUWP/tools/dash/test_dash.c).

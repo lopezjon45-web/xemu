@@ -270,6 +270,8 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
         key.kind = VK_SHADER_STAGE_GEOMETRY_BIT;
         key.geom.state = binding->state.geom;
         key.geom.glsl_opts.vulkan = true;
+        key.geom.glsl_opts.no_point_size =
+            !r->enabled_physical_device_features.shaderTessellationAndGeometryPointSize;
         binding->geom.module_info = get_and_ref_shader_module_for_key(r, &key);
     } else {
         binding->geom.module_info = NULL;

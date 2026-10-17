@@ -21,6 +21,9 @@
 #include "ui/xemu-settings.h"
 #include "renderer.h"
 #include "xemu-version.h"
+#ifdef XEMU_UWP
+#include "qemu/xemu-uwp.h"
+#endif
 
 #define VkExtensionPropertiesArray GArray
 #define StringArray GArray
@@ -144,12 +147,67 @@ add_optional_instance_extension_names(PGRAPHState *pg,
                                    VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 }
 
+#ifdef XEMU_UWP
+/*
+ * The Xbox has no Vulkan loader, and an app could not use one (it finds drivers through the registry). Mesa's
+ * Vulkan-on-D3D12 driver (Dozen, vulkan_dzn.dll in the package) is loaded straight instead and volk takes its
+ * functions from it: the driver's own vkGetInstanceProcAddr after the version handshake a loader would make.
+ */
+static VkResult uwp_vk_initialize(void)
+{
+    /* tests: dzn-debug.txt next to xemu.toml holds Mesa's DZN_DEBUG flags (nir, dxil, experimental, ...) */
+    {
+        gchar *dir = g_path_get_dirname(xemu_settings_get_path());
+        gchar *path = g_build_filename(dir, "dzn-debug.txt", NULL);
+        gchar *flags = NULL;
+        if (g_file_get_contents(path, &flags, NULL, NULL)) {
+            g_strstrip(flags);
+            g_setenv("DZN_DEBUG", flags, TRUE);
+            uwp_log("vulkan: DZN_DEBUG=%s (dzn-debug.txt)", flags);
+            g_free(flags);
+        }
+        g_free(path);
+        g_free(dir);
+    }
+    /* Mesa writes its errors to the debugger on Windows; to stderr instead, which goes into xemu's log */
+    g_setenv("MESA_LOG", "file", FALSE);
+    HMODULE dzn = LoadLibraryW(L"vulkan_dzn.dll");
+    if (!dzn) {
+        typedef HMODULE (WINAPI *LoadPackagedLibrary_fn)(LPCWSTR, DWORD);
+        LoadPackagedLibrary_fn lpl = (LoadPackagedLibrary_fn)xemu_uwp_kernelbase_proc("LoadPackagedLibrary");
+        dzn = lpl ? lpl(L"vulkan_dzn.dll", 0) : NULL;
+    }
+    if (!dzn) {
+        uwp_log("vulkan: vulkan_dzn.dll could not be loaded (error %lu)", (unsigned long)GetLastError());
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    typedef VkResult (VKAPI_PTR *Negotiate_fn)(uint32_t *);
+    Negotiate_fn negotiate = (Negotiate_fn)GetProcAddress(dzn, "vk_icdNegotiateLoaderICDInterfaceVersion");
+    PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)GetProcAddress(dzn, "vk_icdGetInstanceProcAddr");
+    if (!gipa) {
+        uwp_log("vulkan: vulkan_dzn.dll has no vk_icdGetInstanceProcAddr");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    uint32_t icd_version = 5;
+    if (negotiate) {
+        negotiate(&icd_version);
+    }
+    uwp_log("vulkan: Mesa Dozen loaded (driver interface %u)", icd_version);
+    volkInitializeCustom(gipa);
+    return VK_SUCCESS;
+}
+#endif
+
 static bool create_instance(PGRAPHState *pg, Error **errp)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
     VkResult result;
 
+#ifdef XEMU_UWP
+    result = uwp_vk_initialize();
+#else
     result = volkInitialize();
+#endif
     if (result != VK_SUCCESS) {
         error_setg(errp, "volkInitialize failed");
         return false;
@@ -493,7 +551,8 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         F(occlusionQueryPrecise, true),
         F(samplerAnisotropy, false),
         F(shaderClipDistance, true),
-        F(shaderTessellationAndGeometryPointSize, true),
+        /* not required: Mesa's Dozen (Xbox) lacks it; geometry shaders then leave gl_PointSize out (glsl/geom.c) */
+        F(shaderTessellationAndGeometryPointSize, false),
         F(wideLines, false),
         #undef F
         // clang-format on

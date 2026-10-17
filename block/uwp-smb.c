@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Skitzelles - part of xemu for Xbox Dev Mode (github.com/skitzellez/xemu-uwp). GPL-2.0-or-later.
+ *
  * xemu for Xbox Dev Mode: an "smb" disc driver, so an Xbox game plays straight from a PC's shared folder or a NAS
  * (Game Vault's network games). Apps on the Xbox cannot open \\PC\share paths (the console answers error 65), so
  * this speaks SMB2/3 itself through libsmb2 (smb2.dll, LGPL-2.1, the same build Game Vault uses).

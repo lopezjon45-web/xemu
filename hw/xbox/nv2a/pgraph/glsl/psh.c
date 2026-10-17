@@ -722,10 +722,22 @@ static void psh_append_shadowmap(const struct PixelShader *ps, int i, bool compa
 
     bool extract_msb_24b = ps->state->tex_x8y24[i] && ps->opts.vulkan;
 
-    mstring_append_fmt(
-        vars, "%svec4 t%d_depth%s = textureProj(texSamp%d, %s(pT%d.xyw));\n",
-        extract_msb_24b ? "u" : "", i, extract_msb_24b ? "_raw" : "", i,
-        tex_remap, i);
+    if (extract_msb_24b) {
+        /* Game Vault: an integer texture can only be read with texelFetch. textureProj on a usampler is an
+         * integer "sample", which D3D12 forbids, so Dozen (Vulkan on the Xbox) rejected the shader and xemu
+         * stopped (Ninja Gaiden's shadows). Integer textures are never filtered, so the nearest texel is the same. */
+        mstring_append_fmt(
+            vars,
+            "vec3 t%d_pc = %s(pT%d.xyw);\n"
+            "ivec2 t%d_sz = textureSize(texSamp%d, 0);\n"
+            "uvec4 t%d_depth_raw = texelFetch(texSamp%d, clamp(ivec2(floor(t%d_pc.xy / t%d_pc.z * vec2(t%d_sz))), "
+            "ivec2(0), t%d_sz - 1), 0);\n",
+            i, tex_remap, i, i, i, i, i, i, i, i, i);
+    } else {
+        mstring_append_fmt(
+            vars, "vec4 t%d_depth = textureProj(texSamp%d, %s(pT%d.xyw));\n",
+            i, i, tex_remap, i);
+    }
 
     if (extract_msb_24b) {
         mstring_append_fmt(vars,

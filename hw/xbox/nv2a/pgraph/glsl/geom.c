@@ -342,7 +342,7 @@ MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
         output,
         "void emit_vertex(int index, mat4 pz) {\n"
         "  gl_Position = gl_in[index].gl_Position;\n"
-        "  gl_PointSize = gl_in[index].gl_PointSize;\n"
+        "%s"
         "  vtxD0 = v_vtxD0[%s];\n"
         "  vtxD1 = v_vtxD1[%s];\n"
         "  vtxB0 = v_vtxB0[%s];\n"
@@ -358,6 +358,7 @@ MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
         "  triMZ = (isnan(pz[3].x) || isinf(pz[3].x)) ? 0.0 : pz[3].x;\n"
         "  EmitVertex();\n"
         "}\n",
+        opts.no_point_size ? "" : "  gl_PointSize = gl_in[index].gl_PointSize;\n",
         provoking_index,
         provoking_index,
         provoking_index,

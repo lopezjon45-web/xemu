@@ -313,7 +313,8 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
         /* missing components of an integer attribute read as (0, 0, 0, 1), as for floats */
         switch (state->compressed_attrs & (1 << i) ? UWP_ATTR_FLOAT : UWP_ATTR_KIND(state->uwp_attr_kinds, i)) {
         case UWP_ATTR_SCALED:
-            mstring_append_fmt(body, "vec4 v%d = vec4(v%d_int);\n", i, i);
+            /* 1-3 components; .w is not part of the value when Vulkan reads 3 as 4 (vk/vertex.c) */
+            mstring_append_fmt(body, "vec4 v%d = vec4(vec3(v%d_int.xyz), 1.0);\n", i, i);
             break;
         case UWP_ATTR_UNORM8:
             mstring_append_fmt(body, "vec4 v%d = vec4(vec3(v%d_int.xyz) / 255.0, 1.0);\n", i, i);

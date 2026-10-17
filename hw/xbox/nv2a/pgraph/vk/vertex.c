@@ -135,6 +135,9 @@ void pgraph_vk_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
     pg->compressed_attrs = 0;
     pg->uniform_attrs = 0;
     pg->swizzle_attrs = 0;
+#ifdef XEMU_UWP
+    pg->uwp_attr_kinds = 0;
+#endif
 
     r->num_active_vertex_attribute_descriptions = 0;
     r->num_active_vertex_binding_descriptions = 0;
@@ -192,6 +195,28 @@ void pgraph_vk_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
             break;
         }
 
+#ifdef XEMU_UWP
+        {
+            /* D3D12 (Dozen) has no vertex formats with 3 components of 8 or 16 bits, nor SCALED ones: such an
+             * attribute came through as garbage (Mortal Kombat: Shaolin Monks drew huge flat triangles). Read it
+             * as integers in a format D3D12 has; the vertex shader turns them into floats (glsl/vsh.c), as for
+             * the GL renderer (pgraph.c). A 4-component read of a 3-component value: the shader drops .w. */
+            unsigned kind = UWP_ATTR_FLOAT;
+            if (attr->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S32K && attr->count <= 3) {
+                kind = UWP_ATTR_SCALED;
+                vk_format = attr->count == 1 ? VK_FORMAT_R16_SINT :
+                            attr->count == 2 ? VK_FORMAT_R16G16_SINT : VK_FORMAT_R16G16B16A16_SINT;
+            } else if (attr->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL && attr->count == 3) {
+                kind = UWP_ATTR_UNORM8;
+                vk_format = VK_FORMAT_R8G8B8A8_UINT;
+            } else if (attr->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S1 && attr->count == 3) {
+                kind = UWP_ATTR_SNORM16;
+                vk_format = VK_FORMAT_R16G16B16A16_SINT;
+            }
+            pg->uwp_attr_kinds |= kind << (2 * i);
+        }
+#endif
+
         nv2a_profile_inc_counter(NV2A_PROF_ATTR_BIND);
         hwaddr attrib_data_addr;
         size_t stride;
@@ -227,6 +252,9 @@ void pgraph_vk_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
             // Stride of 0 indicates that only the first element should be
             // used.
             pg->uniform_attrs |= 1 << i;
+#ifdef XEMU_UWP
+            pg->uwp_attr_kinds &= ~(3u << (2 * i)); /* a constant: no integer read */
+#endif
             pgraph_update_inline_value(attr, last_entry);
             NV2A_VK_DPRINTF("inline_value = {%f, %f, %f, %f}",
                             attr->inline_value[0], attr->inline_value[1],
@@ -281,6 +309,9 @@ void pgraph_vk_bind_vertex_attributes_inline(NV2AState *d)
     pg->compressed_attrs = 0;
     pg->uniform_attrs = 0;
     pg->swizzle_attrs = 0;
+#ifdef XEMU_UWP
+    pg->uwp_attr_kinds = 0;
+#endif
 
     r->num_active_vertex_attribute_descriptions = 0;
     r->num_active_vertex_binding_descriptions = 0;

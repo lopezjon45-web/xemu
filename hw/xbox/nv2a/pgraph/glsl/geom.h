@@ -38,6 +38,7 @@ typedef struct {
 
 typedef struct GenGeomGlslOptions {
     bool vulkan;
+    bool no_point_size; /* the device cannot write gl_PointSize in a geometry shader (Mesa's Dozen on Xbox) */
 } GenGeomGlslOptions;
 
 void pgraph_glsl_set_geom_state(PGRAPHState *pg, GeomState *geom);

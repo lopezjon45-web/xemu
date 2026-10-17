@@ -541,7 +541,15 @@ static void destroy_current_display_image(PGRAPHState *pg)
 
     destroy_frame_buffer(pg);
 
-#if HAVE_EXTERNAL_MEMORY
+#ifdef XEMU_UWP
+    glDeleteTextures(1, &d->gl_texture_id);
+    d->gl_texture_id = 0;
+    vmaUnmapMemory(r->allocator, d->readback_allocation);
+    vmaDestroyBuffer(r->allocator, d->readback, d->readback_allocation);
+    d->readback = VK_NULL_HANDLE;
+    d->readback_allocation = VK_NULL_HANDLE;
+    d->readback_mapped = NULL;
+#elif HAVE_EXTERNAL_MEMORY
     glDeleteTextures(1, &d->gl_texture_id);
     d->gl_texture_id = 0;
 
@@ -581,7 +589,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
     const GLint gl_internal_format = GL_RGBA8;
     bool use_optimal_tiling = true;
 
-#if HAVE_EXTERNAL_MEMORY
+#if HAVE_EXTERNAL_MEMORY && !defined(XEMU_UWP)
     GLint num_tiling_types;
     glGetInternalformativ(GL_TEXTURE_2D, gl_internal_format,
                           GL_NUM_TILING_TYPES_EXT, 1, &num_tiling_types);
@@ -612,7 +620,11 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         .format = VK_FORMAT_R8G8B8A8_UNORM,
         .tiling = use_optimal_tiling ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+#ifdef XEMU_UWP
+                 | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+#endif
+                 ,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
@@ -625,7 +637,9 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR,
 #endif
     };
+#ifndef XEMU_UWP
     image_create_info.pNext = &external_memory_image_create_info;
+#endif
 
     VK_CHECK(vkCreateImage(r->device, &image_create_info, NULL, &d->image));
 
@@ -651,7 +665,9 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
 #endif
             ,
     };
+#ifndef XEMU_UWP
     alloc_info.pNext = &export_memory_alloc_info;
+#endif
 
     VK_CHECK(vkAllocateMemory(r->device, &alloc_info, NULL, &d->memory));
     VK_CHECK(vkBindImageMemory(r->device, d->image, d->memory, 0));
@@ -669,7 +685,33 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
     VK_CHECK(vkCreateImageView(r->device, &image_view_create_info, NULL,
                                &d->image_view));
 
-#if HAVE_EXTERNAL_MEMORY
+#ifdef XEMU_UWP
+    (void)external_memory_image_create_info;
+    (void)export_memory_alloc_info;
+
+    VkBufferCreateInfo readback_create_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = (VkDeviceSize)width * height * 4,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VmaAllocationCreateInfo readback_alloc_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+    };
+    VK_CHECK(vmaCreateBuffer(r->allocator, &readback_create_info, &readback_alloc_info, &d->readback,
+                             &d->readback_allocation, NULL));
+    VK_CHECK(vmaMapMemory(r->allocator, d->readback_allocation, &d->readback_mapped));
+
+    glGenTextures(1, &d->gl_texture_id);
+    glBindTexture(GL_TEXTURE_2D, d->gl_texture_id);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexStorage2D(GL_TEXTURE_2D, 1, gl_internal_format, width, height);
+    assert(glGetError() == GL_NO_ERROR);
+    (void)use_optimal_tiling;
+
+#elif HAVE_EXTERNAL_MEMORY
 
 #ifdef WIN32
 
@@ -989,14 +1031,41 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
+#ifdef XEMU_UWP
+    pgraph_vk_transition_image_layout(pg, cmd, disp->image,
+                                      VK_FORMAT_R8G8B8A8_UNORM,
+                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy readback_region = {
+        .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        .imageSubresource.layerCount = 1,
+        .imageExtent.width = disp->width,
+        .imageExtent.height = disp->height,
+        .imageExtent.depth = 1,
+    };
+    vkCmdCopyImageToBuffer(cmd, disp->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, disp->readback, 1,
+                           &readback_region);
+#else
     pgraph_vk_transition_image_layout(pg, cmd, disp->image,
                                       VK_FORMAT_R8G8B8_UNORM,
                                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+#endif
 
     pgraph_vk_end_debug_marker(r, cmd);
     pgraph_vk_end_single_time_commands(pg, cmd);
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_5);
+
+#ifdef XEMU_UWP
+    /* the commands above have finished (end_single_time_commands waits): the frame goes to OpenGL's texture */
+    vmaInvalidateAllocation(r->allocator, disp->readback_allocation, 0, VK_WHOLE_SIZE);
+    glBindTexture(GL_TEXTURE_2D, disp->gl_texture_id);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, disp->width, disp->height, GL_RGBA, GL_UNSIGNED_BYTE,
+                    disp->readback_mapped);
+    glFinish();
+#endif
 
     disp->draw_time = surface->draw_time;
 }
@@ -1069,6 +1138,23 @@ void pgraph_vk_render_display(PGRAPHState *pg)
 
     SurfaceBinding *surface = pgraph_vk_surface_get_within(
         d, d->pcrtc.start + vga_display_params.line_offset);
+#ifdef XEMU_UWP
+    {
+        /* which surface goes on screen, logged when it changes (a picture that stays on an old frame) */
+        static uint64_t last[6];
+        uint64_t cur[6] = { 0, surface ? 1 : 0, surface ? surface->width : 0,
+                            surface ? surface->height : 0, surface ? surface->pitch : 0,
+                            surface ? surface->color : 0 };
+        if (memcmp(cur, last, sizeof(cur))) {
+            memcpy(last, cur, sizeof(cur));
+            fprintf(stderr, "vk display: pcrtc %x -> %s %ux%u pitch %u at %x (color %d, draw_time %u, dirty %d)\n",
+                    (unsigned)d->pcrtc.start, surface ? "surface" : "no surface (RAM shown)",
+                    surface ? surface->width : 0, surface ? surface->height : 0, surface ? surface->pitch : 0,
+                    surface ? (unsigned)surface->vram_addr : 0, surface ? surface->color : 0,
+                    surface ? (unsigned)surface->draw_time : 0, surface ? surface->draw_dirty : 0);
+        }
+    }
+#endif
     if (surface == NULL || !surface->color || !surface->width ||
         !surface->height) {
         return;

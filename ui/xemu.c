@@ -2715,6 +2715,8 @@ static void uwp_watch_second(void)
     uwp_watch.quiet = 0;
 }
 
+static bool uwp_file_exists(const char *path);
+
 static void uwp_box_sample(void)
 {
     uwp_watch_second();
@@ -2799,6 +2801,20 @@ static void uwp_box_sample(void)
         unsigned nreads = (unsigned)(reads - last_reads);
         last_reads = reads;
         int vcpu_busy = xemu_uwp_thread_busy("vcpu", 5), pfifo_busy = xemu_uwp_thread_busy("pfifo", 5);
+        {
+            /* vk-capture.txt put next to xemu.toml: the Vulkan renderer logs every draw of the next frame
+             * (pgraph/vk/draw.c), then the file is removed */
+            extern int xemu_uwp_vk_capture;
+            gchar *dir = g_path_get_dirname(xemu_settings_get_path());
+            gchar *marker = g_build_filename(dir, "vk-capture.txt", NULL);
+            if (uwp_file_exists(marker)) {
+                g_remove(marker);
+                uwp_log("capture: the next frame's draws go to xemu.log (vk-capture.txt)");
+                qatomic_set(&xemu_uwp_vk_capture, 2);
+            }
+            g_free(marker);
+            g_free(dir);
+        }
         uwp_log("SEC %u:%02u | %d fps, slowest frame %d ms, %d frames over 34 ms | CPU: game %d%%, graphics %d%%, "
                 "xemu %.1f cores%s | memory %llu of %llu MB | per frame: %ld objects drawn; this second: %ld shaders "
                 "built, %ld textures loaded | waiting on the GPU %d%% | disc %.1f MB/s (%u reads) | hard disk %.1f MB/s | sound %s | holding: %s",
@@ -4351,6 +4367,14 @@ static char *uwp_take_activation_disc(void)
     return disc;
 }
 
+/* Vulkan test switch, read at start (vk-zwrite-off.txt next to xemu.toml), used by pgraph/vk/draw.c */
+bool xemu_uwp_vk_zwrite_off;
+/* Vulkan test switch (vk-pal-white.txt): palette textures drawn solid white, used by pgraph/vk/texture.c */
+bool xemu_uwp_vk_pal_white;
+/* Vulkan test switch (vk-pal-opaque.txt): palette textures without transparency, used by pgraph/vk/texture.c */
+bool xemu_uwp_vk_pal_opaque;
+int xemu_uwp_vk_tex_test; /* vk-tex-test.txt words: nomip (1), noaniso (2), nearest (4) */
+
 /* Before the machine is created: boot with the disc the launcher asked for. */
 /*
  * Setting itself up. The launcher (Game Vault, same publisher) puts the boot
@@ -4817,7 +4841,48 @@ static void uwp_fill_system_files(void)
     /* what a console needs, whatever the settings file says (or if there is none) */
     g_config.general.show_welcome = false;
     g_config.general.updates.check = false;
-    g_config.display.renderer = CONFIG_DISPLAY_RENDERER_OPENGL;
+    /* OpenGL, except on a console with use-vulkan.txt next to xemu.toml: the Vulkan renderer through Mesa's
+     * Vulkan-on-D3D12 driver (pgraph/vk/instance.c), under test - it keeps a shader cache across sessions */
+    {
+        gchar *dir = g_path_get_dirname(xemu_settings_get_path());
+        gchar *marker = g_build_filename(dir, "use-vulkan.txt", NULL);
+        bool vulkan = uwp_file_exists(marker);
+        g_config.display.renderer = vulkan ? CONFIG_DISPLAY_RENDERER_VULKAN : CONFIG_DISPLAY_RENDERER_OPENGL;
+        if (vulkan) {
+            uwp_log("renderer: Vulkan (use-vulkan.txt)");
+        }
+        g_free(marker);
+        marker = g_build_filename(dir, "vk-zwrite-off.txt", NULL);
+        xemu_uwp_vk_zwrite_off = uwp_file_exists(marker);
+        if (xemu_uwp_vk_zwrite_off) {
+            uwp_log("Vulkan test: no depth writes while the depth test is off (vk-zwrite-off.txt)");
+        }
+        g_free(marker);
+        marker = g_build_filename(dir, "vk-pal-white.txt", NULL);
+        xemu_uwp_vk_pal_white = uwp_file_exists(marker);
+        if (xemu_uwp_vk_pal_white) {
+            uwp_log("Vulkan test: palette textures solid white (vk-pal-white.txt)");
+        }
+        g_free(marker);
+        marker = g_build_filename(dir, "vk-pal-opaque.txt", NULL);
+        xemu_uwp_vk_pal_opaque = uwp_file_exists(marker);
+        if (xemu_uwp_vk_pal_opaque) {
+            uwp_log("Vulkan test: palette textures without transparency (vk-pal-opaque.txt)");
+        }
+        g_free(marker);
+        marker = g_build_filename(dir, "vk-tex-test.txt", NULL);
+        {
+            gchar *words = NULL;
+            if (g_file_get_contents(marker, &words, NULL, NULL)) {
+                xemu_uwp_vk_tex_test = (strstr(words, "nomip") ? 1 : 0) | (strstr(words, "noaniso") ? 2 : 0) |
+                                       (strstr(words, "nearest") ? 4 : 0);
+                uwp_log("Vulkan test: texture sampling %s(vk-tex-test.txt)", words);
+                g_free(words);
+            }
+        }
+        g_free(marker);
+        g_free(dir);
+    }
     g_config.display.window.fullscreen_on_startup = true;
     /* Network on, through xemu's own NAT: what an online service such as Insignia needs, and the
      * only backend that works in an app container besides the UDP tunnel (no packet capture). */

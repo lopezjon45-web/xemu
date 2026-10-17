@@ -19,6 +19,9 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "renderer.h"
+#ifdef XEMU_UWP
+#include "qemu/xemu-uwp.h"
+#endif
 
 #include "gloffscreen.h"
 
@@ -49,16 +52,31 @@ static void pgraph_vk_init(NV2AState *d, Error **errp)
     if (*errp) {
         return;
     }
+#ifdef XEMU_UWP
+    {
+        uint64_t u_, l_;
+        if (xemu_uwp_memory(&u_, &l_))
+            uwp_log("vulkan init: device made, %llu MB in use, %llu MB left", (unsigned long long)(u_ >> 20),
+                    (unsigned long long)(l_ >> 20));
+    }
+#endif
 
-    pgraph_vk_init_command_buffers(pg);
-    pgraph_vk_init_buffers(d);
-    pgraph_vk_init_surfaces(pg);
-    pgraph_vk_init_shaders(pg);
-    pgraph_vk_init_pipelines(pg);
-    pgraph_vk_init_textures(pg);
-    pgraph_vk_init_reports(pg);
-    pgraph_vk_init_compute(pg);
-    pgraph_vk_init_display(pg);
+#ifdef XEMU_UWP
+    /* memory after each step: Dozen keeps every allocation in the console's own memory (5 GB for an app) */
+#define VK_STEP(call) do { call; uint64_t u_, l_; if (xemu_uwp_memory(&u_, &l_))         uwp_log("vulkan init: %s done, %llu MB in use, %llu MB left", #call,                 (unsigned long long)(u_ >> 20), (unsigned long long)(l_ >> 20)); } while (0)
+#else
+#define VK_STEP(call) call
+#endif
+    VK_STEP(pgraph_vk_init_command_buffers(pg));
+    VK_STEP(pgraph_vk_init_buffers(d));
+    VK_STEP(pgraph_vk_init_surfaces(pg));
+    VK_STEP(pgraph_vk_init_shaders(pg));
+    VK_STEP(pgraph_vk_init_pipelines(pg));
+    VK_STEP(pgraph_vk_init_textures(pg));
+    VK_STEP(pgraph_vk_init_reports(pg));
+    VK_STEP(pgraph_vk_init_compute(pg));
+    VK_STEP(pgraph_vk_init_display(pg));
+#undef VK_STEP
 
     pgraph_vk_update_vertex_ram_buffer(&d->pgraph, 0, d->vram_ptr,
                                    memory_region_size(d->vram));
@@ -143,6 +161,16 @@ static void pgraph_vk_process_pending(NV2AState *d)
 
 static void pgraph_vk_flip_stall(NV2AState *d)
 {
+#ifdef XEMU_UWP
+    /* a capture (vk/draw.c) runs from one frame end to the next */
+    extern int xemu_uwp_vk_capture;
+    int cap = qatomic_read(&xemu_uwp_vk_capture);
+    if (cap) {
+        fprintf(stderr, "cap %s\n", cap == 2 ? "frame start" : "frame end");
+        fflush(stderr);
+        qatomic_set(&xemu_uwp_vk_capture, cap - 1);
+    }
+#endif
     pgraph_vk_finish(&d->pgraph, VK_FINISH_REASON_FLIP_STALL);
     pgraph_vk_debug_frame_terminator();
 }
