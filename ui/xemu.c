@@ -2554,6 +2554,99 @@ unsigned int xemu_uwp_cap_surface_scale(unsigned int want)
 }
 
 /*
+ * Render scale that follows the game (the owner's wish: "if it starts to even slightly stutter it needs to
+ * automatically adjust"). While the console's GPU is the limit - the graphics thread waits on it a third of the time
+ * or more, frames run late, no shaders are being made (that stall is not the picture size) and the emulated CPU is not
+ * the limit itself - for 3 seconds in a row, the picture is drawn one scale step smaller. After 60 calm seconds it
+ * goes back up a step, up to the player's own setting, which is never changed (the step down is a separate cap read
+ * in pgraph_gl_reload_surface_scale_factor). 30 s between changes: each one costs a short pause.
+ */
+unsigned int xemu_uwp_auto_scale_cap; /* 0: none */
+/* off: Game Vault said so (autoscale=0), or the player changed the render scale in xemu's menu this session (they are
+   trying a scale out: theirs is used exactly, see pgraph_gl_set_surface_scale_factor) */
+bool xemu_uwp_auto_scale_off;
+bool xemu_uwp_auto_scale_busy; /* the change below is ours, not the player's */
+static void uwp_auto_scale(int fps, int late, int gpu_wait, int vcpu, long shaders)
+{
+    static int strained, calm;
+    static uint64_t next_change, last_up;
+    static bool stay;   /* went back up and had to come down again soon: no more steps up this session */
+    uint64_t now = SDL_GetTicks();
+    if (xemu_uwp_auto_scale_off) {
+        return;
+    }
+    if (fps <= 0) {
+        return;   /* nothing drawn yet (start-up, loading): no reading to go by */
+    }
+    /* the scale getter and setter hand the big lock over to the renderer; this is called without it (crashed at
+       0:00 in the first test, assert bql_locked) */
+    bool held = bql_locked();
+    if (!held) {
+        bql_lock();
+    }
+    unsigned cur = nv2a_get_surface_scale_factor();
+    if (!held) {
+        bql_unlock();
+    }
+    unsigned want = xemu_uwp_cap_surface_scale(g_config.display.quality.surface_scale);
+    bool gpu_bound = gpu_wait >= 35 && late >= 3 && shaders == 0 && vcpu < 90;
+    /* test only (autoscale_test.txt next to xemu.toml): strained while at the full setting, calm below it, so the
+       scale steps down and back up every 30-60 s and the switching itself can be watched */
+    static int test = -1;
+    if (test < 0) {
+        char *p = g_strdup_printf("%sautoscale_test.txt", xemu_settings_get_base_path());
+        test = g_file_test(p, G_FILE_TEST_EXISTS) ? 1 : 0;
+        g_free(p);
+    }
+    if (test) {
+        gpu_bound = cur >= want;
+        gpu_wait = gpu_bound ? 50 : 0;
+        late = gpu_bound ? 5 : 0;
+    }
+    strained = gpu_bound ? strained + 1 : 0;
+    calm = (gpu_wait < 10 && late == 0) ? calm + 1 : 0;
+    if (now < next_change) {
+        return;
+    }
+    unsigned set = 0;
+    if (cur > 1 && strained >= 3) {
+        set = cur - 1;
+        uwp_log("render scale: %ux -> %ux for now (the console's GPU was the limit: %d fps, waiting on it %d%%)",
+                cur, set, fps, gpu_wait);
+        /* each change costs a pause (0.5-2 s seen), so a game too heavy for the setting must not bounce */
+        if (last_up && now - last_up < 90000) {
+            stay = true;
+            uwp_log("render scale: staying at %ux for this session (%ux was too much again)", set, cur);
+        }
+    } else if (!stay && xemu_uwp_auto_scale_cap && cur < want && calm >= 60) {
+        last_up = now;
+        set = cur + 1;
+        uwp_log("render scale: %ux -> %ux again (60 calm seconds; the setting is %ux)", cur, set, want);
+    }
+    if (!set) {
+        return;
+    }
+    xemu_uwp_auto_scale_cap = set >= want ? 0 : set;
+    strained = calm = 0;
+    next_change = now + 30000;
+    if (!held) {
+        bql_lock();
+    }
+    xemu_uwp_auto_scale_busy = true;
+    nv2a_set_surface_scale_factor(g_config.display.quality.surface_scale);   /* the player's value, unchanged */
+    xemu_uwp_auto_scale_busy = false;
+    if (!held) {
+        bql_unlock();
+    }
+    uwp_log("render scale: the change held the picture for %u ms", (unsigned)(SDL_GetTicks() - now));
+    /* said on screen too, so nobody wonders why the picture got softer (off: Game Vault, the game's details, LT) */
+    char *msg = g_strdup_printf(set < cur ? "Render scale %ux for now: the console could not keep up at %ux"
+                                          : "Render scale back to %ux", set, cur);
+    xemu_queue_notification(msg);
+    g_free(msg);
+}
+
+/*
  * A start that never shows a picture: no frame at all, not even the Xbox start-up animation (players saw a game
  * sit like that for 10 minutes, 2026-10-16). Counted once a second while xemu is in front: after 25 s with no
  * frame since the start, the emulated console is restarted once by itself; if it is still blank 25 s after that,
@@ -2705,15 +2798,17 @@ static void uwp_box_sample(void)
         last_hdd = hdd;
         unsigned nreads = (unsigned)(reads - last_reads);
         last_reads = reads;
+        int vcpu_busy = xemu_uwp_thread_busy("vcpu", 5), pfifo_busy = xemu_uwp_thread_busy("pfifo", 5);
         uwp_log("SEC %u:%02u | %d fps, slowest frame %d ms, %d frames over 34 ms | CPU: game %d%%, graphics %d%%, "
                 "xemu %.1f cores%s | memory %llu of %llu MB | per frame: %ld objects drawn; this second: %ld shaders "
                 "built, %ld textures loaded | waiting on the GPU %d%% | disc %.1f MB/s (%u reads) | hard disk %.1f MB/s | sound %s | holding: %s",
-                at / 60, at % 60, g_nv2a_stats.increment_fps, slowest, late, xemu_uwp_thread_busy("vcpu", 5),
-                xemu_uwp_thread_busy("pfifo", 5), app_cores, console, (unsigned long long)(u >> 20),
+                at / 60, at % 60, g_nv2a_stats.increment_fps, slowest, late, vcpu_busy,
+                pfifo_busy, app_cores, console, (unsigned long long)(u >> 20),
                 (unsigned long long)((u + l) >> 20), n ? draws / (long)n : 0, shaders, textures,
                 gpu_wait > 100 ? 100 : gpu_wait, disc_mb, nreads, hdd_mb,
                 dry != last_dry ? "RAN DRY (the game could not make sound fast enough)" : "ok",
                 uwp_held_now_for_sec[0] ? uwp_held_now_for_sec : "no buttons");
+        uwp_auto_scale(g_nv2a_stats.increment_fps, late, gpu_wait, vcpu_busy, shaders);
         last_dvd = dvd;
         last_dry = dry;
         last_app = app;
@@ -4097,6 +4192,12 @@ static char *uwp_take_activation_disc(void)
         }
         if (!strcmp(p, "fps=1")) {
             fps = true;
+        }
+        if (!strcmp(p, "autoscale=0")) {
+            /* Game Vault, an Xbox game's details, LT: the player's render scale exactly, never lowered */
+            extern bool xemu_uwp_auto_scale_off;
+            xemu_uwp_auto_scale_off = true;
+            uwp_log("link: render scale adjusting by itself is off (the player's choice)");
         }
         if (!strcmp(p, "widescreen=1") || !strcmp(p, "widescreen=0")) {
             /* the console's 16:9 setting for this session (Game Vault, Menu > Picture): games that

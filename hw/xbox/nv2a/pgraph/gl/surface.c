@@ -39,6 +39,19 @@ void pgraph_gl_set_surface_scale_factor(NV2AState *d, unsigned int scale)
     PGRAPHGLState *r = pg->gl_renderer_state;
 
     g_config.display.quality.surface_scale = scale < 1 ? 1 : scale;
+#ifdef XEMU_UWP
+    {   /* the player chose a scale in the menu: theirs from now on, exactly (ui/xemu.c uwp_auto_scale) */
+        extern bool xemu_uwp_auto_scale_busy, xemu_uwp_auto_scale_off;
+        extern unsigned int xemu_uwp_auto_scale_cap;
+        if (!xemu_uwp_auto_scale_busy) {
+            if (!xemu_uwp_auto_scale_off) {
+                uwp_log("render scale: the player chose %ux; it stays exactly that this session", scale);
+            }
+            xemu_uwp_auto_scale_off = true;
+            xemu_uwp_auto_scale_cap = 0;
+        }
+    }
+#endif
 
     qemu_mutex_lock(&d->pfifo.lock);
     qatomic_set(&d->pfifo.halt, true);
@@ -79,6 +92,12 @@ void pgraph_gl_reload_surface_scale_factor(PGRAPHState *pg)
     pg->surface_scale_factor = factor < 1 ? 1 : factor;
 #ifdef XEMU_UWP
     pg->surface_scale_factor = xemu_uwp_cap_surface_scale(pg->surface_scale_factor);
+    {   /* held lower for now while the console's GPU is the limit (ui/xemu.c uwp_auto_scale) */
+        extern unsigned int xemu_uwp_auto_scale_cap;
+        if (xemu_uwp_auto_scale_cap && pg->surface_scale_factor > xemu_uwp_auto_scale_cap) {
+            pg->surface_scale_factor = xemu_uwp_auto_scale_cap;
+        }
+    }
 #endif
 }
 

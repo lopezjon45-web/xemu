@@ -1332,6 +1332,14 @@ static void uwp_warm_start(PGRAPHGLState *r)
         }
     }
     g_free(path);
+    /* the render scale is a uniform since 0.9.144 (shaders no longer differ by it): entries learned at another
+       scale are the same shaders as at 1x, and the repeats this makes are dropped just below */
+    for (int i = 0; i < n; i++) {
+        if (uwp_warm_list[i].state.vsh.surface_scale_factor != 1) {
+            uwp_warm_list[i].state.vsh.surface_scale_factor = 1;
+            uwp_warm_list[i].check = uwp_warm_check(&uwp_warm_list[i]);
+        }
+    }
     /* repeats written by earlier builds are dropped, and the list is written back without them, so
        their room goes to shaders not learned yet */
     int kept = 0;

@@ -109,7 +109,13 @@ void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *vsh)
 
     assert(vertex_program || fixed_function);
 
+#ifdef XEMU_UWP
+    /* the render scale is a uniform (renderScale), so a change of scale (uwp_auto_scale in ui/xemu.c) does not
+       rebuild every shader; kept at 1 so warm-up lists recorded at 1x still match */
+    vsh->surface_scale_factor = 1;
+#else
     vsh->surface_scale_factor = pg->surface_scale_factor; // FIXME
+#endif
 
     vsh->compressed_attrs = pg->compressed_attrs;
 #ifdef XEMU_UWP
@@ -330,10 +336,9 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
             VSH_VERSION_XVS, (uint32_t *)state->programmable.program_data,
             state->programmable.program_length, header, body);
         if (!state->point_params_enable) {
-            mstring_append_fmt(body, "  oPts.x = %f * %d;\n",
+            mstring_append_fmt(body, "  oPts.x = %f * renderScale;\n",
                                state->point_size <= 0.f ? 1.f :
-                                                          state->point_size,
-                               state->surface_scale_factor);
+                                                          state->point_size);
         }
     }
 
@@ -537,6 +542,10 @@ void pgraph_glsl_set_vsh_uniform_values(PGRAPHState *pg, const VshState *state,
     if (locs[VshUniform_inlineValue] != -1) {
         pgraph_get_inline_values(pg, state->uniform_attrs, values->inlineValue,
                                  NULL);
+    }
+
+    if (locs[VshUniform_renderScale] != -1) {
+        values->renderScale[0] = pg->surface_scale_factor;
     }
 
     if (locs[VshUniform_surfaceSize] != -1) {
