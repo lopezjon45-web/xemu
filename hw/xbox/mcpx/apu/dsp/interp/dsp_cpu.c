@@ -28,6 +28,9 @@
 #include "dsp_cpu.h"
 #include "debug.h"
 #include "trace.h"
+#ifdef XEMU_UWP
+#include "qemu/xemu-uwp.h"
+#endif
 
 #define BITMASK(x)  ((1<<(x))-1)
 
@@ -128,6 +131,12 @@ static const int registers_mask[64] = {
 
 #include "dsp_emu.c.inc"
 #include "dsp_dis.c.inc"
+
+#ifdef XEMU_UWP
+#define EMU_UWP(f) f
+#else
+#define EMU_UWP(f) NULL
+#endif
 
 typedef bool (*match_func_t)(uint32_t op);
 
@@ -234,10 +243,10 @@ static const OpcodeEntry nonparallel_opcodes[] = {
     { "000000000000000010001100", "enddo", NULL, emu_enddo },
     { "0000000101iiiiii1000d011", "eor #xx, D", NULL, NULL },
     { "00000001010000001100d011", "eor #xxxx, D", NULL, NULL },
-    { "0000110000011010000sSSSD", "extract S1, S2, D", NULL, NULL },
-    { "0000110000011000000s000D", "extract #CO, S2, D", NULL, NULL },
-    { "0000110000011010100sSSSD", "extractu S1, S2, D", NULL, NULL },
-    { "0000110000011000100s000D", "extractu #CO, S2, D", NULL, NULL },
+    { "0000110000011010000sSSSD", "extract S1, S2, D", NULL, EMU_UWP(emu_extract_reg) },
+    { "0000110000011000000s000D", "extract #CO, S2, D", NULL, EMU_UWP(emu_extract_imm) },
+    { "0000110000011010100sSSSD", "extractu S1, S2, D", NULL, EMU_UWP(emu_extractu_reg) },
+    { "0000110000011000100s000D", "extractu #CO, S2, D", NULL, EMU_UWP(emu_extractu_imm) },
     { "000000000000000000000101", "ill", NULL, emu_illegal },
     { "00000000000000000000100d", "inc D", NULL, emu_inc },
     { "00001100000110110qqqSSSD", "insert S1, S2, D", NULL, NULL },
@@ -402,7 +411,13 @@ void dsp56k_reset_cpu(dsp_core_t* dsp)
     // start_time = SDL_GetTicks();
     dsp->num_inst = 0;
 
+#ifdef XEMU_UWP
+    /* on a console a DSP fault must not end the whole emulator: the fault
+     * interrupt is still raised, as on the real chip */
+    dsp->exception_debugging = false;
+#else
     dsp->exception_debugging = true;
+#endif
     dsp->disasm_prev_inst_pc = 0xFFFFFFFF;
 }
 

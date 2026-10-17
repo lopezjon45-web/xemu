@@ -27,7 +27,19 @@ typedef void (*emu_func_t)(dsp_core_t* dsp);
 
 static void emu_undefined(dsp_core_t* dsp)
 {
+#ifdef XEMU_UWP
+    /* An instruction the emulated DSP does not know yet: step over it and keep
+     * the sound chip (and the game) running instead of aborting all of xemu.
+     * Logged a few times only. */
+    static int logged;
+    dsp->cur_inst_len = 1;
+    if (logged < 8) {
+        logged++;
+        uwp_log("DSP: 0x%04x: 0x%06x not emulated yet, skipped", dsp->pc, dsp->cur_inst);
+    }
+#else
     dsp->cur_inst_len = 0;
+#endif
     printf("Dsp: 0x%04x: 0x%06x Illegal instruction\n",dsp->pc, dsp->cur_inst);
     /* Add some artificial CPU cycles to avoid being stuck in an infinite loop */
     dsp->instr_cycle += 100;
@@ -5967,6 +5979,97 @@ static void emu_asr_imm(dsp_core_t* dsp)
 
     emu_ccr_update_e_u_n_z(dsp, dest[0], dest[1], dest[2]);
 }
+
+#ifdef XEMU_UWP
+/* extract / extractu: a bit field of accumulator S2 (width = control bits 17..12,
+ * offset from bit 0 = control bits 5..0) goes right-aligned into accumulator D,
+ * sign- or zero-extended. C and V are cleared, E U N Z as usual. */
+static void emu_extract_x(dsp_core_t* dsp, uint32_t control, bool is_unsigned)
+{
+    uint32_t s = (dsp->cur_inst >> 4) & 1;
+    uint32_t d = dsp->cur_inst & 1;
+
+    uint64_t acc;
+    if (s) {
+        acc = ((uint64_t)(dsp->registers[DSP_REG_B2] & BITMASK(8)) << 48)
+            | ((uint64_t)(dsp->registers[DSP_REG_B1] & BITMASK(24)) << 24)
+            | (dsp->registers[DSP_REG_B0] & BITMASK(24));
+    } else {
+        acc = ((uint64_t)(dsp->registers[DSP_REG_A2] & BITMASK(8)) << 48)
+            | ((uint64_t)(dsp->registers[DSP_REG_A1] & BITMASK(24)) << 24)
+            | (dsp->registers[DSP_REG_A0] & BITMASK(24));
+    }
+
+    uint32_t width = (control >> 12) & BITMASK(6);
+    uint32_t offset = control & BITMASK(6);
+    if (width > 56) {
+        width = 56;
+    }
+
+    uint64_t field = offset < 56 ? acc >> offset : 0;
+    if (width == 0) {
+        field = 0;
+    } else {
+        field &= (width >= 64 ? ~0ULL : ((1ULL << width) - 1));
+        if (!is_unsigned && width < 56 && (field >> (width - 1)) & 1) {
+            field |= ~0ULL << width;
+        }
+    }
+
+    uint32_t dest[3];
+    dest[0] = (field >> 48) & BITMASK(8);
+    dest[1] = (field >> 24) & BITMASK(24);
+    dest[2] = field & BITMASK(24);
+
+    if (d) {
+        dsp->registers[DSP_REG_B2] = dest[0];
+        dsp->registers[DSP_REG_B1] = dest[1];
+        dsp->registers[DSP_REG_B0] = dest[2];
+    } else {
+        dsp->registers[DSP_REG_A2] = dest[0];
+        dsp->registers[DSP_REG_A1] = dest[1];
+        dsp->registers[DSP_REG_A0] = dest[2];
+    }
+
+    dsp->registers[DSP_REG_SR] &= BITMASK(16)-((1<<DSP_SR_C)|(1<<DSP_SR_V));
+    emu_ccr_update_e_u_n_z(dsp, dest[0], dest[1], dest[2]);
+}
+
+/* the control word of the register form: SSS = A1 B1 X0 Y0 X1 Y1 (010..111) */
+static uint32_t emu_extract_control(dsp_core_t* dsp)
+{
+    static const int regs[8] = {
+        DSP_REG_NULL, DSP_REG_NULL, DSP_REG_A1, DSP_REG_B1,
+        DSP_REG_X0, DSP_REG_Y0, DSP_REG_X1, DSP_REG_Y1
+    };
+    int reg = regs[(dsp->cur_inst >> 1) & BITMASK(3)];
+    return reg == DSP_REG_NULL ? 0 : dsp->registers[reg];
+}
+
+static void emu_extract_reg(dsp_core_t* dsp)
+{
+    emu_extract_x(dsp, emu_extract_control(dsp), false);
+}
+
+static void emu_extract_imm(dsp_core_t* dsp)
+{
+    uint32_t co = read_memory_p(dsp, dsp->pc+1);
+    dsp->cur_inst_len++;
+    emu_extract_x(dsp, co, false);
+}
+
+static void emu_extractu_reg(dsp_core_t* dsp)
+{
+    emu_extract_x(dsp, emu_extract_control(dsp), true);
+}
+
+static void emu_extractu_imm(dsp_core_t* dsp)
+{
+    uint32_t co = read_memory_p(dsp, dsp->pc+1);
+    dsp->cur_inst_len++;
+    emu_extract_x(dsp, co, true);
+}
+#endif
 
 static void emu_bcc_long(dsp_core_t* dsp)
 {
