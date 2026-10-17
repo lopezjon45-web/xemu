@@ -4287,6 +4287,21 @@ static char *uwp_take_activation_disc(void)
                 g_free(home);
             }
         }
+        if (!strncmp(p, "netcred=", 8)) {
+            /* Game Vault's sign-in for a network disc (block/uwp-smb.c). Any app can open an xemu link, so only a
+               "netcred-<id>.txt" in the shared Publishers folder is taken (it is deleted once read) */
+            char *path = g_uri_unescape_string(p + 8, NULL);
+            const char *base = path ? MAX(strrchr(path, '\\'), strrchr(path, '/')) : NULL;
+            bool ok = base && g_str_has_prefix(base + 1, "netcred-") && g_str_has_suffix(base, ".txt") &&
+                      !strstr(path, "..") && (strstr(path, "\\Publishers\\") || strstr(path, "/Publishers/"));
+            if (ok) {
+                extern void xemu_uwp_smb_set_credentials_file(const char *path);
+                xemu_uwp_smb_set_credentials_file(path);
+            } else {
+                uwp_log("link: network sign-in refused (not Game Vault's file)");
+            }
+            g_free(path);
+        }
         if (!strncmp(p, "disc=", 5)) {
             /* undo the %XX escaping; xemu.toml uses forward slashes */
             disc = g_malloc(strlen(p) + 1);
@@ -5323,6 +5338,32 @@ char *xemu_uwp_disc_filename(const char *path)
 
     if (!path || !path[0] || !strncmp(path, "json:", 5)) {
         return g_strdup(path ? path : "");
+    }
+    if (g_str_has_prefix(path, "smb://")) {
+        /* a disc on a PC's shared folder or a NAS (block/uwp-smb.c): the same look for a full dump's game
+           partition, over the network */
+        extern bool xemu_uwp_smb_peek(const char *url, uint64_t offset, void *buf, uint32_t len);
+        for (int i = 0; i < ARRAY_SIZE(bases) && !found; i++) {
+            char head[20];
+            if (xemu_uwp_smb_peek(path, bases[i] + 0x10000, head, sizeof(head)) && !memcmp(head, magic, sizeof(head))) {
+                found = bases[i];
+            }
+        }
+        if (!found) {
+            return g_strdup(path);
+        }
+        uwp_log("full disc dump on the network: game partition at 0x%llx", (unsigned long long)found);
+        GString *j = g_string_new(NULL);
+        g_string_printf(j, "json:{\"driver\":\"raw\",\"offset\":%llu,\"file\":{\"driver\":\"smb\",\"url\":\"",
+                        (unsigned long long)found);
+        for (const char *c = path; *c; c++) {
+            if (*c == '"' || *c == '\\') {
+                g_string_append_c(j, '\\');
+            }
+            g_string_append_c(j, *c);
+        }
+        g_string_append(j, "\"}}");
+        return g_string_free(j, FALSE);
     }
     /* Opened like the block layer opens it, so a FAT32 / exFAT USB drive works. */
     wchar_t *wpath = g_utf8_to_utf16(path, -1, NULL, NULL, NULL);
