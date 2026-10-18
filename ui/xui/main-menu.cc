@@ -740,6 +740,9 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
 void MainMenuDisplayView::Draw()
 {
     SectionTitle("Renderer");
+#ifndef XEMU_UWP
+    /* On the console the renderer is chosen at start (ui/xemu.c: OpenGL, Vulkan only with use-vulkan.txt); switching
+     * it here took effect at once and Vulkan stopped Burnout 3 in a second (owner console, 2026-10-18). */
     ChevronCombo("Backend", &g_config.display.renderer,
                  "Null\0"
                  "OpenGL\0"
@@ -748,6 +751,7 @@ void MainMenuDisplayView::Draw()
 #endif
                  ,
                  "Select desired renderer implementation");
+#endif
     int rendering_scale = nv2a_get_surface_scale_factor() - 1;
     if (ChevronCombo("Internal resolution scale", &rendering_scale,
                      "1x\0"
