@@ -909,6 +909,25 @@ static uint32_t read_memory_p(dsp_core_t* dsp, uint32_t address)
     return r;
 }
 
+#ifdef XEMU_UWP
+/*
+ * A DSP program that reads or writes past the end of X or Y memory stopped
+ * the whole emulator here (Dead or Alive Xtreme Beach Volleyball, a Y read,
+ * 2026-10-18). On a console the access is answered instead: reads give 0,
+ * writes are dropped, and the first of each kind is logged for the reports.
+ */
+static bool dsp_uwp_out_of_range(const char *what, uint32_t address)
+{
+    static bool seen[4];
+    int k = (what[0] == 'Y') * 2 + (what[2] == 'w');
+    if (!seen[k]) {
+        seen[k] = true;
+        uwp_log("sound chip: %s at %x is outside its memory; answered (first time only)", what, address);
+    }
+    return true;
+}
+#endif
+
 uint32_t dsp56k_read_memory(dsp_core_t* dsp, int space, uint32_t address)
 {
     assert((address & 0xFF000000) == 0);
@@ -930,6 +949,11 @@ uint32_t dsp56k_read_memory(dsp_core_t* dsp, int space, uint32_t address)
             }
         }
     } else if (space == DSP_SPACE_Y) {
+#ifdef XEMU_UWP
+        if (address >= DSP_YRAM_SIZE && dsp_uwp_out_of_range("Y read", address)) {
+            return 0;
+        }
+#endif
         assert(address < DSP_YRAM_SIZE);
         return dsp->yram[address];
     } else if (space == DSP_SPACE_P) {
@@ -963,10 +987,20 @@ static void write_memory_raw(dsp_core_t* dsp, int space, uint32_t address, uint3
         } else if (address >= 0xc00 && address < 0xc00+DSP_MIXBUFFER_SIZE) {
             dsp->mixbuffer[address-0xc00] = value;
         } else {
+#ifdef XEMU_UWP
+            if (address >= DSP_XRAM_SIZE && dsp_uwp_out_of_range("X write", address)) {
+                return;
+            }
+#endif
             assert(address < DSP_XRAM_SIZE);
             dsp->xram[address] = value;
         }
     } else if (space == DSP_SPACE_Y) {
+#ifdef XEMU_UWP
+        if (address >= DSP_YRAM_SIZE && dsp_uwp_out_of_range("Y write", address)) {
+            return;
+        }
+#endif
         assert(address < DSP_YRAM_SIZE);
         dsp->yram[address] = value;
     } else if (space == DSP_SPACE_P) {
