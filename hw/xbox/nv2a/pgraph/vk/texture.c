@@ -1186,14 +1186,6 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
             d, texture_vram_offset, texture_length, texture_palette_vram_offset,
             texture_palette_data_size);
     }
-#ifdef XEMU_UWP
-    /* Palette textures are compared by content every time (they are small). A game can fill one after it was
-     * first loaded without the write being seen as dirty, and the empty first copy stayed: Ninja Gaiden's item and
-     * save message boxes were invisible on Vulkan (all index 0 = the clear colour). */
-    if (is_indexed && !surface_to_texture) {
-        possibly_dirty = true;
-    }
-#endif
 
     // Calculate hash of texture data, if necessary
     void *texture_data = (char*)d->vram_ptr + texture_vram_offset;
