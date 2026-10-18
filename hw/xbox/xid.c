@@ -62,6 +62,17 @@ void update_input(USBXIDGamepadState *s)
     ControllerState *state = xemu_input_get_bound(s->device_index);
     assert(state);
     xemu_input_update_controller(state);
+#ifdef XEMU_UWP
+    /* xemu's menu is open: the game gets an untouched controller, the menu keeps the real one */
+    extern bool xemu_uwp_game_input_held(const ControllerState *state);
+    ControllerState game_view;
+    if (xemu_uwp_game_input_held(state)) {
+        game_view = *state;
+        game_view.buttons = 0;
+        memset(game_view.axis, 0, sizeof(game_view.axis));
+        state = &game_view;
+    }
+#endif
 
     const int button_map_analog[6][2] = {
         { GAMEPAD_A,     CONTROLLER_BUTTON_A     },
