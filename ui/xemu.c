@@ -2316,7 +2316,8 @@ static void uwp_press(const char *list)
         { "white", CONTROLLER_BUTTON_WHITE }, { "black", CONTROLLER_BUTTON_BLACK },
         { "ls", CONTROLLER_BUTTON_LSTICK }, { "rs", CONTROLLER_BUTTON_RSTICK },
     };
-    char **parts = g_strsplit(list, ",", -1);
+    /* "," or "-" between entries: Game Vault's xemu-extra.txt test file passes no commas */
+    char **parts = g_strsplit_set(list, ",-", -1);
     if (uwp_press_next >= uwp_press_count) {
         uwp_press_count = uwp_press_next = 0;
     }
@@ -4850,6 +4851,15 @@ static void uwp_fill_system_files(void)
         g_config.display.renderer = vulkan ? CONFIG_DISPLAY_RENDERER_VULKAN : CONFIG_DISPLAY_RENDERER_OPENGL;
         if (vulkan) {
             uwp_log("renderer: Vulkan (use-vulkan.txt)");
+        }
+        g_free(marker);
+        marker = g_build_filename(dir, "display-upstream.txt", NULL);
+        {
+            extern bool xemu_uwp_display_upstream; /* pgraph/gl/display.c */
+            xemu_uwp_display_upstream = uwp_file_exists(marker);
+            if (xemu_uwp_display_upstream) {
+                uwp_log("display test: upstream's surface choice, no stale-surface rule (display-upstream.txt)");
+            }
         }
         g_free(marker);
         marker = g_build_filename(dir, "vk-zwrite-off.txt", NULL);

@@ -231,7 +231,10 @@ typedef struct PGRAPHGLState {
         GLuint fbo, vao, vbo, prog;
         GLuint tex_loc, surface_size_loc;
         GLuint zeta_prog; /* XEMU_UWP: depth surface -> the color image of its bits */
-        GLint zeta_tex_loc;
+        GLint zeta_tex_loc, zeta_rgba_loc;
+        GLuint zeta_dl_prog, zeta_dl_tex; /* XEMU_UWP: depth read-back through a colour image */
+        GLint zeta_dl_tex_loc;
+        unsigned int zeta_dl_w, zeta_dl_h;
     } s2t_rndr;
 
     struct disp_rndr {

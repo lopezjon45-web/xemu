@@ -499,7 +499,16 @@ void *pfifo_thread(void *arg)
          * as the puller does around pgraph_method; a kick meanwhile sets fifo_kick, checked below. */
         extern bool xemu_uwp_reports_nowait, xemu_uwp_reports_left;   /* gl/reports.c */
         qemu_mutex_unlock(&d->pfifo.lock);
-        xemu_uwp_reports_nowait = true;
+        /* test file reports-wait.txt: every result waited for, as upstream does */
+        static int uwp_reports_wait = -1;
+        if (uwp_reports_wait < 0) {
+            extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+            uwp_reports_wait = xemu_uwp_test_file_exists("reports-wait.txt");
+            if (uwp_reports_wait) {
+                uwp_log("occlusion results: every one waited for (reports-wait.txt)");
+            }
+        }
+        xemu_uwp_reports_nowait = !uwp_reports_wait;
         /* Asking GL whether a query result is ready makes Mesa's D3D12 driver submit the commands
          * gathered so far as a batch; it keeps 8 batches, and starting one that the GPU still uses
          * waits for the GPU. Asked after every pusher run (thousands a second), that put a GPU wait

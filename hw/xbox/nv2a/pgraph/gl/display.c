@@ -403,14 +403,30 @@ static void gl_fence(void)
  * on screen: drop it and let the frame buffer in RAM be shown instead.
  */
 static uint64_t uwp_stale_surface_addr; /* vram address + 1 of a surface to drop, 0 = none */
+/* test switch display-upstream.txt (ui/xemu.c): upstream's choice, no stale-surface rule */
+bool xemu_uwp_display_upstream;
 
 static SurfaceBinding *uwp_display_surface(NV2AState *d, hwaddr line_offset)
 {
-    SurfaceBinding *surface =
-        pgraph_gl_surface_get_within(d, d->pcrtc.start + line_offset);
+    /*
+     * The display address is read once: a game that flips between two frame buffers can change it between two
+     * reads, and then the buffer just looked up seemed to start a whole frame before the display (Conker: Live &
+     * Reloaded, gameplay black while it drew).
+     */
+    hwaddr start = qatomic_read(&d->pcrtc.start);
+    SurfaceBinding *surface = pgraph_gl_surface_get_within(d, start + line_offset);
+    if (xemu_uwp_display_upstream) {
+        return surface;
+    }
     if (surface && surface->color && !surface->draw_dirty &&
-        d->pcrtc.start > surface->vram_addr &&
-        d->pcrtc.start - surface->vram_addr > 2 * (hwaddr)surface->pitch) {
+        start > surface->vram_addr &&
+        start - surface->vram_addr > 2 * (hwaddr)surface->pitch) {
+        static unsigned hidden;
+        if (hidden++ < 12) {
+            uwp_log("display: surface %ux%u at %x left out (display starts at %x, %u time(s))",
+                    surface->width, surface->height, (unsigned)surface->vram_addr, (unsigned)start,
+                    hidden);
+        }
         /*
          * Not invalidated here: this also runs on the UI thread, which does
          * not own the renderer's state. The renderer thread does it when it

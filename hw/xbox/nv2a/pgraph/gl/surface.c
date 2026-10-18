@@ -170,9 +170,42 @@ static void init_render_to_texture(PGRAPHState *pg)
      * A Z24S8 depth surface read as an A8R8G8B8 / X8R8G8B8 texture (games do
      * this for depth-of-field and glare effects): the texel is the 32-bit
      * word (depth << 8 | stencil), so A, R, G are the depth's high, middle
-     * and low byte. The stencil byte (B) is given as 0.
+     * and low byte. The stencil byte (B) is given as 0. Read as an R8G8B8A8
+     * texture (rgba = 1; Conker: Live & Reloaded's glow and fog) the same word
+     * gives R, G, B = high, middle, low byte and A = stencil.
      */
     const char *zeta_fs =
+        "#version 330\n"
+        "uniform sampler2D tex;\n"
+        "uniform int rgba;\n"
+        "layout(location = 0) out vec4 out_Color;\n"
+        "void main()\n"
+        "{\n"
+        "    float d = texelFetch(tex, ivec2(gl_FragCoord.xy), 0).r;\n"
+        "    uint v = min(uint(d * 16777215.0 + 0.5), 16777215u);\n"
+        "    if (rgba != 0)\n"
+        "        out_Color = vec4(float(v >> 16), float((v >> 8) & 255u),\n"
+        "                         float(v & 255u), 0.0) / 255.0;\n"
+        "    else\n"
+        "        out_Color = vec4(float((v >> 8) & 255u), float(v & 255u), 0.0,\n"
+        "                         float(v >> 16)) / 255.0;\n"
+        "}\n";
+    r->s2t_rndr.zeta_prog = pgraph_gl_compile_shader(vs, zeta_fs);
+    r->s2t_rndr.zeta_tex_loc =
+        glGetUniformLocation(r->s2t_rndr.zeta_prog, "tex");
+    r->s2t_rndr.zeta_rgba_loc =
+        glGetUniformLocation(r->s2t_rndr.zeta_prog, "rgba");
+    /*
+     * Reading a depth surface back to guest memory: glReadPixels of
+     * GL_DEPTH_STENCIL returned one value for every pixel on the console's
+     * GL-on-D3D12 (0x800000 for a whole 640x480 depth buffer), so games that
+     * switch a depth buffer's memory between two shapes lost their depth and
+     * drew black (Conker: Live & Reloaded, 640x480 and 32x32 at one address).
+     * The depth is drawn into a colour image as the bytes of the word
+     * (depth << 8 | stencil), lowest byte first, and that image is read
+     * instead. The stencil byte is given as 0.
+     */
+    const char *zeta_dl_fs =
         "#version 330\n"
         "uniform sampler2D tex;\n"
         "layout(location = 0) out vec4 out_Color;\n"
@@ -180,12 +213,14 @@ static void init_render_to_texture(PGRAPHState *pg)
         "{\n"
         "    float d = texelFetch(tex, ivec2(gl_FragCoord.xy), 0).r;\n"
         "    uint v = min(uint(d * 16777215.0 + 0.5), 16777215u);\n"
-        "    out_Color = vec4(float((v >> 8) & 255u), float(v & 255u), 0.0,\n"
+        "    out_Color = vec4(0.0, float(v & 255u), float((v >> 8) & 255u),\n"
         "                     float(v >> 16)) / 255.0;\n"
         "}\n";
-    r->s2t_rndr.zeta_prog = pgraph_gl_compile_shader(vs, zeta_fs);
-    r->s2t_rndr.zeta_tex_loc =
-        glGetUniformLocation(r->s2t_rndr.zeta_prog, "tex");
+    r->s2t_rndr.zeta_dl_prog = pgraph_gl_compile_shader(vs, zeta_dl_fs);
+    r->s2t_rndr.zeta_dl_tex_loc =
+        glGetUniformLocation(r->s2t_rndr.zeta_dl_prog, "tex");
+    glGenTextures(1, &r->s2t_rndr.zeta_dl_tex);
+    r->s2t_rndr.zeta_dl_w = r->s2t_rndr.zeta_dl_h = 0;
 #endif
     r->s2t_rndr.tex_loc = glGetUniformLocation(r->s2t_rndr.prog, "tex");
     r->s2t_rndr.surface_size_loc = glGetUniformLocation(r->s2t_rndr.prog,
@@ -207,6 +242,8 @@ static void finalize_render_to_texture(PGRAPHState *pg)
     r->s2t_rndr.prog = 0;
 #ifdef XEMU_UWP
     glDeleteProgram(r->s2t_rndr.zeta_prog);
+    glDeleteProgram(r->s2t_rndr.zeta_dl_prog);
+    glDeleteTextures(1, &r->s2t_rndr.zeta_dl_tex);
     r->s2t_rndr.zeta_prog = 0;
 #endif
 
@@ -226,10 +263,24 @@ static void finalize_render_to_texture(PGRAPHState *pg)
  * are GL_DEPTH_COMPONENT16 here, so pgraph_gl_render_surface_to_texture can
  * copy the image on the GPU instead of reading the surface back every frame.
  */
+/* test file zeta-tex-upstream.txt: depth surfaces sampled as textures go through memory, as upstream does */
+static bool uwp_zeta_tex_upstream(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("zeta-tex-upstream.txt");
+        if (off) {
+            uwp_log("depth texture test: depth surfaces read as textures through memory (zeta-tex-upstream.txt)");
+        }
+    }
+    return off;
+}
+
 static bool uwp_zeta_to_texture_ok(const SurfaceBinding *surface,
                                    const TextureShape *shape)
 {
-    if (surface->color || surface->swizzle) {
+    if (surface->color || surface->swizzle || uwp_zeta_tex_upstream()) {
         return false;
     }
     /* the texture gets the surface's own GL format, see the copy below */
@@ -245,12 +296,14 @@ static bool uwp_zeta_to_texture_ok(const SurfaceBinding *surface,
 static bool uwp_zeta_as_color_ok(const SurfaceBinding *surface,
                                  const TextureShape *shape)
 {
-    return !surface->color && !surface->swizzle &&
+    return !surface->color && !surface->swizzle && !uwp_zeta_tex_upstream() &&
            surface->fmt.gl_internal_format == GL_DEPTH24_STENCIL8 &&
            (shape->color_format ==
                 NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8 ||
             shape->color_format ==
-                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8);
+                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8 ||
+            shape->color_format ==
+                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8);
 }
 #endif
 
@@ -308,7 +361,7 @@ static bool surface_to_texture_can_fastpath(SurfaceBinding *surface,
 static void render_surface_to(NV2AState *d, SurfaceBinding *surface,
                               int texture_unit, GLuint gl_target,
                               GLuint gl_texture, unsigned int width,
-                              unsigned int height)
+                              unsigned int height, int tex_color_format)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
@@ -337,6 +390,9 @@ static void render_surface_to(NV2AState *d, SurfaceBinding *surface,
         glUseProgram(r->s2t_rndr.zeta_prog);
         glProgramUniform1i(r->s2t_rndr.zeta_prog, r->s2t_rndr.zeta_tex_loc,
                            texture_unit);
+        glProgramUniform1i(r->s2t_rndr.zeta_prog, r->s2t_rndr.zeta_rgba_loc,
+                           tex_color_format ==
+                               NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8);
     } else
 #endif
     {
@@ -482,7 +538,8 @@ void pgraph_gl_render_surface_to_texture(NV2AState *d, SurfaceBinding *surface,
                  f->gl_format, f->gl_type, NULL);
     glBindTexture(texture->gl_target, 0);
     render_surface_to(d, surface, texture_unit, texture->gl_target,
-                             texture->gl_texture, width, height);
+                             texture->gl_texture, width, height,
+                             texture_shape->color_format);
     glBindTexture(texture->gl_target, texture->gl_texture);
     glUseProgram(
         r->shader_binding ? r->shader_binding->gl_program : 0);
@@ -676,6 +733,78 @@ static bool uwp_evict_without_download(const SurfaceBinding *old,
     bool old_in_new = n0 <= o0 && o1 <= n1;
     bool new_in_old = o0 <= n0 && n1 <= o1;
     return !old_in_new && !new_in_old;
+}
+
+/*
+ * A game that uses one piece of memory for two depth buffers of different
+ * shapes, a frame at a time (Conker: Live & Reloaded: 640x480 and a swizzled
+ * 32x32 at the same address, twice a frame), made the big one go to guest
+ * memory and back every time: a GPU wait each way, about half of the
+ * graphics thread (title screen 10 fps instead of 30). The big depth image is
+ * parked on the GPU instead and taken back when that same shape is bound again
+ * within two frames. Anything else, or after two frames, writes it to guest
+ * memory as before. Test file zeta-park-off.txt: no parking.
+ */
+static SurfaceBinding uwp_parked;
+static bool uwp_parked_valid;
+static unsigned int uwp_parked_scale;
+
+static bool uwp_zeta_park_off(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("zeta-park-off.txt");
+        if (off) {
+            uwp_log("depth park test: off (zeta-park-off.txt)");
+        }
+    }
+    return off;
+}
+
+/* write the parked depth image to guest memory (or drop it) and free it */
+static void uwp_unpark(NV2AState *d, bool keep_data)
+{
+    if (!uwp_parked_valid) {
+        return;
+    }
+    uwp_parked_valid = false;
+    if (keep_data && d->pgraph.surface_scale_factor == uwp_parked_scale) {
+        uwp_parked.download_pending = true;
+        surface_download(d, &uwp_parked, true);
+    }
+    glDeleteTextures(1, &uwp_parked.gl_buffer);
+    uwp_parked.gl_buffer = 0;
+}
+
+static bool uwp_park_zeta(NV2AState *d, SurfaceBinding *old, const SurfaceBinding *incoming)
+{
+    if (old->color || incoming->color || !old->draw_dirty || old->vram_addr != incoming->vram_addr ||
+        (uint64_t)incoming->width * incoming->height >= (uint64_t)old->width * old->height ||
+        uwp_zeta_park_off()) {
+        return false;
+    }
+    uwp_unpark(d, true);
+    uwp_parked = *old;
+    uwp_parked_valid = true;
+    uwp_parked_scale = d->pgraph.surface_scale_factor;
+    old->gl_buffer = 0;      /* the texture lives on in the park; invalidate frees nothing */
+    old->draw_dirty = false; /* and nothing is read back */
+    static unsigned logged;
+    if (!logged++) {
+        uwp_log("depth park: %ux%u at %x kept on the GPU while a %ux%u depth buffer uses its memory",
+                old->width, old->height, (unsigned)old->vram_addr, incoming->width, incoming->height);
+    }
+    return true;
+}
+
+static bool uwp_unpark_matches(PGRAPHState *pg, const SurfaceBinding *e)
+{
+    return uwp_parked_valid && !e->color && e->vram_addr == uwp_parked.vram_addr &&
+           e->width == uwp_parked.width && e->height == uwp_parked.height &&
+           e->pitch == uwp_parked.pitch && e->swizzle == uwp_parked.swizzle &&
+           e->fmt.gl_internal_format == uwp_parked.fmt.gl_internal_format &&
+           pg->surface_scale_factor == uwp_parked_scale;
 }
 #endif
 
@@ -952,6 +1081,90 @@ static void surface_copy_shrink_row(uint8_t *out, uint8_t *in,
     }
 }
 
+#ifdef XEMU_UWP
+/* test file zeta-readpixels.txt: depth surfaces read back with glReadPixels, as upstream does */
+static bool uwp_zeta_readpixels(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        on = xemu_uwp_test_file_exists("zeta-readpixels.txt");
+        if (on) {
+            uwp_log("depth read-back test: glReadPixels of the depth (zeta-readpixels.txt)");
+        }
+    }
+    return on;
+}
+
+/* see zeta_dl_fs in pgraph_gl_init_surfaces */
+static void uwp_zeta_download_via_color(NV2AState *d, SurfaceBinding *surface, bool flip, uint8_t *out)
+{
+    PGRAPHState *pg = &d->pgraph;
+    PGRAPHGLState *r = pg->gl_renderer_state;
+    unsigned int w = pg->surface_scale_factor * surface->width;
+    unsigned int h = pg->surface_scale_factor * surface->height;
+
+    GLint prev_active, prev_tex;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+
+    glBindTexture(GL_TEXTURE_2D, r->s2t_rndr.zeta_dl_tex);
+    if (r->s2t_rndr.zeta_dl_w != w || r->s2t_rndr.zeta_dl_h != h) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        r->s2t_rndr.zeta_dl_w = w;
+        r->s2t_rndr.zeta_dl_h = h;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, r->s2t_rndr.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r->s2t_rndr.zeta_dl_tex, 0);
+    GLenum draw_buffers[1] = { GL_COLOR_ATTACHMENT0 };
+    glDrawBuffers(1, draw_buffers);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+    glBindTexture(GL_TEXTURE_2D, surface->gl_buffer);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+    glUseProgram(r->s2t_rndr.zeta_dl_prog);
+    glProgramUniform1i(r->s2t_rndr.zeta_dl_prog, r->s2t_rndr.zeta_dl_tex_loc, 0);
+    glBindVertexArray(r->s2t_rndr.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->s2t_rndr.vbo);
+    glViewport(0, 0, w, h);
+    glColorMask(true, true, true, true);
+    glDisable(GL_DITHER);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_DEPTH_TEST);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    glo_readpixels(GL_RGBA, GL_UNSIGNED_BYTE, 4, pg->surface_scale_factor * surface->pitch, w, h, flip, out);
+
+    static unsigned logged;
+    if (logged < 6) {
+        uint32_t lo = UINT32_MAX, hi = 0;
+        for (unsigned int y = 0; y < h; y += 16) {
+            const uint32_t *row = (const uint32_t *)(out + y * pg->surface_scale_factor * surface->pitch);
+            for (unsigned int x = 0; x < w; x += 16) {
+                lo = MIN(lo, row[x] >> 8);
+                hi = MAX(hi, row[x] >> 8);
+            }
+        }
+        logged++;
+        uwp_log("depth read-back through a colour image %ux%u at %x: depth %06x..%06x",
+                surface->width, surface->height, (unsigned)surface->vram_addr, lo, hi);
+    }
+
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, r->gl_framebuffer);
+    glBindTexture(GL_TEXTURE_2D, prev_tex);
+    glActiveTexture(prev_active);
+    glUseProgram(r->shader_binding ? r->shader_binding->gl_program : 0);
+}
+#endif
+
 static void surface_download_to_buffer(NV2AState *d, SurfaceBinding *surface,
                                        bool swizzle, bool flip, bool downscale,
                                        uint8_t *pixels)
@@ -1003,11 +1216,18 @@ static void surface_download_to_buffer(NV2AState *d, SurfaceBinding *surface,
         gl_read_buf = pg->scale_buf;
     }
 
+#ifdef XEMU_UWP
+    if (!surface->color && surface->fmt.gl_internal_format == GL_DEPTH24_STENCIL8 &&
+        !uwp_zeta_readpixels()) {
+        uwp_zeta_download_via_color(d, surface, flip, gl_read_buf);
+    } else
+#endif
     glo_readpixels(
         surface->fmt.gl_format, surface->fmt.gl_type, surface->fmt.bytes_per_pixel,
         pg->surface_scale_factor * surface->pitch,
         pg->surface_scale_factor * surface->width,
         pg->surface_scale_factor * surface->height, flip, gl_read_buf);
+
 
     /* FIXME: Replace this with a hw accelerated version */
     if (downscale) {
@@ -1505,7 +1725,19 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
              * stays the color target's.
              */
             bool zeta_larger = false;
-            if (is_compatible && !color && r->color_binding) {
+            /* test file zeta-equal.txt: upstream's rule, the depth buffer only kept at the colour target's size */
+            static int uwp_zeta_equal = -1;
+            if (uwp_zeta_equal < 0) {
+                extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+                uwp_zeta_equal = xemu_uwp_test_file_exists("zeta-equal.txt");
+                if (uwp_zeta_equal) {
+                    uwp_log("depth buffer test: kept only at the colour target's size (zeta-equal.txt)");
+                }
+            }
+            if (is_compatible && !color && r->color_binding && uwp_zeta_equal) {
+                is_compatible &= (found->width == r->color_binding->width) &&
+                                 (found->height == r->color_binding->height);
+            } else if (is_compatible && !color && r->color_binding) {
                 is_compatible &= (found->width >= r->color_binding->width) &&
                                  (found->height >= r->color_binding->height);
                 zeta_larger = is_compatible &&
@@ -1559,6 +1791,8 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
 #ifdef XEMU_UWP
                 if (uwp_evict_without_download(found, &entry)) {
                     found->draw_dirty = false;
+                } else {
+                    uwp_park_zeta(d, found, &entry);
                 }
 #endif
                 pgraph_gl_surface_download_if_dirty(d, found);
@@ -1566,6 +1800,24 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
             }
         }
 
+#ifdef XEMU_UWP
+        bool uwp_from_park = should_create && uwp_unpark_matches(pg, &entry);
+        if (uwp_from_park) {
+            entry.gl_buffer = uwp_parked.gl_buffer;
+            uwp_parked.gl_buffer = 0;
+            uwp_parked_valid = false;
+            found = surface_put(d, entry.vram_addr, &entry);
+            found->upload_pending = false;
+            found->draw_dirty = true;
+            found->cleared = false;
+            pg->surface_binding_dim.width = entry.width;
+            pg->surface_binding_dim.clip_x = entry.shape.clip_x;
+            pg->surface_binding_dim.clip_width = entry.shape.clip_width;
+            pg->surface_binding_dim.height = entry.height;
+            pg->surface_binding_dim.clip_y = entry.shape.clip_y;
+            pg->surface_binding_dim.clip_height = entry.shape.clip_height;
+        } else
+#endif
         if (should_create) {
             glGenTextures(1, &entry.gl_buffer);
             glBindTexture(GL_TEXTURE_2D, entry.gl_buffer);
@@ -1679,6 +1931,12 @@ void pgraph_gl_surface_update(NV2AState *d, bool upload, bool color_write,
     pg->surface_shape.z_format =
         GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER),
                  NV_PGRAPH_SETUPRASTER_Z_FORMAT);
+
+#ifdef XEMU_UWP
+    if (uwp_parked_valid && pg->frame_time - uwp_parked.frame_time > 2) {
+        uwp_unpark(d, true);
+    }
+#endif
 
     color_write = color_write &&
             (pg->clearing || pgraph_color_write_enabled(pg));
@@ -1799,6 +2057,9 @@ static void flush_surfaces(NV2AState *d)
     pgraph_gl_unbind_surface(d, true);
     pgraph_gl_unbind_surface(d, false);
 
+#ifdef XEMU_UWP
+    uwp_unpark(d, false);
+#endif
     SurfaceBinding *s, *next;
     QTAILQ_FOREACH_SAFE(s, &r->surfaces, entry, next) {
         // FIXME: We should download all surfaces to ram, but need to
