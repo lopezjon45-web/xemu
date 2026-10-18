@@ -19,6 +19,7 @@
 
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "hw/qdev-core.h"
 #include "hw/qdev-properties.h"
 #include "qapi/error.h"
@@ -690,6 +691,42 @@ void xemu_input_update_sdl_controller_state(ControllerState *state)
     state->axis[5] = SDL_GET_AXIS(state, axis_right_y);
 
 #undef SDL_GET_AXIS
+
+#ifdef XEMU_UWP
+    /*
+     * Round sticks to the square range of the original Xbox controller. Today's pads reach only about 71% on each
+     * axis when pushed fully into a corner; the Duke and Controller S reported (close to) full on both. Games that
+     * test each axis on its own then never see a full push on a diagonal: in Oogie's Revenge Jack only walked when
+     * the stick went into a corner (r/xemu 1q3gqqe, 2026-01; user, 2026-10-17). Each direction is stretched so the
+     * edge of the circle lands on the edge of the square; straight up/down/left/right and the centre stay as they
+     * were.
+     */
+    for (int s = 0; s < 2; s++) {
+        int ix = s ? CONTROLLER_AXIS_RSTICK_X : CONTROLLER_AXIS_LSTICK_X;
+        int iy = s ? CONTROLLER_AXIS_RSTICK_Y : CONTROLLER_AXIS_LSTICK_Y;
+        float x = state->axis[ix] / 32767.0f, y = state->axis[iy] / 32767.0f;
+        float ax = fabsf(x), ay = fabsf(y), m = ax > ay ? ax : ay;
+        if (m < 0.0001f) {
+            continue;
+        }
+        float k = sqrtf(x * x + y * y) / m;
+        x *= k;
+        y *= k;
+        x = x > 1.0f ? 1.0f : x < -1.0f ? -1.0f : x;
+        y = y > 1.0f ? 1.0f : y < -1.0f ? -1.0f : y;
+        {
+            /* for the log, once per stick: a full push into a corner, as the pad gave it and as the game gets it */
+            static bool logged[2];
+            if (!logged[s] && k > 1.3f && fabsf(x) > 0.95f && fabsf(y) > 0.95f) {
+                logged[s] = true;
+                uwp_log("stick: %s stick pushed into a corner, pad %d,%d -> game %d,%d", s ? "right" : "left",
+                        state->axis[ix], state->axis[iy], (int)lrintf(x * 32767.0f), (int)lrintf(y * 32767.0f));
+            }
+        }
+        state->axis[ix] = (int16_t)lrintf(x * 32767.0f);
+        state->axis[iy] = (int16_t)lrintf(y * 32767.0f);
+    }
+#endif
 
 // FIXME: Check range
 #define INVERT_AXIS(controller_axis) \
