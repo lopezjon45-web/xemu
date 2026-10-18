@@ -35,6 +35,9 @@
 #include <stdlib.h>
 
 #include "system/blockdev.h"
+#ifdef XEMU_UWP
+#include "qemu/xemu-uwp.h"
+#endif
 
 // #define DEBUG_INPUT
 
@@ -511,6 +514,14 @@ uint64_t xemu_uwp_injected_rt_until, xemu_uwp_injected_lt_until;
 /* a button held from outside until this SDL tick ("a=<seconds>" in a launch link) */
 uint16_t xemu_uwp_held_buttons;
 uint64_t xemu_uwp_held_until;
+/*
+ * xemu's menu is on screen (set by ui/xui/main.cc). The Xbox keeps the Guide button, so players open the menu with
+ * View + Menu and move through it with the d-pad and A, and the game got all of that too: Start opened the game's own
+ * pause menu and the presses meant for xemu's menu picked "quit to title" in it (neociano, Oogie's Revenge,
+ * 2026-10-18, live stream: render scale set to 1x and the game went back to its title screen). The game now sees an
+ * untouched controller while the menu is open, and after it closes until every button is let go.
+ */
+bool xemu_uwp_menu_open;
 #endif
 
 void xemu_input_update_controller(ControllerState *state)
@@ -552,6 +563,22 @@ void xemu_input_update_controller(ControllerState *state)
         extern void xemu_uwp_note_input(uint32_t buttons, const int16_t *axis);
         if (state->bound == 0) {
             xemu_uwp_note_input(state->buttons, state->axis);
+        }
+    }
+    {
+        static bool menu_held;   /* the menu was open: still held back until all buttons are up */
+        bool down = state->buttons != 0 || state->axis[CONTROLLER_AXIS_LTRIG] > 8000 ||
+                    state->axis[CONTROLLER_AXIS_RTRIG] > 8000;
+        if (xemu_uwp_menu_open && !menu_held) {
+            menu_held = true;
+            uwp_log("menu open: the game gets no buttons until it is closed and every button is up");
+        }
+        if (menu_held && !xemu_uwp_menu_open && !down) {
+            menu_held = false;
+        }
+        if (menu_held) {
+            state->buttons = 0;
+            memset(state->axis, 0, sizeof(state->axis));
         }
     }
 #endif

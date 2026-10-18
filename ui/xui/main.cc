@@ -61,6 +61,8 @@ extern "C" bool xemu_uwp_overlay_on;
 extern "C" const char *xemu_uwp_shot_wanted(void);
 extern "C" void xemu_uwp_shot_save(const char *label, const void *png, size_t size);
 extern "C" void xemu_uwp_shot_black(const char *label);
+/* xemu's menu is on screen: the game gets no buttons (ui/xemu-input.c) */
+extern "C" bool xemu_uwp_menu_open;
 #endif
 #include "compat.hh"
 #if defined(_WIN32)
@@ -353,6 +355,9 @@ void xemu_hud_update(void)
     update_window.Draw();
 #endif
     g_scene_mgr.Draw();
+#ifdef XEMU_UWP
+    xemu_uwp_menu_open = g_scene_mgr.IsDisplayingScene();
+#endif
     if (!first_boot_window.is_open) notification_manager.Draw();
     g_snapshot_mgr.Draw();
 
