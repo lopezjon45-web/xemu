@@ -743,7 +743,7 @@ static bool uwp_evict_without_download(const SurfaceBinding *old,
  * graphics thread (title screen 10 fps instead of 30). The big depth image is
  * parked on the GPU instead and taken back when that same shape is bound again
  * within two frames. Anything else, or after two frames, writes it to guest
- * memory as before. Test file zeta-park-off.txt: no parking.
+ * memory as before. Off unless the test file zeta-park.txt exists.
  */
 static SurfaceBinding uwp_parked;
 static bool uwp_parked_valid;
@@ -754,9 +754,11 @@ static bool uwp_zeta_park_off(void)
     static int off = -1;
     if (off < 0) {
         extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
-        off = xemu_uwp_test_file_exists("zeta-park-off.txt");
-        if (off) {
-            uwp_log("depth park test: off (zeta-park-off.txt)");
+        /* off by default: shiny objects in Conker (cups, candles) take their reflection from that memory and
+         * came out white or rainbow-coloured while the big buffer was parked; test file zeta-park.txt: on */
+        off = !xemu_uwp_test_file_exists("zeta-park.txt");
+        if (!off) {
+            uwp_log("depth park test: on (zeta-park.txt)");
         }
     }
     return off;
