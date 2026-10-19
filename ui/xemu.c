@@ -61,6 +61,9 @@
 #include <io.h>
 #include <fcntl.h>
 #endif
+#ifdef XEMU_CPU_GATE
+#include "xemu-cpu-gate.h"
+#endif
 #include "qemu/xemu-uwp.h"
 #include "system/block-backend.h"
 #include "system/blockdev.h"
@@ -1064,6 +1067,33 @@ static void display_very_early_init(DisplayOptions *o)
     }
 #endif
 
+#ifdef XEMU_CPU_GATE
+    /*
+     * CPU gate build: no OpenGL context, no renderer contexts. On the console SDL's WinRT backend owns the
+     * app's CoreWindow, so a plain window is still made; on a PC there is no window at all.
+     */
+#ifdef XEMU_UWP
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        fprintf(stderr, "Failed to initialize SDL video subsystem: %s\n", SDL_GetError());
+        exit(1);
+    }
+    m_window = SDL_CreateWindow("xemu cpu gate", 640, 480, 0);
+    if (m_window == NULL) {
+        fprintf(stderr, "Failed to create main window: %s\n", SDL_GetError());
+        exit(1);
+    }
+#else
+    if (!SDL_Init(SDL_INIT_EVENTS)) {
+        fprintf(stderr, "Failed to initialize SDL: %s\n", SDL_GetError());
+        exit(1);
+    }
+#endif
+    fprintf(stderr, "CPU: %s\n", xemu_get_cpu_info());
+    fprintf(stderr, "OS_Version: %s\n", xemu_get_os_info());
+    fprintf(stderr, "cpu gate build: no OpenGL, renderer forced to null\n");
+    return;
+#endif
+
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "Failed to initialize SDL video subsystem: %s\n",
                 SDL_GetError());
@@ -1216,6 +1246,7 @@ static void display_very_early_init(DisplayOptions *o)
 static void display_early_init(DisplayOptions *o)
 {
     assert(o->type == DISPLAY_TYPE_XEMU);
+#ifndef XEMU_CPU_GATE
     display_opengl = 1;
 
     SDL_GL_MakeCurrent(m_window, m_context);
@@ -1224,6 +1255,7 @@ static void display_early_init(DisplayOptions *o)
     win32_dxgi_present_init(m_window);
 #endif
     xemu_hud_init(m_window, m_context);
+#endif
 }
 
 static const DisplayChangeListenerOps dcl_gl_ops = {
@@ -1240,7 +1272,9 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     int i;
 
     assert(o->type == DISPLAY_TYPE_XEMU);
+#ifndef XEMU_CPU_GATE
     SDL_GL_MakeCurrent(m_window, m_context);
+#endif
 
     gui_fullscreen = o->has_full_screen && o->full_screen;
     gui_fullscreen |= g_config.display.window.fullscreen_on_startup;
@@ -1296,7 +1330,9 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     }
 
     /* Tell main thread to go ahead and create the app and enter the run loop */
+#ifndef XEMU_CPU_GATE
     SDL_GL_MakeCurrent(NULL, NULL);
+#endif
     qemu_sem_post(&display_init_sem);
 }
 
@@ -1307,11 +1343,13 @@ static void display_finalize(void)
     }
 
     SDL_RemoveEventWatch(event_watch_callback, &scon_list[0]);
+#ifndef XEMU_CPU_GATE
 #ifdef _WIN32
     win32_dxgi_present_cleanup();
 #endif
     SDL_GL_MakeCurrent(NULL, NULL);
     SDL_GL_DestroyContext(m_context);
+#endif
     SDL_DestroyWindow(m_window);
     SDL_Quit();
 }
@@ -5147,10 +5185,12 @@ int main(int argc, char **argv)
         SDL_Quit();
         exit(1);
     }
+#ifndef XEMU_CPU_GATE /* the gate build leaves the settings file as the player wrote it */
 #ifdef XEMU_UWP
     atexit(uwp_save_settings);
 #else
     atexit(xemu_settings_save);
+#endif
 #endif
 
 #ifdef _WIN32
@@ -5234,6 +5274,10 @@ int main(int argc, char **argv)
      */
     xemu_uwp_audio_stream = xemu_uwp_audio_start();
 #endif
+#ifdef XEMU_CPU_GATE
+    /* after the console's own choice above (uwp_fill_system_files picks OpenGL or Vulkan) */
+    g_config.display.renderer = CONFIG_DISPLAY_RENDERER_NULL;
+#endif
     qemu_sem_init(&display_init_sem, 0);
     qemu_sem_init(&display_shutdown_sem, 0);
     qemu_thread_create(&thread, "qemu_main", qemu_main,
@@ -5250,10 +5294,12 @@ int main(int argc, char **argv)
 #endif
 
     gui_grab = 0;
+#ifndef XEMU_CPU_GATE
     if (gui_fullscreen) {
         grab_start(0);
         set_full_screen(&scon_list[0], gui_fullscreen);
     }
+#endif
 
     /*
      * FIXME: May want to create a callback mechanism for main QEMU thread
@@ -5265,6 +5311,30 @@ int main(int argc, char **argv)
     xemu_main_loop_lock();
     xemu_input_init();
     xemu_main_loop_unlock();
+
+#ifdef XEMU_CPU_GATE
+    {
+        /* the log goes to LocalState on the console (SDL's preference folder is LocalState\xemu\xemu),
+           next to the settings file on a PC */
+#ifdef XEMU_UWP
+        char *pref = SDL_GetPrefPath("xemu", "xemu");
+        char *pref_parent = g_path_get_dirname(pref);
+        char *dir = g_path_get_dirname(pref_parent);
+        g_free(pref_parent);
+        SDL_free(pref);
+#else
+        char *dir = g_path_get_dirname(xemu_settings_get_path());
+#endif
+        char *log_path = xemu_cpu_gate_log_path(dir);
+        xemu_cpu_gate_run(log_path, g_config.general.cpu_gate_seconds, &qemu_exiting);
+        g_free(log_path);
+        g_free(dir);
+    }
+    qemu_sem_post(&display_shutdown_sem);
+    qemu_thread_join(&thread);
+    display_finalize();
+    return exit_status;
+#endif
 
     struct xemu_console *scon = &scon_list[0];
 #ifdef XEMU_UWP

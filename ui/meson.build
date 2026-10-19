@@ -45,6 +45,7 @@ if host_os == 'windows'
   d3d11 = cc.find_library('d3d11', required: true)
   dxgi = cc.find_library('dxgi', required: true)
   xemu_ss.add(nvapi, d3d11, dxgi)
+  xemu_ss.add(files('xemu-cpu-gate.c')) # only called from xemu.c in a -DXEMU_CPU_GATE=1 build
 endif
 
 subdir('xui')

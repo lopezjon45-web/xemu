@@ -6,6 +6,10 @@ general:
     check:
       type: bool
       default: true
+  # CPU gate build (XEMU_CPU_GATE): seconds to run before quitting by itself
+  cpu_gate_seconds:
+    type: integer
+    default: 180
   screenshot_dir: string
   games_dir: string
   skip_boot_anim: bool

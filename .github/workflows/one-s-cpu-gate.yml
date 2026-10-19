@@ -1,0 +1,332 @@
+# The CPU gate for the Xbox One S: xemu with the null renderer and no OpenGL (-DXEMU_CPU_GATE=1, see
+# ui/xemu-cpu-gate.c), built twice from the same source.
+#
+#   uwp      the One S package, built the way uwp-one-s.yml builds it (btver2, x86-64-v2, instruction gate, signed
+#            appx). On the console it boots the disc named in xemu.toml with no interface, writes
+#            LocalState\cpu_gate.log once a second (guest frames flipped, CPU time of the TCG thread) and quits
+#            after general.cpu_gate_seconds (180 by default).
+#   desktop  the same code as a plain Windows exe, run on this runner against the free SpiritBoot BIOS (first its
+#            dashboard, then the nxdk_pgraph_tests disc), so the console's numbers have a known PC to compare to.
+name: one-s-cpu-gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [one-s-cpu-gate]
+
+permissions:
+  contents: read
+
+env:
+  START_COMMIT: e4b6fd5d96dadf3b469d376e33fce1b562c8225a # skitzellez/xemu-uwp branch uwp, where this branch starts
+  # The 0.9.208.0 package the uwp-one-s workflow rebuilt is no longer on the release page (404 on 2026-10-19);
+  # 0.9.226.0 ships the same SDL3 3.4.16 build line, the same SpiritBoot files and the same blank disk image.
+  APPX_URL: https://github.com/skitzellez/xemu-uwp/releases/download/uwp-0.9.226.0/Xemu_0.9.226.0_x64.appx
+  APPX_SHA256: 17b087f11bec1bb52205291ccb65dcd74377c5aa7c2c03f487d98a15f9bbcbff
+  LIBSMB2_SRC_URL: https://github.com/skitzellez/xemu-uwp/releases/download/uwp-0.9.226.0/libsmb2-6.2-source.zip
+  SDL3_HEADERS_REPO: XboxEmulationHub/SDL3-uwp # the fork README-UWP.md names, branch uwp-3.4.16
+  SDL3_HEADERS_REF: ddd5d4f99a26ac95d4620ccf489c07fcf5f08636
+  # above both 0.9.208.1 (the uwp-one-s build) and 0.9.226.0 (upstream), so it installs over either
+  PKG_VERSION: 0.9.226.1
+  GATE_CFLAGS: -DXEMU_CPU_GATE=1 -Wno-error -lIphlpapi -lCrypt32 -march=btver2 -mtune=btver2 -mprefer-vector-width=128
+  PGRAPH_TESTS_ISO_URL: https://github.com/abaire/nxdk_pgraph_tests/releases/latest/download/nxdk_pgraph_tests_xiso.iso
+
+jobs:
+  uwp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tags for the version string
+        run: |
+          git fetch --tags --no-recurse-submodules https://github.com/skitzellez/xemu-uwp.git
+          git describe --tags --match 'v*'
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: git make unzip diffutils
+          pacboy: >-
+            toolchain:p pkgconf:p ninja:p meson:p cmake:p python:p ccache:p tools-git:p
+            glib2:p pixman:p libepoxy:p libslirp:p libsamplerate:p openssl:p curl:p zlib:p zstd:p
+            glslang:p spirv-tools:p vulkan-headers:p libmspack:p xxhash:p nlohmann-json:p python-yaml:p
+
+      - name: Original package
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:APPX_URL -OutFile orig.appx
+          $hash = (Get-FileHash orig.appx -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:APPX_SHA256) { throw "orig.appx has SHA-256 $hash, expected $env:APPX_SHA256" }
+          makeappx unpack /o /d orig /p orig.appx
+          if ($LASTEXITCODE -ne 0) { throw "makeappx unpack failed" }
+          Invoke-WebRequest -Uri $env:LIBSMB2_SRC_URL -OutFile libsmb2-src.zip
+
+      - name: Compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ccache
+          key: ccache-one-s-cpu-gate-uwp-${{ github.sha }}
+          restore-keys: ccache-one-s-cpu-gate-uwp-
+
+      - name: Import libraries and headers for SDL3.dll and smb2.dll
+        shell: msys2 {0}
+        run: .github/uwp-one-s/prepare-deps.sh orig libsmb2-src.zip report
+
+      - name: Remove WSL's bash.exe from System32
+        shell: pwsh
+        run: |
+          $wsl = "$env:SystemRoot\System32\bash.exe"
+          if (Test-Path $wsl) {
+            takeown /f $wsl | Out-Null
+            icacls $wsl /grant "*S-1-5-32-544:F" | Out-Null
+            Remove-Item $wsl
+            Write-Output "removed $wsl"
+          } else {
+            Write-Output "no $wsl on this runner"
+          }
+
+      - name: Configure and build xemu.exe
+        shell: msys2 {0}
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/ccache
+          AR: gcc-ar
+          RANLIB: gcc-ranlib
+          NM: gcc-nm
+          TAR_OPTIONS: --force-local
+        run: |
+          export PKG_CONFIG_PATH="$(cd .. && pwd)/deps/sdl3-uwp/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          pkg-config --modversion sdl3
+          gcc --version | head -1 | tee report/compiler.txt
+          mkdir -p build-uwp && cd build-uwp
+          ../configure --cc='ccache gcc' --cxx='ccache g++' \
+            --extra-cflags="-DXBOX=1 -DXEMU_UWP=1 $GATE_CFLAGS" \
+            --target-list=i386-softmmu -Db_lto=true -Dx86_version=2
+          make -j"$(nproc)" qemu-system-i386w.exe
+          ccache -s
+
+      - name: Save the compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ccache
+          key: ccache-one-s-cpu-gate-uwp-${{ github.sha }}
+
+      - name: Gate on instructions the One S cannot run
+        shell: msys2 {0}
+        run: .github/uwp-one-s/isa-gate.sh objdump build-uwp/qemu-system-i386w.exe | tee report/gate.txt
+
+      - name: Assemble the package folder
+        shell: msys2 {0}
+        run: .github/uwp-one-s/assemble-package.sh orig pkg build-uwp/qemu-system-i386w.exe "$PKG_VERSION" report
+
+      - name: Mark, pack and sign
+        shell: pwsh
+        run: |
+          editbin /NOLOGO /APPCONTAINER pkg\xemu.exe
+          if ($LASTEXITCODE -ne 0) { throw "editbin failed" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          $appx = "out\Xemu_${env:PKG_VERSION}_x64.appx"
+          makeappx pack /o /d pkg /p $appx
+          if ($LASTEXITCODE -ne 0) { throw "makeappx pack failed" }
+          # A throwaway certificate with the package's publisher as subject. This build is for one console in
+          # Dev Mode, which accepts any signature; the key is deleted below and never leaves the runner.
+          $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=GamerDad" -KeyUsage DigitalSignature `
+            -KeyAlgorithm RSA -KeyLength 2048 -CertStoreLocation Cert:\CurrentUser\My `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}") -NotAfter (Get-Date).AddYears(10)
+          $password = [guid]::NewGuid().ToString()
+          Export-PfxCertificate -Cert $cert -FilePath sign.pfx -Password (ConvertTo-SecureString $password -AsPlainText -Force) | Out-Null
+          signtool sign /fd SHA256 /f sign.pfx /p $password $appx
+          $signed = $LASTEXITCODE
+          Remove-Item sign.pfx
+          Remove-Item $cert.PSPath
+          if ($signed -ne 0) { throw "signtool failed" }
+
+      - name: Build report
+        shell: msys2 {0}
+        run: |
+          appx=out/Xemu_${PKG_VERSION}_x64.appx
+          sha256sum "$appx" | tee report/appx.sha256
+          {
+            echo "# xemu CPU gate for Xbox One S, package $PKG_VERSION"
+            echo
+            echo "- start commit: $START_COMMIT (skitzellez/xemu-uwp, branch uwp)"
+            echo "- built commit: $GITHUB_SHA (branch $GITHUB_REF_NAME), run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "- original package: $APPX_URL (SHA-256 $APPX_SHA256)"
+            echo "- $(cat report/sdl3.txt)"
+            echo "- compiler: $(cat report/compiler.txt)"
+            echo "- configure: -Dx86_version=2 -Db_lto=true, extra cflags -DXEMU_CPU_GATE=1 -march=btver2 -mtune=btver2 -mprefer-vector-width=128"
+            echo "- appx SHA-256: $(cut -d' ' -f1 report/appx.sha256)"
+            echo
+            echo "## Instruction gate on xemu.exe (objdump)"
+            echo
+            sed 's/^/    /' report/gate.txt
+            echo
+            echo "## DLLs"
+            echo
+            echo '| dll | origin |'
+            echo '| --- | --- |'
+            tail -n +2 report/dlls.tsv | awk -F'\t' '{ printf "| %s | %s |\n", $1, $2 }'
+          } > out/build-report.md
+          cp report/gate.txt report/dlls.tsv out/
+          cat out/build-report.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xemu-one-s-cpu-gate-${{ env.PKG_VERSION }}
+          path: out
+          compression-level: 0
+          if-no-files-found: error
+
+  desktop:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tags for the version string
+        run: |
+          git fetch --tags --no-recurse-submodules https://github.com/skitzellez/xemu-uwp.git
+          git describe --tags --match 'v*'
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: git make unzip diffutils
+          pacboy: >-
+            toolchain:p pkgconf:p ninja:p meson:p cmake:p python:p ccache:p tools-git:p
+            glib2:p pixman:p libepoxy:p libslirp:p libsamplerate:p openssl:p curl:p zlib:p zstd:p
+            glslang:p spirv-tools:p vulkan-headers:p libmspack:p xxhash:p nlohmann-json:p python-yaml:p
+            sdl3:p
+
+      - name: Free BIOS, blank disk and test disc
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:APPX_URL -OutFile orig.appx
+          $hash = (Get-FileHash orig.appx -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:APPX_SHA256) { throw "orig.appx has SHA-256 $hash, expected $env:APPX_SHA256" }
+          Copy-Item orig.appx orig.zip
+          Expand-Archive orig.zip -DestinationPath orig
+          New-Item -ItemType Directory -Force cal | Out-Null
+          Copy-Item orig\spiritboot\SpiritBoot-v1.0.0-64MB.bin cal\
+          Copy-Item orig\xbox_hdd_blank.qcow2 cal\xbox_hdd.qcow2
+          Invoke-WebRequest -Uri $env:PGRAPH_TESTS_ISO_URL -OutFile cal\nxdk_pgraph_tests_xiso.iso
+          Get-ChildItem cal
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed | Format-List | Tee-Object cal\runner-cpu.txt
+
+      - name: Compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ccache
+          key: ccache-one-s-cpu-gate-desktop-${{ github.sha }}
+          restore-keys: ccache-one-s-cpu-gate-desktop-
+
+      - name: Remove WSL's bash.exe from System32
+        shell: pwsh
+        run: |
+          $wsl = "$env:SystemRoot\System32\bash.exe"
+          if (Test-Path $wsl) {
+            takeown /f $wsl | Out-Null
+            icacls $wsl /grant "*S-1-5-32-544:F" | Out-Null
+            Remove-Item $wsl
+            Write-Output "removed $wsl"
+          } else {
+            Write-Output "no $wsl on this runner"
+          }
+
+      - name: Configure and build the desktop exe
+        shell: msys2 {0}
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/ccache
+          AR: gcc-ar
+          RANLIB: gcc-ranlib
+          NM: gcc-nm
+          TAR_OPTIONS: --force-local
+        run: |
+          pkg-config --modversion sdl3
+          gcc --version | head -1
+          mkdir -p build-desktop && cd build-desktop
+          ../configure --cc='ccache gcc' --cxx='ccache g++' \
+            --extra-cflags="-DXBOX=1 $GATE_CFLAGS" \
+            --target-list=i386-softmmu -Db_lto=true -Dx86_version=2
+          make -j"$(nproc)" qemu-system-i386w.exe
+          ccache -s
+
+      - name: Save the compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ccache
+          key: ccache-one-s-cpu-gate-desktop-${{ github.sha }}
+
+      # Two runs of 60 s each: the SpiritBoot dashboard with no disc, then the nxdk_pgraph_tests disc. A run that
+      # never flips a frame fails the job: the point of the desktop build is to show the guest advances with the
+      # null renderer.
+      - name: Run the gate on this runner
+        shell: msys2 {0}
+        run: |
+          exe=$(pwd)/build-desktop/qemu-system-i386w.exe
+          cal=$(cygpath -m "$(pwd)/cal")
+          failed=0
+          for name in dashboard pgraph-tests; do
+            dir=$cal/$name
+            mkdir -p "$dir"
+            cp cal/xbox_hdd.qcow2 "$dir/xbox_hdd.qcow2"
+            disc=""
+            [ "$name" = pgraph-tests ] && disc="$cal/nxdk_pgraph_tests_xiso.iso"
+            cat > "$dir/xemu.toml" <<EOF
+          [general]
+          show_welcome = false
+          cpu_gate_seconds = 60
+
+          [general.updates]
+          check = false
+
+          [net]
+          enable = false
+
+          [sys.files]
+          bootrom_path = ''
+          flashrom_path = '$cal/SpiritBoot-v1.0.0-64MB.bin'
+          hdd_path = '$dir/xbox_hdd.qcow2'
+          eeprom_path = '$dir/eeprom.bin'
+          dvd_path = '$disc'
+          EOF
+            echo "=== run $name"
+            cat "$dir/xemu.toml"
+            (cd "$dir" && timeout 240 "$exe" -config_path "$dir/xemu.toml") && echo "exit code 0" || { echo "exit code $?"; }
+            echo "--- cpu_gate.log"
+            if [ -f "$dir/cpu_gate.log" ]; then
+              cat "$dir/cpu_gate.log"
+              # the dashboard may draw through the 2D framebuffer only; the pgraph test disc flips every frame
+              if [ "$name" = pgraph-tests ] && ! grep -Eq 'flips=[1-9]' "$dir/cpu_gate.log"; then
+                echo "no second with a flipped frame"; failed=1
+              fi
+            else
+              echo "no cpu_gate.log"; failed=1
+            fi
+            echo "--- xemu.log (head)"
+            [ -f "$dir/xemu.log" ] && head -80 "$dir/xemu.log"
+          done
+          exit $failed
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpu-gate-calibration
+          path: |
+            cal/runner-cpu.txt
+            cal/*/cpu_gate.log
+            cal/*/xemu.log
+            cal/*/xemu.toml
+          if-no-files-found: error
