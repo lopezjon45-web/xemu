@@ -75,6 +75,8 @@ jobs:
           AR: gcc-ar
           RANLIB: gcc-ranlib
           NM: gcc-nm
+          # subprojects/dsp56300 runs MSYS2's tar on a D:/... path, which GNU tar reads as host:path without this
+          TAR_OPTIONS: --force-local
         run: |
           export PKG_CONFIG_PATH="$(cd .. && pwd)/deps/sdl3-uwp/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           pkg-config --modversion sdl3
