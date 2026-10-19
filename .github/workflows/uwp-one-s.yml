@@ -64,7 +64,7 @@ jobs:
           Invoke-WebRequest -Uri $env:LIBSMB2_SRC_URL -OutFile libsmb2-src.zip
 
       - name: Compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ccache
           key: ccache-uwp-one-s-${{ github.sha }}
@@ -112,6 +112,14 @@ jobs:
             --target-list=i386-softmmu -Db_lto=true -Dx86_version=2
           make -j"$(nproc)" qemu-system-i386w.exe
           ccache -s
+
+      # Saved even when a later step fails, so the next run does not compile xemu from scratch.
+      - name: Save the compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ccache
+          key: ccache-uwp-one-s-${{ github.sha }}
 
       - name: Gate on instructions the One S cannot run
         shell: msys2 {0}
