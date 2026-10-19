@@ -1,0 +1,155 @@
+# xemu for Xbox Dev Mode, rebuilt for the Xbox One S.
+#
+# The released Xemu_0.9.208.0_x64.appx is compiled for x86-64-v3 (-Dx86_version=3: BMI2, FMA3, AVX2). The
+# One S CPU is an AMD Jaguar (GCC btver2: SSE4.2, AVX, BMI1, F16C, MOVBE) and stops the app at the first BMI2
+# instruction with STATUS_ILLEGAL_INSTRUCTION. This job rebuilds only xemu.exe, for btver2 at x86-64-v2, and
+# puts it back into the released package with matching MinGW DLLs. Nothing in the emulator's source changes.
+name: uwp-one-s
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [uwp-one-s]
+
+permissions:
+  contents: read
+
+env:
+  START_COMMIT: e4b6fd5d96dadf3b469d376e33fce1b562c8225a # skitzellez/xemu-uwp branch uwp, where this branch starts
+  APPX_URL: https://github.com/skitzellez/xemu-uwp/releases/download/uwp-0.9.208.0/Xemu_0.9.208.0_x64.appx
+  APPX_SHA256: b4ef6b260a852b7f4d1660002475bfd65e6ed094ea454daea0b1a888cb51fe98
+  LIBSMB2_SRC_URL: https://github.com/skitzellez/xemu-uwp/releases/download/uwp-0.9.208.0/libsmb2-6.2-source.zip
+  SDL3_HEADERS_REPO: XboxEmulationHub/SDL3-uwp # the fork README-UWP.md names, branch uwp-3.4.16
+  SDL3_HEADERS_REF: ddd5d4f99a26ac95d4620ccf489c07fcf5f08636
+  PKG_VERSION: 0.9.208.1
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: git make unzip diffutils
+          pacboy: >-
+            toolchain:p pkgconf:p ninja:p meson:p cmake:p python:p ccache:p tools-git:p
+            glib2:p pixman:p libepoxy:p libslirp:p libsamplerate:p openssl:p curl:p zlib:p zstd:p
+            glslang:p spirv-tools:p vulkan-headers:p libmspack:p xxhash:p nlohmann-json:p
+
+      - name: Original package
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:APPX_URL -OutFile orig.appx
+          $hash = (Get-FileHash orig.appx -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:APPX_SHA256) { throw "orig.appx has SHA-256 $hash, expected $env:APPX_SHA256" }
+          makeappx unpack /o /d orig /p orig.appx
+          if ($LASTEXITCODE -ne 0) { throw "makeappx unpack failed" }
+          Invoke-WebRequest -Uri $env:LIBSMB2_SRC_URL -OutFile libsmb2-src.zip
+
+      - name: Compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ccache
+          key: ccache-uwp-one-s-${{ github.sha }}
+          restore-keys: ccache-uwp-one-s-
+
+      - name: Import libraries and headers for SDL3.dll and smb2.dll
+        shell: msys2 {0}
+        run: .github/uwp-one-s/prepare-deps.sh orig libsmb2-src.zip report
+
+      - name: Configure and build xemu.exe
+        shell: msys2 {0}
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/ccache
+          AR: gcc-ar
+          RANLIB: gcc-ranlib
+          NM: gcc-nm
+        run: |
+          export PKG_CONFIG_PATH="$(cd .. && pwd)/deps/sdl3-uwp/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          pkg-config --modversion sdl3
+          gcc --version | head -1 | tee report/compiler.txt
+          mkdir -p build-uwp && cd build-uwp
+          ../configure --cc='ccache gcc' --cxx='ccache g++' \
+            --extra-cflags='-DXBOX=1 -DXEMU_UWP=1 -Wno-error -lIphlpapi -lCrypt32 -march=btver2 -mtune=btver2 -mprefer-vector-width=128' \
+            --target-list=i386-softmmu -Db_lto=true -Dx86_version=2
+          make -j"$(nproc)" qemu-system-i386w.exe
+          ccache -s
+
+      - name: Gate on instructions the One S cannot run
+        shell: msys2 {0}
+        run: .github/uwp-one-s/isa-gate.sh objdump build-uwp/qemu-system-i386w.exe | tee report/gate.txt
+
+      - name: Assemble the package folder
+        shell: msys2 {0}
+        run: .github/uwp-one-s/assemble-package.sh orig pkg build-uwp/qemu-system-i386w.exe "$PKG_VERSION" report
+
+      - name: Mark, pack and sign
+        shell: pwsh
+        run: |
+          editbin /NOLOGO /APPCONTAINER pkg\xemu.exe
+          if ($LASTEXITCODE -ne 0) { throw "editbin failed" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          $appx = "out\Xemu_${env:PKG_VERSION}_x64.appx"
+          makeappx pack /o /d pkg /p $appx
+          if ($LASTEXITCODE -ne 0) { throw "makeappx pack failed" }
+          # A throwaway certificate with the package's publisher as subject. This build is for one console in
+          # Dev Mode, which accepts any signature; the key is deleted below and never leaves the runner.
+          $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=GamerDad" -KeyUsage DigitalSignature `
+            -KeyAlgorithm RSA -KeyLength 2048 -CertStoreLocation Cert:\CurrentUser\My `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}") -NotAfter (Get-Date).AddYears(10)
+          $password = [guid]::NewGuid().ToString()
+          Export-PfxCertificate -Cert $cert -FilePath sign.pfx -Password (ConvertTo-SecureString $password -AsPlainText -Force) | Out-Null
+          signtool sign /fd SHA256 /f sign.pfx /p $password $appx
+          $signed = $LASTEXITCODE
+          Remove-Item sign.pfx
+          Remove-Item $cert.PSPath
+          if ($signed -ne 0) { throw "signtool failed" }
+
+      - name: Build report
+        shell: msys2 {0}
+        run: |
+          appx=out/Xemu_${PKG_VERSION}_x64.appx
+          sha256sum "$appx" | tee report/appx.sha256
+          {
+            echo "# xemu for Xbox One S, package $PKG_VERSION"
+            echo
+            echo "- start commit: $START_COMMIT (skitzellez/xemu-uwp, branch uwp)"
+            echo "- built commit: $GITHUB_SHA (branch $GITHUB_REF_NAME), run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "- original package: $APPX_URL (SHA-256 $APPX_SHA256)"
+            echo "- $(cat report/sdl3.txt)"
+            echo "- compiler: $(cat report/compiler.txt)"
+            echo "- configure: -Dx86_version=2 -Db_lto=true, extra cflags -march=btver2 -mtune=btver2 -mprefer-vector-width=128"
+            echo "- appx SHA-256: $(cut -d' ' -f1 report/appx.sha256)"
+            echo
+            echo "## Instruction gate on xemu.exe (objdump)"
+            echo
+            sed 's/^/    /' report/gate.txt
+            echo
+            echo "## DLLs"
+            echo
+            echo "original: kept from the released package; rebuilt: replaced by this runner's MSYS2 build of the same library; added: new dependency from this runner; dropped: in the original, not needed by the new exe."
+            echo
+            echo '| dll | origin |'
+            echo '| --- | --- |'
+            tail -n +2 report/dlls.tsv | awk -F'\t' '{ printf "| %s | %s |\n", $1, $2 }'
+          } > out/build-report.md
+          cp report/gate.txt report/dlls.tsv out/
+          cat out/build-report.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xemu-one-s-${{ env.PKG_VERSION }}
+          path: out
+          compression-level: 0
+          if-no-files-found: error
