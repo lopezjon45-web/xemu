@@ -12,6 +12,8 @@
  */
 
 #include "qemu/osdep.h"
+#include <windows.h>
+#include <SDL3/SDL.h> /* before xemu-os-utils.h: its cpuid.h macro __cpuid clashes with intrin.h's function */
 #include "qemu/timer.h"
 #include "qemu/main-loop.h"
 #include "hw/core/cpu.h"
@@ -22,8 +24,6 @@
 #include "xemu-settings.h"
 #include "xemu-os-utils.h"
 #include "xemu-version.h"
-#include <SDL3/SDL.h>
-#include <windows.h>
 
 static double filetime_seconds(FILETIME kernel, FILETIME user)
 {
