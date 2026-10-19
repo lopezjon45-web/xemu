@@ -74,6 +74,24 @@ jobs:
         shell: msys2 {0}
         run: .github/uwp-one-s/prepare-deps.sh orig libsmb2-src.zip report
 
+      # Meson runs scripts/xemu-version.sh through its shebang as the bare command `bash`, from the build's native
+      # Python, and CreateProcess searches System32 before PATH. windows-latest ships WSL's
+      # C:\Windows\System32\bash.exe with no distribution installed; it exits 1 with its message on stdout only, so
+      # the build stopped at xemu-version-macro.h with an empty stderr. Remove that launcher from the runner, and
+      # MSYS2's /usr/bin/bash is the only bash left.
+      - name: Remove WSL's bash.exe from System32
+        shell: pwsh
+        run: |
+          $wsl = "$env:SystemRoot\System32\bash.exe"
+          if (Test-Path $wsl) {
+            takeown /f $wsl | Out-Null
+            icacls $wsl /grant "*S-1-5-32-544:F" | Out-Null
+            Remove-Item $wsl
+            Write-Output "removed $wsl"
+          } else {
+            Write-Output "no $wsl on this runner"
+          }
+
       - name: Configure and build xemu.exe
         shell: msys2 {0}
         env:
@@ -84,6 +102,7 @@ jobs:
           # subprojects/dsp56300 runs MSYS2's tar on a D:/... path, which GNU tar reads as host:path without this
           TAR_OPTIONS: --force-local
         run: |
+          python -c 'import subprocess, sys; r = subprocess.run(["bash", "-c", "echo $BASH"], capture_output=True, text=True); found = (r.stdout + r.stderr).strip(); print("the native Python resolves bash to", found or "nothing"); sys.exit(0 if r.returncode == 0 and found == "/usr/bin/bash" else "bash must be MSYS2 /usr/bin/bash: another bash.exe comes first in the CreateProcess search order")'
           export PKG_CONFIG_PATH="$(cd .. && pwd)/deps/sdl3-uwp/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           pkg-config --modversion sdl3
           gcc --version | head -1 | tee report/compiler.txt
