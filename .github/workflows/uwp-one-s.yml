@@ -51,7 +51,7 @@ jobs:
           pacboy: >-
             toolchain:p pkgconf:p ninja:p meson:p cmake:p python:p ccache:p tools-git:p
             glib2:p pixman:p libepoxy:p libslirp:p libsamplerate:p openssl:p curl:p zlib:p zstd:p
-            glslang:p spirv-tools:p vulkan-headers:p libmspack:p xxhash:p nlohmann-json:p
+            glslang:p spirv-tools:p vulkan-headers:p libmspack:p xxhash:p nlohmann-json:p python-yaml:p
 
       - name: Original package
         shell: pwsh
