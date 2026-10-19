@@ -31,7 +31,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          fetch-tags: true
+
+      # scripts/xemu-version.sh runs `git describe --tags --match 'v*'` for the version string, and the fork this
+      # branch lives in has no tags. Fetch them, read-only, from the repository the branch starts from.
+      - name: Tags for the version string
+        run: |
+          git fetch --tags --no-recurse-submodules https://github.com/skitzellez/xemu-uwp.git
+          git describe --tags --match 'v*'
 
       - uses: ilammy/msvc-dev-cmd@v1
         with:
