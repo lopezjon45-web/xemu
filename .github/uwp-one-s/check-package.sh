@@ -39,13 +39,13 @@ else
 fi
 
 echo
-echo "## xemu.exe"
+echo "## xemu.exe (functions resolved through the package's xemu.sym)"
 gate_status=0
-"$here/isa-gate.sh" objdump "$work/xemu.exe" || gate_status=$?
+"$here/isa-gate.sh" objdump "$work/xemu.exe" "$work/xemu.sym" || gate_status=$?
 
 echo
 echo "## DLLs"
-printf '%-32s %-9s %10s %6s %6s %6s\n' dll origin instrs BMI2 FMA3 AVX2
+printf '%-32s %-9s %10s %6s %6s %6s %8s\n' dll origin instrs BMI2 FMA3 AVX2 allowed
 for f in "$work"/*.dll; do
   d=$(basename "$f")
   origin=unknown
@@ -56,9 +56,9 @@ for f in "$work"/*.dll; do
   if [ "$origin" = original ]; then
     printf '%-32s %-9s\n' "$d" "$origin"
   else
-    counts=$("$here/isa-gate.sh" objdump "$f" | awk '{ printf "%s ", $2 }' || true)
+    counts=$("$here/isa-gate.sh" objdump "$f" | grep -E '^(instructions|BMI2|FMA3|AVX2|allowed) ' | awk '{ printf "%s ", $2 }' || true)
     # shellcheck disable=SC2086
-    printf '%-32s %-9s %10s %6s %6s %6s\n' "$d" "$origin" $counts
+    printf '%-32s %-9s %10s %6s %6s %6s %8s\n' "$d" "$origin" $counts
   fi
 done
 
