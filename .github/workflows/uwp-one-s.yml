@@ -22,9 +22,13 @@ permissions:
 
 env:
   START_COMMIT: e4b6fd5d96dadf3b469d376e33fce1b562c8225a # skitzellez/xemu-uwp branch uwp, where this branch starts
-  APPX_URL: https://github.com/skitzellez/xemu-uwp/releases/download/uwp-0.9.208.0/Xemu_0.9.208.0_x64.appx
-  APPX_SHA256: b4ef6b260a852b7f4d1660002475bfd65e6ed094ea454daea0b1a888cb51fe98
-  LIBSMB2_SRC_URL: https://github.com/skitzellez/xemu-uwp/releases/download/uwp-0.9.208.0/libsmb2-6.2-source.zip
+  # The base package: skitzellez/xemu-uwp release uwp-0.9.208.0 is gone (404 on 2026-10-20; upstream keeps only its
+  # latest releases), so the base is our 0.9.208.1 package from run 39196736832, which carries that release's
+  # files unchanged apart from xemu.exe and the MinGW DLLs, which every build replaces anyway. The libsmb2
+  # source zip (headers only are used) is mirrored from upstream's uwp-0.9.226.0 release.
+  APPX_URL: https://github.com/lopezjon45-web/xemu/releases/download/uwp-one-s-base-0.9.208.1/Xemu_0.9.208.1_x64.appx
+  APPX_SHA256: 7e54c4ec9a2ab12154f67f4cce06a884e63bbca091f018fca24df6324dee5355
+  LIBSMB2_SRC_URL: https://github.com/lopezjon45-web/xemu/releases/download/uwp-one-s-base-0.9.208.1/libsmb2-6.2-source.zip
   SDL3_HEADERS_REPO: XboxEmulationHub/SDL3-uwp # the fork README-UWP.md names, branch uwp-3.4.16
   SDL3_HEADERS_REF: ddd5d4f99a26ac95d4620ccf489c07fcf5f08636
   # Mesa DLLs with the DXBC backend: lopezjon45-web/mesa-uwp branch dxbc-port at 3f807f0, built by run
