@@ -34,10 +34,10 @@ env:
   # Mesa DLLs with the DXBC backend: lopezjon45-web/mesa-uwp branch dxbc-port at 3f807f0, built by run
   # https://github.com/lopezjon45-web/mesa-uwp/actions/runs/39344416321 (artifact mesa-uwp-one-s, id 12230287197,
   # gate reports from artifact uwp-gate-report), published as release one-s-dxbc-3f807f0 of that repository.
-  MESA_RELEASE_URL: https://github.com/lopezjon45-web/mesa-uwp/releases/download/one-s-dxbc-3f807f0
-  MESA_WGL_SHA256: 21fc7fc397e941b0edd38bc82175090826990e68407113309cd27eecf6c9f6fb
-  MESA_GL32_SHA256: 92e4e23e49021f47fcb548d8b37a4ad5b49d2179131050e217633009f1b5099c
-  PKG_VERSION: 0.9.227.1
+  MESA_RELEASE_URL: https://github.com/lopezjon45-web/mesa-uwp/releases/download/one-s-dxbc-97ad580
+  MESA_WGL_SHA256: 3308c99af7b14ef3b839cb0056fc9948d1cb306e0a1137b5ed61d180452a2e9b
+  MESA_GL32_SHA256: e5d2334f61118bf75972ab9cf6a222fee2d90d661c7db9b38e5635fb98631e29
+  PKG_VERSION: 0.9.228.1
 
 jobs:
   build:
@@ -204,7 +204,7 @@ jobs:
             echo "- compiler: $(cat report/compiler.txt)"
             echo "- configure: -Dx86_version=2 -Db_lto=true, extra cflags -march=btver2 -mtune=btver2 -mprefer-vector-width=128"
             echo "- appx SHA-256: $(cut -d' ' -f1 report/appx.sha256)"
-            echo "- Mesa: DXBC build $MESA_RELEASE_URL (dxbc-port 3f807f0, run 39344416321); $(awk '{ printf "%s %s; ", $2, $1 }' report/mesa.sha256)"
+            echo "- Mesa: DXBC build $MESA_RELEASE_URL (dxbc-port 97ad580, run 39369279116); $(awk '{ printf "%s %s; ", $2, $1 }' report/mesa.sha256)"
             echo
             echo "## Instruction gate on xemu.exe (objdump)"
             echo
