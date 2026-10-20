@@ -4,12 +4,18 @@
 # One S CPU is an AMD Jaguar (GCC btver2: SSE4.2, AVX, BMI1, F16C, MOVBE) and stops the app at the first BMI2
 # instruction with STATUS_ILLEGAL_INSTRUCTION. This job rebuilds only xemu.exe, for btver2 at x86-64-v2, and
 # puts it back into the released package with matching MinGW DLLs. Nothing in the emulator's source changes.
+#
+# Mesa: the released package's libgallium_wgl.dll and opengl32.dll emit DXIL, which the One S D3D12 driver
+# refuses (xemu died at its first draw). This branch replaces them with the lopezjon45-web/mesa-uwp build that
+# carries the nir_to_dxbc backend (DXBC shader model 5.1 when the adapter reports no SM 6.0), published as a
+# release of that repository so no cross-repository token is needed. The release holds the ISA gate reports
+# of that build; the step below refuses a DLL whose report is missing or not clean.
 name: uwp-one-s
 
 on:
   workflow_dispatch:
   push:
-    branches: [uwp-one-s]
+    branches: [uwp-one-s-dxbc]
 
 permissions:
   contents: read
@@ -21,7 +27,13 @@ env:
   LIBSMB2_SRC_URL: https://github.com/skitzellez/xemu-uwp/releases/download/uwp-0.9.208.0/libsmb2-6.2-source.zip
   SDL3_HEADERS_REPO: XboxEmulationHub/SDL3-uwp # the fork README-UWP.md names, branch uwp-3.4.16
   SDL3_HEADERS_REF: ddd5d4f99a26ac95d4620ccf489c07fcf5f08636
-  PKG_VERSION: 0.9.208.1
+  # Mesa DLLs with the DXBC backend: lopezjon45-web/mesa-uwp branch dxbc-port at 3f807f0, built by run
+  # https://github.com/lopezjon45-web/mesa-uwp/actions/runs/39344416321 (artifact mesa-uwp-one-s, id 12230287197,
+  # gate reports from artifact uwp-gate-report), published as release one-s-dxbc-3f807f0 of that repository.
+  MESA_RELEASE_URL: https://github.com/lopezjon45-web/mesa-uwp/releases/download/one-s-dxbc-3f807f0
+  MESA_WGL_SHA256: 21fc7fc397e941b0edd38bc82175090826990e68407113309cd27eecf6c9f6fb
+  MESA_GL32_SHA256: 92e4e23e49021f47fcb548d8b37a4ad5b49d2179131050e217633009f1b5099c
+  PKG_VERSION: 0.9.227.1
 
 jobs:
   build:
@@ -129,6 +141,28 @@ jobs:
         shell: msys2 {0}
         run: .github/uwp-one-s/assemble-package.sh orig pkg build-uwp/qemu-system-i386w.exe "$PKG_VERSION" report
 
+      # The two Mesa DLLs come from the DXBC build, pinned by SHA-256. Their ISA gate reports (the mesa-uwp
+      # gate, which names the AVX2 sites the CRT and Mesa reach only behind __isa_available checks) must end in
+      # "failing 0". The PDBs ride along in the artifact for reading the console's crash dumps.
+      - name: Mesa DLLs with the DXBC backend
+        shell: msys2 {0}
+        run: |
+          mkdir -p mesa
+          for f in libgallium_wgl.dll opengl32.dll libgallium_wgl.pdb opengl32.pdb gate-libgallium_wgl.dll.txt gate-opengl32.dll.txt; do
+            curl -sfL -o "mesa/$f" "$MESA_RELEASE_URL/$f"
+          done
+          printf '%s  mesa/libgallium_wgl.dll\n%s  mesa/opengl32.dll\n' "$MESA_WGL_SHA256" "$MESA_GL32_SHA256" | sha256sum -c -
+          for d in libgallium_wgl.dll opengl32.dll; do
+            tr -d '\r' < "mesa/gate-$d.txt" > "report/gate-$d.txt"
+            grep -qx 'failing 0' "report/gate-$d.txt" || { echo "the Mesa gate report for $d does not say failing 0" >&2; exit 1; }
+            grep -qx 'BMI2 0' "report/gate-$d.txt" && grep -qx 'FMA3 0' "report/gate-$d.txt" || { echo "$d carries BMI2 or FMA3" >&2; exit 1; }
+            cp "mesa/$d" "pkg/$d"
+            sed -i "s/^$d\toriginal\$/$d\tdxbc/" report/dlls.tsv
+            awk -F'\t' -v d="$d" '$1 == d && $2 == "dxbc" { ok = 1 } END { exit !ok }' report/dlls.tsv || { echo "$d not marked dxbc in dlls.tsv" >&2; exit 1; }
+          done
+          cp mesa/libgallium_wgl.pdb mesa/opengl32.pdb report/
+          sha256sum pkg/libgallium_wgl.dll pkg/opengl32.dll | tee report/mesa.sha256
+
       - name: Mark, pack and sign
         shell: pwsh
         run: |
@@ -166,20 +200,28 @@ jobs:
             echo "- compiler: $(cat report/compiler.txt)"
             echo "- configure: -Dx86_version=2 -Db_lto=true, extra cflags -march=btver2 -mtune=btver2 -mprefer-vector-width=128"
             echo "- appx SHA-256: $(cut -d' ' -f1 report/appx.sha256)"
+            echo "- Mesa: DXBC build $MESA_RELEASE_URL (dxbc-port 3f807f0, run 39344416321); $(awk '{ printf "%s %s; ", $2, $1 }' report/mesa.sha256)"
             echo
             echo "## Instruction gate on xemu.exe (objdump)"
             echo
             sed 's/^/    /' report/gate.txt
             echo
+            echo "## Instruction gate on the Mesa DLLs (mesa-uwp one-s gate, summary lines)"
+            echo
+            for d in libgallium_wgl.dll opengl32.dll; do
+              echo "    $d"
+              grep -E '^(instructions|BMI2|FMA3|FMA4|AVX2|AVX512|allowed|failing) ' "report/gate-$d.txt" | sed 's/^/        /'
+            done
+            echo
             echo "## DLLs"
             echo
-            echo "original: kept from the released package; rebuilt: replaced by this runner's MSYS2 build of the same library; added: new dependency from this runner; dropped: in the original, not needed by the new exe."
+            echo "original: kept from the released package; rebuilt: replaced by this runner's MSYS2 build of the same library; added: new dependency from this runner; dropped: in the original, not needed by the new exe; dxbc: Mesa from the DXBC build named above."
             echo
             echo '| dll | origin |'
             echo '| --- | --- |'
             tail -n +2 report/dlls.tsv | awk -F'\t' '{ printf "| %s | %s |\n", $1, $2 }'
           } > out/build-report.md
-          cp report/gate.txt report/dlls.tsv out/
+          cp report/gate.txt report/dlls.tsv report/gate-*.txt report/mesa.sha256 report/*.pdb out/
           cat out/build-report.md
 
       - uses: actions/upload-artifact@v4
