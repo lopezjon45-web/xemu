@@ -34,10 +34,10 @@ env:
   # Mesa DLLs with the DXBC backend: lopezjon45-web/mesa-uwp branch dxbc-port at 3f807f0, built by run
   # https://github.com/lopezjon45-web/mesa-uwp/actions/runs/39344416321 (artifact mesa-uwp-one-s, id 12230287197,
   # gate reports from artifact uwp-gate-report), published as release one-s-dxbc-3f807f0 of that repository.
-  MESA_RELEASE_URL: https://github.com/lopezjon45-web/mesa-uwp/releases/download/one-s-dxbc-97ad580
-  MESA_WGL_SHA256: 3308c99af7b14ef3b839cb0056fc9948d1cb306e0a1137b5ed61d180452a2e9b
-  MESA_GL32_SHA256: e5d2334f61118bf75972ab9cf6a222fee2d90d661c7db9b38e5635fb98631e29
-  PKG_VERSION: 0.9.228.1
+  MESA_RELEASE_URL: https://github.com/lopezjon45-web/mesa-uwp/releases/download/one-s-dxbc-d0fedb8
+  MESA_WGL_SHA256: 05fc0cc1c53056c5b51d8073c4f8adff2b0e49ef05ad31c8937cabb54851ee6b
+  MESA_GL32_SHA256: ced3a87c2e6e37120c55eaa6c4990f0ba132d803574c1cfe033c9184e4e6ceee
+  PKG_VERSION: 0.9.229.1
 
 jobs:
   build:
