@@ -1,0 +1,138 @@
+# Pipeline corpus for xbrt's M0 probe: upstream xemu (this branch is v0.8.139 plus vk/corpus.c) runs the public
+# nxdk_pgraph_tests disc on the free SpiritBoot BIOS with the Vulkan renderer on lavapipe, and records every pipeline
+# its GLSL generators produce (XEMU_PIPELINE_CORPUS). The corpus is published as a prerelease asset of this fork.
+# Nothing here comes from a game disc. Upstream's own workflows are removed on this branch so a push runs only this.
+name: m0-corpus
+
+on:
+  push:
+    branches: [m0-corpus]
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Longest the test disc may run
+        default: "300"
+
+permissions:
+  contents: write
+
+env:
+  PGRAPH_TESTS_TAG: v2026-10-24_03-34-32-639536333
+  PGRAPH_TESTS_SHA256: 28d655d3d8e4ca6a187ff332473bf50a08cd91ffa2dd27ca3f8f57ba3938688a
+  SPIRITBOOT_URL: https://github.com/Mainkill1/SpiritBoot/releases/download/v1.0.0/SpiritBoot-v1.0.0-64MB.bin
+  SPIRITBOOT_SHA256: c630d22f2353d3898024d510f0b402b64bccdb331781fe7885389f73d6200853
+  HDD_URL: https://github.com/xemu-project/xemu-hdd-image/releases/download/1.0/xbox_hdd.qcow2.zip
+  # The run ends when the disc has made no new pipeline for this long (it idles on its menu after the last suite).
+  QUIET_MINUTES: 20
+
+jobs:
+  corpus:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build and run dependencies
+        run: |
+          sudo apt-get -qy update
+          sudo apt-get -qy install --no-install-recommends \
+            build-essential cmake git ninja-build python3-pip python3-tomli python3-yaml python3-venv \
+            libepoxy-dev libpixman-1-dev libsamplerate0-dev zlib1g-dev libssl-dev libpcap-dev libslirp-dev \
+            libvulkan-dev libusb-1.0-0-dev libcurl4-gnutls-dev libpipewire-0.3-dev libgtk-3-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev \
+            libxkbcommon-dev libegl-dev libgl-dev libgles-dev libdrm-dev libgbm-dev \
+            mesa-vulkan-drivers libgl1-mesa-dri vulkan-tools mesa-utils xvfb unzip
+
+      - name: Build xemu
+        run: |
+          ./build.sh -j"$(nproc)"
+          ls -la dist
+
+      - name: Fetch the test disc, BIOS and blank hard disk
+        run: |
+          mkdir -p run
+          curl -fsSL -o run/nxdk_pgraph_tests_xiso.iso \
+            "https://github.com/abaire/nxdk_pgraph_tests/releases/download/$PGRAPH_TESTS_TAG/nxdk_pgraph_tests_xiso.iso"
+          curl -fsSL -o run/spiritboot.bin "$SPIRITBOOT_URL"
+          curl -fsSL -o run/hdd.zip "$HDD_URL"
+          echo "$PGRAPH_TESTS_SHA256  run/nxdk_pgraph_tests_xiso.iso" | sha256sum -c
+          echo "$SPIRITBOOT_SHA256  run/spiritboot.bin" | sha256sum -c
+          (cd run && unzip -q hdd.zip && ls -la)
+
+      - name: Run the test disc and record pipelines
+        env:
+          MINUTES: ${{ inputs.minutes || '300' }}
+        run: |
+          set -u
+          root=$PWD
+          mkdir -p corpus
+          cat > run/xemu.toml <<EOF
+          [general]
+          show_welcome = false
+          skip_boot_anim = true
+
+          [general.updates]
+          check = false
+
+          [net]
+          enable = false
+
+          [display]
+          renderer = 'VULKAN'
+
+          [perf]
+          cache_shaders = false
+
+          [sys.files]
+          bootrom_path = ''
+          flashrom_path = '$root/run/spiritboot.bin'
+          hdd_path = '$root/run/xbox_hdd.qcow2'
+          eeprom_path = '$root/run/eeprom.bin'
+          dvd_path = '$root/run/nxdk_pgraph_tests_xiso.iso'
+          EOF
+          Xvfb :99 -screen 0 1280x800x24 &
+          export DISPLAY=:99
+          sleep 2
+          vulkaninfo --summary | tee corpus/vulkaninfo.txt || true
+          glxinfo -B | tee corpus/glxinfo.txt || true
+          export XEMU_PIPELINE_CORPUS=$root/corpus
+          ./dist/xemu -config_path "$root/run/xemu.toml" > corpus/xemu-stdout.txt 2>&1 &
+          pid=$!
+          printf 'minute\tpipelines\tshaders\n' > corpus/timeline.tsv
+          last=-1; quiet=0; end="time limit"
+          for minute in $(seq 1 "$MINUTES"); do
+            sleep 60
+            if ! kill -0 "$pid" 2>/dev/null; then wait "$pid"; end="xemu exited with $?"; break; fi
+            n=$(cat corpus/pipelines.jsonl 2>/dev/null | wc -l)
+            s=$(ls corpus/shaders 2>/dev/null | wc -l)
+            printf '%s\t%s\t%s\n' "$minute" "$n" "$s" | tee -a corpus/timeline.tsv
+            if [ "$n" = "$last" ]; then quiet=$((quiet + 1)); else quiet=0; last=$n; fi
+            if [ "$n" -gt 0 ] && [ "$quiet" -ge "$QUIET_MINUTES" ]; then end="no new pipeline for $QUIET_MINUTES minutes"; break; fi
+          done
+          kill "$pid" 2>/dev/null || true
+          sleep 3
+          kill -9 "$pid" 2>/dev/null || true
+          {
+            echo "end: $end"
+            echo "xemu: $(git rev-parse HEAD) (upstream v0.8.139 aa54c34cae1c09410d74c69a44210a9867fe2d16 plus vk/corpus.c)"
+            echo "disc: nxdk_pgraph_tests $PGRAPH_TESTS_TAG sha256 $PGRAPH_TESTS_SHA256"
+            echo "bios: SpiritBoot v1.0.0 64MB sha256 $SPIRITBOOT_SHA256"
+            echo "pipelines recorded: $(wc -l < corpus/pipelines.jsonl 2>/dev/null || echo 0)"
+            echo "shader files: $(ls corpus/shaders 2>/dev/null | wc -l)"
+          } | tee corpus/run-info.txt
+          tail -50 corpus/xemu-stdout.txt
+          test -s corpus/pipelines.jsonl
+
+      - name: Publish the corpus as a prerelease
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -d corpus ] || exit 0
+          tar -czf m0-corpus.tar.gz corpus
+          sha256sum m0-corpus.tar.gz | tee m0-corpus.tar.gz.sha256
+          tag="m0-corpus-${{ github.run_number }}"
+          gh release create "$tag" m0-corpus.tar.gz m0-corpus.tar.gz.sha256 corpus/run-info.txt corpus/timeline.tsv \
+            --repo "${{ github.repository }}" --target "${{ github.sha }}" --prerelease \
+            --title "M0 pipeline corpus ${{ github.run_number }}" \
+            --notes "Run ${{ github.run_id }} of ${{ github.sha }}: nxdk_pgraph_tests $PGRAPH_TESTS_TAG under upstream xemu v0.8.139 with the Vulkan renderer on lavapipe."

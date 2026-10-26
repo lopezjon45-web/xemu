@@ -433,6 +433,11 @@ typedef struct PGRAPHVkState {
 // renderer.c
 void pgraph_vk_check_memory_budget(PGRAPHState *pg);
 
+// corpus.c
+void pgraph_vk_corpus_record(PGRAPHVkState *r, const PipelineKey *key,
+                             const VkGraphicsPipelineCreateInfo *info,
+                             uint32_t push_constant_bytes);
+
 // debug.c
 #define RGBA_RED     (float[4]){1,0,0,1}
 #define RGBA_YELLOW  (float[4]){1,1,0,1}

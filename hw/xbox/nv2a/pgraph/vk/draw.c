@@ -1007,6 +1007,10 @@ static void create_pipeline(PGRAPHState *pg)
     VkPipeline pipeline;
     VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_cache, 1,
                                        &pipeline_create_info, NULL, &pipeline));
+    pgraph_vk_corpus_record(r, &key, &pipeline_create_info,
+                            pipeline_layout_info.pushConstantRangeCount ?
+                                push_constant_range.size :
+                                0);
 
     snode->pipeline = pipeline;
     snode->layout = layout;
