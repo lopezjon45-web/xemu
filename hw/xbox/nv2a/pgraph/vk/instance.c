@@ -37,7 +37,8 @@ static char const *const required_device_extensions[] = {
     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
 #else
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-    VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+    /* m0-corpus: lavapipe lacks VK_KHR_external_semaphore_fd, and the
+     * renderer creates only internal semaphores. */
 #endif
 };
 

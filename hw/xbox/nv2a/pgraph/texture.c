@@ -264,7 +264,11 @@ TextureShape pgraph_get_texture_shape(PGRAPHState *pg, int texture_idx)
     if (f.bytes_per_pixel == 0) {
         fprintf(stderr, "nv2a: unimplemented texture color format 0x%x\n",
                 color_format);
-        abort();
+        /* m0-corpus: nxdk_pgraph_tests probes formats xemu lacks; upload the
+         * texture as A8R8G8B8 so the run continues. Shaders do not depend on
+         * this, so the recorded GLSL is unchanged. */
+        color_format = NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8;
+        f = kelvin_color_format_info_map[color_format];
     }
 
     unsigned int width, height, depth;
