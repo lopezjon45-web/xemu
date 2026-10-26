@@ -102,7 +102,7 @@ jobs:
           last=-1; quiet=0; end="time limit"
           for minute in $(seq 1 "$MINUTES"); do
             sleep 60
-            if ! kill -0 "$pid" 2>/dev/null; then wait "$pid"; end="xemu exited with $?"; break; fi
+            if ! kill -0 "$pid" 2>/dev/null; then rc=0; wait "$pid" || rc=$?; end="xemu exited with $rc"; break; fi
             n=$(cat corpus/pipelines.jsonl 2>/dev/null | wc -l)
             s=$(ls corpus/shaders 2>/dev/null | wc -l)
             printf '%s\t%s\t%s\n' "$minute" "$n" "$s" | tee -a corpus/timeline.tsv
@@ -120,7 +120,7 @@ jobs:
             echo "pipelines recorded: $(wc -l < corpus/pipelines.jsonl 2>/dev/null || echo 0)"
             echo "shader files: $(ls corpus/shaders 2>/dev/null | wc -l)"
           } | tee corpus/run-info.txt
-          tail -50 corpus/xemu-stdout.txt
+          grep -v 'Could not resolve keysym' corpus/xemu-stdout.txt | tail -150
           test -s corpus/pipelines.jsonl
 
       - name: Publish the corpus as a prerelease
@@ -132,7 +132,7 @@ jobs:
           tar -czf m0-corpus.tar.gz corpus
           sha256sum m0-corpus.tar.gz | tee m0-corpus.tar.gz.sha256
           tag="m0-corpus-${{ github.run_number }}"
-          gh release create "$tag" m0-corpus.tar.gz m0-corpus.tar.gz.sha256 corpus/run-info.txt corpus/timeline.tsv \
+          gh release create "$tag" m0-corpus.tar.gz m0-corpus.tar.gz.sha256 corpus/timeline.tsv \
             --repo "${{ github.repository }}" --target "${{ github.sha }}" --prerelease \
             --title "M0 pipeline corpus ${{ github.run_number }}" \
             --notes "Run ${{ github.run_id }} of ${{ github.sha }}: nxdk_pgraph_tests $PGRAPH_TESTS_TAG under upstream xemu v0.8.139 with the Vulkan renderer on lavapipe."
