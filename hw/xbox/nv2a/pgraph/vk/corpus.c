@@ -4,7 +4,8 @@
  * When XEMU_PIPELINE_CORPUS names a directory, every pipeline the renderer
  * creates is appended to <dir>/pipelines.jsonl with the fixed-function state
  * it was created with, and each shader's generated GLSL is written once to
- * <dir>/shaders/<sha256>.<vert|geom|frag>.
+ * <dir>/shaders/<sha256>.<vert|geom|frag>. XEMU_PIPELINE_CORPUS_TAG, when set,
+ * is stored with each record (the corpus workflow names the test suite).
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -25,6 +26,7 @@
 
 static FILE *corpus_log;
 static char *corpus_dir;
+static char *corpus_tag;
 
 static bool corpus_open(void)
 {
@@ -38,6 +40,8 @@ static bool corpus_open(void)
         return false;
     }
     corpus_dir = g_strdup(dir);
+    const char *tag = getenv("XEMU_PIPELINE_CORPUS_TAG");
+    corpus_tag = g_strescape(tag ? tag : "", NULL);
     g_autofree char *shaders = g_build_filename(dir, "shaders", NULL);
     g_mkdir_with_parents(shaders, 0755);
     g_autofree char *path = g_build_filename(dir, "pipelines.jsonl", NULL);
@@ -89,8 +93,8 @@ void pgraph_vk_corpus_record(PGRAPHVkState *r, const PipelineKey *key,
     const VkPipelineDepthStencilStateCreateInfo *ds = info->pDepthStencilState;
     const VkPipelineVertexInputStateCreateInfo *vi = info->pVertexInputState;
 
-    fprintf(f, "{\"vs\":%s,\"gs\":%s,\"ps\":%s,\"topology\":%d,", vs, gs, ps,
-            info->pInputAssemblyState->topology);
+    fprintf(f, "{\"tag\":\"%s\",\"vs\":%s,\"gs\":%s,\"ps\":%s,\"topology\":%d,",
+            corpus_tag, vs, gs, ps, info->pInputAssemblyState->topology);
     fprintf(f,
             "\"raster\":{\"polygon_mode\":%d,\"cull_mode\":%u,"
             "\"front_face\":%d,\"depth_clamp\":%u},",

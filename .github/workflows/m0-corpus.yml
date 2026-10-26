@@ -1,17 +1,15 @@
-# Pipeline corpus for xbrt's M0 probe: upstream xemu (this branch is v0.8.139 plus vk/corpus.c) runs the public
-# nxdk_pgraph_tests disc on the free SpiritBoot BIOS with the Vulkan renderer on lavapipe, and records every pipeline
-# its GLSL generators produce (XEMU_PIPELINE_CORPUS). The corpus is published as a prerelease asset of this fork.
-# Nothing here comes from a game disc. Upstream's own workflows are removed on this branch so a push runs only this.
+# Pipeline corpus for xbrt's M0 probe: upstream xemu (this branch is v0.8.139 plus vk/corpus.c and two run fixes)
+# runs the public nxdk_pgraph_tests disc on the free SpiritBoot BIOS with the Vulkan renderer on lavapipe, and records
+# every pipeline its GLSL generators produce (XEMU_PIPELINE_CORPUS). Each test suite runs in its own xemu process from
+# a copy of the disc whose config enables only that suite, so a suite that stops xemu costs only itself; eight shards
+# share the suites. The merged corpus is published as a prerelease asset of this fork. Nothing here comes from a game
+# disc. Upstream's own workflows are removed on this branch so a push runs only this.
 name: m0-corpus
 
 on:
   push:
     branches: [m0-corpus]
   workflow_dispatch:
-    inputs:
-      minutes:
-        description: Longest the test disc may run
-        default: "300"
 
 permissions:
   contents: write
@@ -19,16 +17,21 @@ permissions:
 env:
   PGRAPH_TESTS_TAG: v2026-10-24_03-34-32-639536333
   PGRAPH_TESTS_SHA256: 28d655d3d8e4ca6a187ff332473bf50a08cd91ffa2dd27ca3f8f57ba3938688a
+  PGRAPH_CONFIG_SHA256: 5a32dc9e95c9bfaa58d9df12ee11d79c3327de353fd0fde6753a9206f9f27877
   SPIRITBOOT_URL: https://github.com/Mainkill1/SpiritBoot/releases/download/v1.0.0/SpiritBoot-v1.0.0-64MB.bin
   SPIRITBOOT_SHA256: c630d22f2353d3898024d510f0b402b64bccdb331781fe7885389f73d6200853
   HDD_URL: https://github.com/xemu-project/xemu-hdd-image/releases/download/1.0/xbox_hdd.qcow2.zip
-  # The run ends when the disc has made no new pipeline for this long (it idles on its menu after the last suite).
-  QUIET_MINUTES: 20
+  EXTRACT_XISO_COMMIT: 3f5b62cfe68f000b0e3c8a30104973f3a297948e
+  SHARDS: 8
 
 jobs:
-  corpus:
+  shard:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v4
 
@@ -47,95 +50,136 @@ jobs:
             mesa-vulkan-drivers libgl1-mesa-dri vulkan-tools mesa-utils xvfb unzip
 
       - name: Build xemu
-        run: |
-          ./build.sh -j"$(nproc)"
-          ls -la dist
+        run: ./build.sh -j"$(nproc)" > build-log.txt 2>&1 || { tail -100 build-log.txt; exit 1; }
 
-      - name: Fetch the test disc, BIOS and blank hard disk
+      - name: Build extract-xiso
+        run: |
+          git init -q extract-xiso
+          git -C extract-xiso fetch -q --depth 1 https://github.com/XboxDev/extract-xiso.git "$EXTRACT_XISO_COMMIT"
+          git -C extract-xiso checkout -q FETCH_HEAD
+          cmake -S extract-xiso -B extract-xiso/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build extract-xiso/build
+
+      - name: Fetch the test disc, its config list, BIOS and blank hard disk
         run: |
           mkdir -p run
-          curl -fsSL -o run/nxdk_pgraph_tests_xiso.iso \
-            "https://github.com/abaire/nxdk_pgraph_tests/releases/download/$PGRAPH_TESTS_TAG/nxdk_pgraph_tests_xiso.iso"
+          base="https://github.com/abaire/nxdk_pgraph_tests/releases/download/$PGRAPH_TESTS_TAG"
+          curl -fsSL -o run/nxdk_pgraph_tests_xiso.iso "$base/nxdk_pgraph_tests_xiso.iso"
+          curl -fsSL -o run/sample-config.json "$base/sample-config.json"
           curl -fsSL -o run/spiritboot.bin "$SPIRITBOOT_URL"
           curl -fsSL -o run/hdd.zip "$HDD_URL"
           echo "$PGRAPH_TESTS_SHA256  run/nxdk_pgraph_tests_xiso.iso" | sha256sum -c
+          echo "$PGRAPH_CONFIG_SHA256  run/sample-config.json" | sha256sum -c
           echo "$SPIRITBOOT_SHA256  run/spiritboot.bin" | sha256sum -c
-          (cd run && unzip -q hdd.zip && ls -la)
+          (cd run && unzip -q hdd.zip && mv xbox_hdd.qcow2 blank_hdd.qcow2)
+          mkdir -p run/disc && (cd run/disc && ../../extract-xiso/build/extract-xiso -x ../nxdk_pgraph_tests_xiso.iso)
+          ls run/disc/*
 
-      - name: Run the test disc and record pipelines
-        env:
-          MINUTES: ${{ inputs.minutes || '300' }}
+      - name: Run this shard's suites and record pipelines
         run: |
-          set -u
           root=$PWD
+          shard=${{ matrix.shard }}
           mkdir -p corpus
-          cat > run/xemu.toml <<EOF
+          printf 'suite\texit\tseconds\trecords_after\n' > corpus/suites-$shard.tsv
+          Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 &
+          export DISPLAY=:99 XEMU_PIPELINE_CORPUS=$root/corpus
+          sleep 2
+          python3 - "$shard" "$SHARDS" > run/suites.txt <<'PY'
+          import json, sys
+          shard, shards = int(sys.argv[1]), int(sys.argv[2])
+          suites = list(json.load(open("run/sample-config.json"))["test_suites"])
+          print("\n".join(s for i, s in enumerate(suites) if i % shards == shard))
+          PY
+          dir=$(ls -d run/disc/*/ | head -n 1)
+          while IFS= read -r suite; do
+            python3 - "$suite" > "$dir/nxdk_pgraph_tests_config.json" <<'PY'
+          import json, sys
+          suite = sys.argv[1]
+          tests = json.load(open("run/sample-config.json"))["test_suites"][suite]
+          print(json.dumps({
+              "settings": {"skip_tests_by_default": True, "enable_autorun_immediately": True,
+                           "enable_shutdown_on_completion": True, "delay_milliseconds_before_exit": 0,
+                           "output_directory_path": "e:/nxdk_pgraph_tests"},
+              "test_suites": {suite: dict({"skipped": False}, **{t: {"skipped": False} for t in tests})},
+          }))
+          PY
+            rm -f run/suite.iso && ./extract-xiso/build/extract-xiso -q -c "$dir" run/suite.iso < /dev/null
+            cp run/blank_hdd.qcow2 run/xbox_hdd.qcow2
+            rm -f run/eeprom.bin
+            cat > run/xemu.toml <<EOF
           [general]
           show_welcome = false
           skip_boot_anim = true
-
           [general.updates]
           check = false
-
           [net]
           enable = false
-
           [display]
           renderer = 'VULKAN'
-
           [perf]
           cache_shaders = false
-
           [sys.files]
           bootrom_path = ''
           flashrom_path = '$root/run/spiritboot.bin'
           hdd_path = '$root/run/xbox_hdd.qcow2'
           eeprom_path = '$root/run/eeprom.bin'
-          dvd_path = '$root/run/nxdk_pgraph_tests_xiso.iso'
+          dvd_path = '$root/run/suite.iso'
           EOF
-          Xvfb :99 -screen 0 1280x800x24 &
-          export DISPLAY=:99
-          sleep 2
-          vulkaninfo --summary | tee corpus/vulkaninfo.txt || true
-          glxinfo -B | tee corpus/glxinfo.txt || true
-          export XEMU_PIPELINE_CORPUS=$root/corpus
-          ./dist/xemu -config_path "$root/run/xemu.toml" > corpus/xemu-stdout.txt 2>&1 &
-          pid=$!
-          printf 'minute\tpipelines\tshaders\n' > corpus/timeline.tsv
-          last=-1; quiet=0; end="time limit"
-          for minute in $(seq 1 "$MINUTES"); do
-            sleep 60
-            if ! kill -0 "$pid" 2>/dev/null; then rc=0; wait "$pid" || rc=$?; end="xemu exited with $rc"; break; fi
-            n=$(cat corpus/pipelines.jsonl 2>/dev/null | wc -l)
-            s=$(ls corpus/shaders 2>/dev/null | wc -l)
-            printf '%s\t%s\t%s\n' "$minute" "$n" "$s" | tee -a corpus/timeline.tsv
-            if [ "$n" = "$last" ]; then quiet=$((quiet + 1)); else quiet=0; last=$n; fi
-            if [ "$n" -gt 0 ] && [ "$quiet" -ge "$QUIET_MINUTES" ]; then end="no new pipeline for $QUIET_MINUTES minutes"; break; fi
-          done
-          kill "$pid" 2>/dev/null || true
-          sleep 3
-          kill -9 "$pid" 2>/dev/null || true
-          {
-            echo "end: $end"
-            echo "xemu: $(git rev-parse HEAD) (upstream v0.8.139 aa54c34cae1c09410d74c69a44210a9867fe2d16 plus vk/corpus.c)"
-            echo "disc: nxdk_pgraph_tests $PGRAPH_TESTS_TAG sha256 $PGRAPH_TESTS_SHA256"
-            echo "bios: SpiritBoot v1.0.0 64MB sha256 $SPIRITBOOT_SHA256"
-            echo "pipelines recorded: $(wc -l < corpus/pipelines.jsonl 2>/dev/null || echo 0)"
-            echo "shader files: $(ls corpus/shaders 2>/dev/null | wc -l)"
-          } | tee corpus/run-info.txt
-          grep -v 'Could not resolve keysym' corpus/xemu-stdout.txt | tail -150
-          test -s corpus/pipelines.jsonl
+            t0=$SECONDS
+            XEMU_PIPELINE_CORPUS_TAG="$suite" ./dist/xemu -config_path "$root/run/xemu.toml" < /dev/null >> corpus/xemu-stdout-$shard.txt 2>&1 &
+            pid=$!
+            last=-1; quiet=0; rc=running
+            # Ends at xemu's own exit (the disc shuts down after the suite), after 120 s with no new pipeline once
+            # three minutes have passed, or at 15 minutes.
+            while [ $((SECONDS - t0)) -lt 900 ]; do
+              sleep 10
+              if ! kill -0 "$pid" 2>/dev/null; then rc=0; wait "$pid" || rc=$?; break; fi
+              n=$(cat corpus/pipelines.jsonl 2>/dev/null | wc -l)
+              if [ "$n" = "$last" ]; then quiet=$((quiet + 10)); else quiet=0; last=$n; fi
+              if [ "$quiet" -ge 120 ] && [ $((SECONDS - t0)) -ge 180 ]; then rc=quiet; break; fi
+            done
+            kill "$pid" 2>/dev/null || true; sleep 2; kill -9 "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+            printf '%s\t%s\t%s\t%s\n' "$suite" "$rc" "$((SECONDS - t0))" "$(cat corpus/pipelines.jsonl 2>/dev/null | wc -l)" |
+              tee -a corpus/suites-$shard.tsv
+          done < run/suites.txt
+          mv corpus/pipelines.jsonl corpus/pipelines-$shard.jsonl 2>/dev/null || touch corpus/pipelines-$shard.jsonl
+          grep -v 'Could not resolve keysym' corpus/xemu-stdout-$shard.txt | grep -E 'Assertion|abort|unimplemented|error' | sort | uniq -c | sort -rn | head -40 || true
 
-      - name: Publish the corpus as a prerelease
-        if: always()
+      - uses: actions/upload-artifact@v4
+        with:
+          name: corpus-${{ matrix.shard }}
+          path: corpus
+          retention-days: 1
+
+  publish:
+    needs: shard
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: corpus-*
+          path: shards
+      - name: Merge the shards and publish the corpus as a prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          [ -d corpus ] || exit 0
+          mkdir -p corpus/shaders
+          cat shards/*/pipelines-*.jsonl > corpus/pipelines.jsonl
+          cp -n shards/*/shaders/* corpus/shaders/
+          { head -n 1 "$(ls shards/*/suites-*.tsv | head -n 1)"; tail -q -n +2 shards/*/suites-*.tsv; } > corpus/suites.tsv
+          cat shards/*/xemu-stdout-*.txt | grep -v 'Could not resolve keysym' > corpus/xemu-stdout.txt || true
+          {
+            echo "xemu: ${{ github.sha }} (upstream v0.8.139 aa54c34cae1c09410d74c69a44210a9867fe2d16 plus vk/corpus.c and run fixes)"
+            echo "disc: nxdk_pgraph_tests $PGRAPH_TESTS_TAG sha256 $PGRAPH_TESTS_SHA256, one xemu process per suite"
+            echo "bios: SpiritBoot v1.0.0 64MB sha256 $SPIRITBOOT_SHA256"
+            echo "suites: $(tail -n +2 corpus/suites.tsv | wc -l), exits: $(tail -n +2 corpus/suites.tsv | cut -f2 | sort | uniq -c | tr '\n' ' ')"
+            echo "pipeline records: $(wc -l < corpus/pipelines.jsonl), shader files: $(ls corpus/shaders | wc -l)"
+          } | tee corpus/run-info.txt
+          cat corpus/suites.tsv
           tar -czf m0-corpus.tar.gz corpus
           sha256sum m0-corpus.tar.gz | tee m0-corpus.tar.gz.sha256
-          tag="m0-corpus-${{ github.run_number }}"
-          gh release create "$tag" m0-corpus.tar.gz m0-corpus.tar.gz.sha256 corpus/timeline.tsv \
+          gh release create "m0-corpus-${{ github.run_number }}" m0-corpus.tar.gz m0-corpus.tar.gz.sha256 corpus/run-info.txt corpus/suites.tsv \
             --repo "${{ github.repository }}" --target "${{ github.sha }}" --prerelease \
             --title "M0 pipeline corpus ${{ github.run_number }}" \
-            --notes "Run ${{ github.run_id }} of ${{ github.sha }}: nxdk_pgraph_tests $PGRAPH_TESTS_TAG under upstream xemu v0.8.139 with the Vulkan renderer on lavapipe."
+            --notes "Run ${{ github.run_id }} of ${{ github.sha }}: nxdk_pgraph_tests $PGRAPH_TESTS_TAG, one suite per xemu process, upstream xemu v0.8.139 with the Vulkan renderer on lavapipe."
